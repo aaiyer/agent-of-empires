@@ -1418,6 +1418,7 @@ pub struct ServerAbout {
     /// retained in `AppState` (only its effects are).
     pub auth_mode: &'static str,
     pub read_only: bool,
+    pub maya_restricted: bool,
     pub behind_tunnel: bool,
     /// CityHall client mode (`AOE_CITYHALL_MODE`). Drives the web
     /// dashboard's locked-down end-user client: composer + structured
@@ -1485,6 +1486,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         passphrase_enabled,
         auth_mode,
         read_only: state.read_only,
+        maya_restricted: state.maya_restricted,
         behind_tunnel: state.behind_tunnel,
         cityhall_mode: state.cityhall_mode,
         profile: state.profile.clone(),

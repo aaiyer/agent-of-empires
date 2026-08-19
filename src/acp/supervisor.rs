@@ -356,6 +356,7 @@ pub(crate) enum ResumeReservationOutcome {
 pub struct Supervisor<S: BroadcastSink> {
     sink: Arc<S>,
     registry: Arc<Mutex<AgentRegistry>>,
+    maya_restricted: std::sync::atomic::AtomicBool,
     workers: Arc<Mutex<HashMap<String, WorkerHandle>>>,
     next_seqs: Arc<SeqMap>,
     /// Reservation map: a session_id present here means another task is
@@ -665,6 +666,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         Self {
             sink,
             registry: Arc::new(Mutex::new(AgentRegistry::with_defaults())),
+            maya_restricted: std::sync::atomic::AtomicBool::new(false),
             workers: Arc::new(Mutex::new(HashMap::new())),
             next_seqs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pending_resumes: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1397,6 +1399,11 @@ impl<S: BroadcastSink> Supervisor<S> {
         self.registry.lock().await.upsert(name, spec);
     }
 
+    pub fn enable_maya_restricted(&self) {
+        self.maya_restricted
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// Spawn a structured view worker for the given session. Returns Err if a
     /// worker is already running for that session, if a spawn for
     /// the same session is already in progress, or if the
@@ -1525,6 +1532,27 @@ impl<S: BroadcastSink> Supervisor<S> {
             seed_history_replay,
         } = req;
 
+        let maya_restricted = self
+            .maya_restricted
+            .load(std::sync::atomic::Ordering::Acquire);
+        if maya_restricted
+            && (agent != "codex"
+                || cwd != std::path::Path::new(crate::server::maya_restricted::PROJECT_PATH)
+                || !additional_dirs.is_empty()
+                || !provider_env.is_empty()
+                || model.is_some()
+                || effort.is_some()
+                || sandbox_info.is_some()
+                || fork_from.is_some()
+                || source_profile.as_deref() != Some(crate::server::maya_restricted::PROFILE_NAME)
+                || yolo_mode
+                || acp_mode_id.is_some())
+        {
+            return Err(SupervisorError::InvalidAgentCommand(
+                "Maya restricted sessions require the fixed Codex agent and repository".into(),
+            ));
+        }
+
         // Per-agent install gate. claude-agent-acp lazy-installs its
         // native binary on first ever run; two concurrent `session/new`
         // calls against a partially-installed SDK race the install and
@@ -1576,14 +1604,19 @@ impl<S: BroadcastSink> Supervisor<S> {
         // only overlays registry specs (custom ACP commands own their
         // full argv already). Returned by `resolve_agent_spec` so the
         // registry is locked once, not raced across two reads.
-        let (mut spec, spec_from_registry) = self
-            .resolve_agent_spec(&agent, &resolved_cfg.session, &policy)
-            .await?;
+        let (mut spec, spec_from_registry) = if maya_restricted {
+            (crate::server::maya_restricted::codex_agent_spec(), false)
+        } else {
+            self.resolve_agent_spec(&agent, &resolved_cfg.session, &policy)
+                .await?
+        };
         // Overlay the instance command override (e.g. opencode →
         // opencode-plannotator from `session.agent_command_override`)
         // so structured view launches the same binary tmux would. See #1766.
-        if let Some(ref ovr) = agent_command_override {
-            apply_agent_command_override(&agent, spec_from_registry, ovr, &mut spec)?;
+        if !maya_restricted {
+            if let Some(ref ovr) = agent_command_override {
+                apply_agent_command_override(&agent, spec_from_registry, ovr, &mut spec)?;
+            }
         }
         // Apply ${aoe_data_dir} placeholder substitution against the
         // appropriate path; if the placeholder is not consumed it stays
@@ -1603,7 +1636,11 @@ impl<S: BroadcastSink> Supervisor<S> {
         // fills in. Mode has no per-request override today.
         // ponytail: resolve here instead of threading model/effort/mode through
         // every SpawnRequest site; revisit if explicit per-request values land.
-        let acp_defaults = resolved_cfg.acp.acp_defaults_for(&agent);
+        let acp_defaults = if maya_restricted {
+            None
+        } else {
+            resolved_cfg.acp.acp_defaults_for(&agent)
+        };
         let (model, effort) =
             crate::session::config::resolve_spawn_model_effort(acp_defaults, model, effort);
         let default_mode = acp_defaults.and_then(|defaults| defaults.mode());
@@ -1612,7 +1649,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         // overrides cannot contribute it. Mirror terminal-view behavior for
         // host agents, while sandboxed agents continue to use the separate
         // `sandbox.environment` namespace.
-        let mut host_environment = if sandbox_info.is_none() {
+        let mut host_environment = if !maya_restricted && sandbox_info.is_none() {
             crate::session::environment::resolve_host_environment_pairs(&resolved_cfg.environment)
         } else {
             Vec::new()
@@ -1638,7 +1675,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         // computes. It can only be empty when the trusted value is empty; the
         // re-resolve stays as the belt-and-suspenders that actually enforces the
         // boundary.
-        if sandbox_info.is_none() && !resolved_cfg.host_hooks.before_session.is_empty() {
+        if !maya_restricted
+            && sandbox_info.is_none()
+            && !resolved_cfg.host_hooks.before_session.is_empty()
+        {
             let profile_for_hook = source_profile.clone().unwrap_or_default();
             let cwd_for_hook = cwd.clone();
             let session_for_hook = session_id.clone();
@@ -1684,7 +1724,11 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         }
 
-        let mut env = provider_env;
+        let mut env = if maya_restricted {
+            Vec::new()
+        } else {
+            provider_env
+        };
         if let Some(model) = model {
             env.push(("AOE_AGENT_MODEL".into(), model));
         }
@@ -1711,19 +1755,23 @@ impl<S: BroadcastSink> Supervisor<S> {
         let mcp_session = session_id.clone();
         let mcp_profile = source_profile.clone();
         let mcp_cwd = cwd.clone();
-        let mcp_servers = tokio::task::spawn_blocking(move || {
-            resolve_mcp_layers(&mcp_agent, &mcp_session, mcp_profile.as_deref(), &mcp_cwd)
-        })
-        .await
-        .unwrap_or_else(|e| {
-            warn!(
-                target: "acp.mcp",
-                session = %session_id,
-                error = %e,
-                "MCP resolution task failed; forwarding no servers"
-            );
+        let mcp_servers = if maya_restricted {
             Vec::new()
-        });
+        } else {
+            tokio::task::spawn_blocking(move || {
+                resolve_mcp_layers(&mcp_agent, &mcp_session, mcp_profile.as_deref(), &mcp_cwd)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                warn!(
+                    target: "acp.mcp",
+                    session = %session_id,
+                    error = %e,
+                    "MCP resolution task failed; forwarding no servers"
+                );
+                Vec::new()
+            })
+        };
 
         let config = SpawnConfig {
             agent_key: agent.clone(),

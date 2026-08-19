@@ -456,6 +456,7 @@ async fn admit_and_create(
         // record below.
         callback_url: None,
         idempotency_key: None,
+        allow_hooks: true,
         profile: deps.profile.clone(),
         created_by_plugin: None,
         plugin_create_idempotency: None,

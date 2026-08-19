@@ -13,6 +13,7 @@ pub mod auth;
 pub mod callback;
 pub mod live_ws;
 pub mod login;
+pub mod maya_restricted;
 mod pane;
 pub mod push;
 pub mod push_send;
@@ -315,6 +316,10 @@ pub struct AppState {
     /// diff, project-management, and advanced-settings endpoints. Enforced
     /// server-side, not only in the UI, mirroring `read_only`. See #7.
     pub cityhall_mode: bool,
+    /// Server-authoritative deployment profile for the Maya chat surface.
+    /// Immutable for the daemon lifetime; every request and ACP spawn consults
+    /// this bit rather than trusting a browser-provided mode selector.
+    pub maya_restricted: bool,
     pub instances: Arc<RwLock<Vec<Instance>>>,
     /// Session-domain service handle sharing `instances`, `instance_locks`,
     /// `file_watch`, the telemetry create counter, and the ACP supervisor
@@ -719,6 +724,7 @@ pub struct ServerConfig<'a> {
     /// Operator-supplied `--allowed-origin` entries (normalized to the browser
     /// `Origin` form), for reverse proxies on nonstandard ports. See #2735.
     pub extra_allowed_origins: Vec<String>,
+    pub maya_restricted: bool,
 }
 
 /// Resolve the coarse auth-mode label the same way `/api/about` reports it, so
@@ -754,7 +760,41 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         open_browser,
         extra_allowed_hosts,
         extra_allowed_origins,
+        maya_restricted,
     } = config;
+
+    if maya_restricted {
+        anyhow::ensure!(
+            profile == maya_restricted::PROFILE_NAME,
+            "--maya-restricted requires --profile maya"
+        );
+        anyhow::ensure!(
+            host == maya_restricted::HOST,
+            "--maya-restricted requires --host {}",
+            maya_restricted::HOST
+        );
+        anyhow::ensure!(
+            port == maya_restricted::PORT,
+            "--maya-restricted requires --port {}",
+            maya_restricted::PORT
+        );
+        anyhow::ensure!(
+            passphrase.is_some(),
+            "--maya-restricted requires passphrase authentication"
+        );
+        anyhow::ensure!(
+            !remote && !behind_proxy,
+            "--maya-restricted disables remote and proxy exposure"
+        );
+        anyhow::ensure!(
+            tunnel_name.is_none() && tunnel_url.is_none(),
+            "--maya-restricted disables tunnels"
+        );
+        anyhow::ensure!(
+            extra_allowed_hosts.is_empty() && extra_allowed_origins.is_empty(),
+            "--maya-restricted disables additional hosts and origins"
+        );
+    }
 
     raise_fd_limit();
 
@@ -835,7 +875,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // Persist the plaintext passphrase so the TUI can display it on
     // reopen, including after a TUI restart or when the daemon was
     // started from the CLI. Owner-only perms; cleaned up on shutdown.
-    if let Some(pp) = passphrase {
+    if let Some(pp) = passphrase.filter(|_| !maya_restricted) {
         if let Ok(app_dir) = crate::session::get_app_dir() {
             write_secret_file(&app_dir.join("serve.passphrase"), pp).await;
         }
@@ -843,7 +883,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
     // Push notifications: initialize only when the operator flag is on at
     // startup. Flipping it later requires a server restart to take effect.
-    let push_enabled = config.web.notifications_enabled;
+    let push_enabled = !maya_restricted && config.web.notifications_enabled;
     let push_state = if push_enabled {
         match crate::session::get_app_dir() {
             Ok(dir) => match PushState::init(&dir) {
@@ -894,6 +934,12 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             sink,
             config.acp.max_concurrent_workers,
         ));
+        if maya_restricted {
+            supervisor.enable_maya_restricted();
+            supervisor
+                .upsert_agent("codex".to_string(), maya_restricted::codex_agent_spec())
+                .await;
+        }
         // Seed the seq counter from disk so fresh publishes don't
         // collide with restored history. Without this, after a
         // restart the first publish would be seq=1 — duplicate of
@@ -932,7 +978,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // The host API includes mutating session.meta.set/cas, so a read-only
     // daemon must not run plugin workers at all: gate the host on !read_only.
     #[cfg(feature = "serve")]
-    let plugin_host = if read_only {
+    let plugin_host = if read_only || maya_restricted {
         tracing::info!(target: "plugin.host", "plugin host disabled in read-only serve mode");
         None
     } else {
@@ -977,7 +1023,9 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // attempt is still recorded even if a remote tunnel later fails to come up.
     // The periodic `usage_snapshot` loop is spawned only after the transport is
     // resolved (below), so its first tick can report the real `serve_mode`.
-    crate::telemetry::spawn_process_start(crate::telemetry::Surface::Serve);
+    if !maya_restricted {
+        crate::telemetry::spawn_process_start(crate::telemetry::Surface::Serve);
+    }
 
     // Resolve the coarse auth mode once at launch; `/api/about` and the
     // telemetry snapshot both read this single value.
@@ -1201,6 +1249,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         profile: profile.to_string(),
         read_only,
         cityhall_mode: std::env::var_os("AOE_CITYHALL_MODE").is_some(),
+        maya_restricted,
         instances,
         session_service,
         token_manager: Arc::clone(&token_manager),
@@ -1292,7 +1341,9 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // daemon whose tunnel failed to start emits nothing) and after acp
     // status seeding plus the synchronous recovery marking (so that first tick's
     // session counts reflect the restored state rather than a half-loaded one).
-    spawn_serve_snapshot_loop(state.clone());
+    if !maya_restricted {
+        spawn_serve_snapshot_loop(state.clone());
+    }
 
     // GC the recently_restarted suppression map periodically; the TTL
     // check on read filters but does not remove entries. Without this,
@@ -1484,10 +1535,12 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         .plugin_host
         .clone()
         .map(|h| h as std::sync::Arc<dyn crate::plugin::auto_update::UpdateNotifier>);
-    crate::plugin::auto_update::spawn_if_enabled(
-        &crate::session::Config::load_or_warn(),
-        update_notifier,
-    );
+    if !maya_restricted {
+        crate::plugin::auto_update::spawn_if_enabled(
+            &crate::session::Config::load_or_warn(),
+            update_notifier,
+        );
+    }
 
     rate_limiter.spawn_cleanup_task(state.shutdown.clone());
     login_manager.spawn_cleanup_task(state.shutdown.clone());
@@ -2056,6 +2109,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             cityhall_gate,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            maya_restricted::enforce_routes,
         ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -5547,6 +5604,25 @@ async fn acp_event_listener(state: Arc<AppState>) {
             {
                 let state_for_rename = state.clone();
                 let session_id = frame.session_id.clone();
+                if state.maya_restricted {
+                    state
+                        .smart_rename_attempted
+                        .lock()
+                        .expect("smart_rename_attempted poisoned")
+                        .insert(session_id.clone());
+                    tokio::spawn(async move {
+                        if let Err(error) = maya_restricted::apply_first_turn_name(
+                            &state_for_rename,
+                            &session_id,
+                            &first_user_prompt,
+                        )
+                        .await
+                        {
+                            tracing::warn!(target: "smart_rename", session = %session_id, %error, "Maya first-turn naming failed");
+                        }
+                    });
+                    continue;
+                }
                 let context = crate::session::smart_rename::render_first_turn(
                     &first_user_prompt,
                     &agent_prose,
@@ -6160,6 +6236,7 @@ pub mod test_support {
             profile: "test".to_string(),
             read_only: false,
             cityhall_mode,
+            maya_restricted: false,
             instances,
             session_service,
             token_manager: Arc::new(TokenManager::new(token, Duration::from_secs(3600))),
@@ -7380,6 +7457,60 @@ mod tests {
             );
             assert!(line.contains("request_id="), "no request id at all: {line}");
         }
+    }
+
+    #[tokio::test]
+    async fn maya_restricted_router_denies_settings_and_reports_profile() {
+        use tower::ServiceExt;
+
+        let mut state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vecs(&["localhost"]),
+            Vec::new(),
+            None,
+        );
+        let state_mut = Arc::get_mut(&mut state).expect("unique test state");
+        state_mut.maya_restricted = true;
+        state_mut.profile = "maya".to_string();
+        let remote: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        let mut denied_request = axum::http::Request::builder()
+            .uri("/api/settings")
+            .header("host", "localhost")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        denied_request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let denied = test_support::build_router_for_test(state.clone())
+            .oneshot(denied_request)
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), axum::http::StatusCode::FORBIDDEN);
+        let denied_body = axum::body::to_bytes(denied.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&denied_body).contains("maya_restricted"));
+
+        let mut about_request = axum::http::Request::builder()
+            .uri("/api/about")
+            .header("host", "localhost")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        about_request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let about = test_support::build_router_for_test(state)
+            .oneshot(about_request)
+            .await
+            .unwrap();
+        assert_eq!(about.status(), axum::http::StatusCode::OK);
+        let about_body = axum::body::to_bytes(about.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&about_body).unwrap();
+        assert_eq!(payload["profile"], "maya");
+        assert_eq!(payload["maya_restricted"], true);
     }
 
     #[tokio::test]

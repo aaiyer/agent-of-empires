@@ -1395,6 +1395,7 @@ mod tests {
             custom_instruction: None,
             callback_url: None,
             idempotency_key: None,
+            allow_hooks: true,
             profile: "default".to_string(),
             created_by_plugin: None,
             plugin_create_idempotency: None,
