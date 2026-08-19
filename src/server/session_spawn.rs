@@ -36,6 +36,7 @@ pub(crate) struct StructuredSessionSpec {
     pub scratch: bool,
     pub trust_hooks: Option<bool>,
     pub custom_instruction: Option<String>,
+    pub allow_hooks: bool,
     /// Resolved source profile (request profile, else the server default).
     pub profile: String,
     /// Creating plugin id, when the caller is a plugin worker rather than a
@@ -131,6 +132,7 @@ pub(crate) async fn spawn_structured_session(
             scratch,
             trust_hooks,
             custom_instruction,
+            allow_hooks,
             profile,
             created_by_plugin,
             plugin_create_idempotency,
@@ -174,12 +176,16 @@ pub(crate) async fn spawn_structured_session(
         // repo, so a worktree created from an already-trusted repo inherits its
         // trust without a separate prompt.
         let original_path = path.clone();
-        let hook_plan = crate::server::api::sessions::resolve_create_hook_plan(
-            &profile,
-            std::path::Path::new(&original_path),
-            scratch,
-            trust_hooks.unwrap_or(false),
-        )?;
+        let hook_plan = if allow_hooks {
+            Some(crate::server::api::sessions::resolve_create_hook_plan(
+                &profile,
+                std::path::Path::new(&original_path),
+                scratch,
+                trust_hooks.unwrap_or(false),
+            )?)
+        } else {
+            None
+        };
 
         let title = title.unwrap_or_default();
         let worktree_branch = worktree_branch
@@ -350,11 +356,16 @@ pub(crate) async fn spawn_structured_session(
         // worktree is bootstrapped (`.env` copies, venv symlinks, DB seeds)
         // before the agent launches. On failure, tear down the just-built
         // worktree/container so a broken hook doesn't leave an orphan.
-        if let Err(e) = crate::server::api::sessions::run_create_hooks(
-            &mut instance,
-            &hook_plan,
-            std::path::Path::new(&original_path),
-        ) {
+        let hook_result = if let Some(hook_plan) = hook_plan.as_ref() {
+            crate::server::api::sessions::run_create_hooks(
+                &mut instance,
+                hook_plan,
+                std::path::Path::new(&original_path),
+            )
+        } else {
+            Ok(())
+        };
+        if let Err(e) = hook_result {
             builder::cleanup_instance(
                 &instance,
                 created_worktree.as_ref(),

@@ -447,6 +447,7 @@ async fn admit_and_create(
         // explicitly anyway so the intent is local.
         trust_hooks: Some(false),
         custom_instruction: None,
+        allow_hooks: true,
         profile: deps.profile.clone(),
         created_by_plugin: None,
         plugin_create_idempotency: None,

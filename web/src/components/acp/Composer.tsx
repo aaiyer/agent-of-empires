@@ -322,6 +322,8 @@ interface Props {
    *  when the user submits while browsing the queue, so an edit does not
    *  enqueue a duplicate. */
   editQueuedPrompt: (id: string, text: string) => void;
+  /** Hide and disable all workspace, agent, model, mode, and plugin selectors. */
+  restricted?: boolean;
 }
 
 export function Composer({
@@ -345,10 +347,11 @@ export function Composer({
   primerPrefill,
   queuedPrompts,
   editQueuedPrompt,
+  restricted = false,
 }: Props) {
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const { files } = useFilesIndex(sessionId);
+  const { files } = useFilesIndex(sessionId, !restricted);
 
   const attachmentsEnabled =
     !!promptCapabilities &&
@@ -875,28 +878,32 @@ export function Composer({
 
             {/* @ file picker — Directive behavior chips the path into
                 the prompt text using the default formatter. */}
-            <ComposerPrimitive.Unstable_TriggerPopover
-              char="@"
-              adapter={fileAdapter}
-              className="absolute bottom-full left-0 right-0 mb-2 z-30 overflow-hidden rounded-lg border border-surface-700 bg-surface-850 shadow-xl"
-            >
-              <ComposerPrimitive.Unstable_TriggerPopover.Directive formatter={defaultDirectiveFormatter} />
-              <PopoverItems trigger="@" />
-            </ComposerPrimitive.Unstable_TriggerPopover>
+            {!restricted && (
+              <ComposerPrimitive.Unstable_TriggerPopover
+                char="@"
+                adapter={fileAdapter}
+                className="absolute bottom-full left-0 right-0 mb-2 z-30 overflow-hidden rounded-lg border border-surface-700 bg-surface-850 shadow-xl"
+              >
+                <ComposerPrimitive.Unstable_TriggerPopover.Directive formatter={defaultDirectiveFormatter} />
+                <PopoverItems trigger="@" />
+              </ComposerPrimitive.Unstable_TriggerPopover>
+            )}
 
             {/* / slash commands — Action behavior fires a handler and
                 strips the `/cmd` text from the input. */}
-            <ComposerPrimitive.Unstable_TriggerPopover
-              char="/"
-              adapter={slashAdapter}
-              className="absolute bottom-full left-0 right-0 mb-2 z-30 overflow-hidden rounded-lg border border-surface-700 bg-surface-850 shadow-xl"
-            >
-              <ComposerPrimitive.Unstable_TriggerPopover.Action
-                onExecute={(item) => insertSlashCommand(composerRuntime, item)}
-                removeOnExecute
-              />
-              <PopoverItems trigger="/" />
-            </ComposerPrimitive.Unstable_TriggerPopover>
+            {!restricted && (
+              <ComposerPrimitive.Unstable_TriggerPopover
+                char="/"
+                adapter={slashAdapter}
+                className="absolute bottom-full left-0 right-0 mb-2 z-30 overflow-hidden rounded-lg border border-surface-700 bg-surface-850 shadow-xl"
+              >
+                <ComposerPrimitive.Unstable_TriggerPopover.Action
+                  onExecute={(item) => insertSlashCommand(composerRuntime, item)}
+                  removeOnExecute
+                />
+                <PopoverItems trigger="/" />
+              </ComposerPrimitive.Unstable_TriggerPopover>
+            )}
 
             {/* Input area — tall by default, grows up to 200px */}
             <ComposerPrimitive.Input
@@ -1118,18 +1125,22 @@ export function Composer({
               className="flex items-end gap-2 border-t border-surface-800/60 px-2 pb-2 pt-1.5"
             >
               <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-0.5 gap-y-1">
-                <ToolbarButton
-                  icon={<AtSign className="h-3.5 w-3.5" />}
-                  label="Add file context (@)"
-                  hint="@"
-                  onClick={() => insertAtCaret(taRef, "@")}
-                />
-                <ToolbarButton
-                  icon={<Slash className="h-3.5 w-3.5" />}
-                  label="Slash command (/)"
-                  hint="/"
-                  onClick={() => insertAtCaret(taRef, "/")}
-                />
+                {!restricted && (
+                  <>
+                    <ToolbarButton
+                      icon={<AtSign className="h-3.5 w-3.5" />}
+                      label="Add file context (@)"
+                      hint="@"
+                      onClick={() => insertAtCaret(taRef, "@")}
+                    />
+                    <ToolbarButton
+                      icon={<Slash className="h-3.5 w-3.5" />}
+                      label="Slash command (/)"
+                      hint="/"
+                      onClick={() => insertAtCaret(taRef, "/")}
+                    />
+                  </>
+                )}
                 <ToolbarButton
                   icon={<Paperclip className="h-3.5 w-3.5" />}
                   label={
@@ -1155,26 +1166,30 @@ export function Composer({
                     e.target.value = "";
                   }}
                 />
-                <span className="mx-1 h-4 w-px bg-surface-700" aria-hidden />
-                <ModePicker
-                  sessionId={sessionId}
-                  availableModes={availableModes}
-                  currentModeId={currentModeId}
-                  legacyMode={legacyMode}
-                  configOptions={configOptions}
-                  pendingConfigOption={pendingConfigOption}
-                  setConfigOption={setConfigOption}
-                />
-                <SessionConfigControls
-                  configOptions={configOptions}
-                  pendingConfigOption={pendingConfigOption}
-                  onSetConfigOption={setConfigOption}
-                />
+                {!restricted && (
+                  <>
+                    <span className="mx-1 h-4 w-px bg-surface-700" aria-hidden />
+                    <ModePicker
+                      sessionId={sessionId}
+                      availableModes={availableModes}
+                      currentModeId={currentModeId}
+                      legacyMode={legacyMode}
+                      configOptions={configOptions}
+                      pendingConfigOption={pendingConfigOption}
+                      setConfigOption={setConfigOption}
+                    />
+                    <SessionConfigControls
+                      configOptions={configOptions}
+                      pendingConfigOption={pendingConfigOption}
+                      onSetConfigOption={setConfigOption}
+                    />
+                  </>
+                )}
               </div>
 
               <div data-testid="composer-actions" className="flex shrink-0 items-center gap-2">
                 <UsageHint usage={sessionUsage} />
-                <PluginComposerActions sessionId={sessionId} getSnapshot={getPluginComposerSnapshot} />
+                {!restricted && <PluginComposerActions sessionId={sessionId} getSnapshot={getPluginComposerSnapshot} />}
                 {turnActive ? (
                   <>
                     <StopButton />
@@ -1188,29 +1203,31 @@ export function Composer({
           </ComposerPrimitive.Root>
         </ComposerPrimitive.Unstable_TriggerPopoverRoot>
       </div>
-      <SwitchAgentModal
-        open={switchAgentOpen}
-        sessionId={sessionId}
-        currentAgent={currentAgent}
-        onClose={() => clearPendingSwitchAgent()}
-        onPrefill={(text) => {
-          composerRuntime.setText(text);
-          requestAnimationFrame(() => {
-            const el = taRef.current;
-            if (!el) return;
-            el.focus();
-            const len = el.value.length;
-            try {
-              el.setSelectionRange(len, len);
-            } catch {
-              // ignore: non-text inputs can throw here
-            }
-            el.style.height = "auto";
-            el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
-          });
-        }}
-        trigger="manual"
-      />
+      {!restricted && (
+        <SwitchAgentModal
+          open={switchAgentOpen}
+          sessionId={sessionId}
+          currentAgent={currentAgent}
+          onClose={() => clearPendingSwitchAgent()}
+          onPrefill={(text) => {
+            composerRuntime.setText(text);
+            requestAnimationFrame(() => {
+              const el = taRef.current;
+              if (!el) return;
+              el.focus();
+              const len = el.value.length;
+              try {
+                el.setSelectionRange(len, len);
+              } catch {
+                // ignore: non-text inputs can throw here
+              }
+              el.style.height = "auto";
+              el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+            });
+          }}
+          trigger="manual"
+        />
+      )}
     </div>
   );
 }

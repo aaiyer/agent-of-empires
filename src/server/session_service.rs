@@ -909,6 +909,7 @@ mod tests {
             scratch: false,
             trust_hooks: None,
             custom_instruction: None,
+            allow_hooks: true,
             profile: "default".to_string(),
             created_by_plugin: None,
             plugin_create_idempotency: None,

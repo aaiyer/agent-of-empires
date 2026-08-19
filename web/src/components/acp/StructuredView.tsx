@@ -128,6 +128,9 @@ interface Props {
   /** Open (or focus) the Sub agents dock pane. Lets an inline async
    *  sub-agent card jump to its panel entry. */
   onOpenAgentsPane?: () => void;
+  /** Locks this conversation to the server-authoritative Maya profile and
+   *  removes every adapter/provider/configuration escape hatch. */
+  restricted?: boolean;
 }
 
 const STARTER_PROMPTS = [
@@ -150,6 +153,7 @@ export function StructuredView(props: Props) {
     fileRefSession,
     onOpenAgentsPane,
     isSandboxed,
+    restricted = false,
   } = props;
   // Folds rows above the most recent `/clear` divider out of the
   // thread by default; the disclosure banner toggles this. Lives on
@@ -188,6 +192,7 @@ export function StructuredView(props: Props) {
                     trashedAt={trashedAt}
                     onRestore={onRestore}
                     isSandboxed={isSandboxed}
+                    restricted={restricted}
                     {...ctx}
                   />
                 </BackgroundAgentsContext.Provider>
@@ -276,6 +281,7 @@ function AcpChrome({
   loadEarlierHistory,
   loadingEarlierHistory,
   isSandboxed,
+  restricted,
 }: AcpContext & {
   sessionId: string;
   acpWorkerState: "absent" | "resuming" | "running";
@@ -289,6 +295,7 @@ function AcpChrome({
   trashedAt: string | null;
   onRestore?: () => Promise<boolean> | void;
   isSandboxed?: boolean;
+  restricted: boolean;
 }) {
   // Count how many activity rows precede the latest `session_cleared`
   // divider so the banner can say "12 earlier turns hidden". The
@@ -480,7 +487,14 @@ function AcpChrome({
   if (state.incompatibleAgent) {
     return (
       <div className="flex h-full flex-col bg-surface-900 text-text-primary">
-        <StartupErrorScreen detail={state.incompatibleAgent} sessionId={sessionId} isSandboxed={isSandboxed} />
+        {restricted ? (
+          <div className="m-auto max-w-lg p-6 text-center">
+            <div className="text-sm font-medium text-rose-200">Maya Codex bridge is unavailable</div>
+            <p className="mt-2 text-xs text-text-dim">Ask the Maya service operator to restore the managed bridge.</p>
+          </div>
+        ) : (
+          <StartupErrorScreen detail={state.incompatibleAgent} sessionId={sessionId} isSandboxed={isSandboxed} />
+        )}
       </div>
     );
   }
@@ -493,6 +507,7 @@ function AcpChrome({
         sessionId={sessionId}
         currentAgent={state.agent ?? acpAgent}
         onPrefill={recoveryHandoffPrefill}
+        enabled={!restricted}
       >
         {({ onSwitchAgent }) =>
           status !== "open" || state.lagged || state.rateLimit || reconnecting ? (
@@ -515,7 +530,9 @@ function AcpChrome({
         }
       </RateLimitRecoverySection>
 
-      {state.startupError && <StartupErrorBanner sessionId={sessionId} message={state.startupError} />}
+      {state.startupError && (
+        <StartupErrorBanner sessionId={sessionId} message={state.startupError} restricted={restricted} />
+      )}
       {(() => {
         const variant = pickWorkerStoppedVariant({
           workerStopped: state.workerStopped,
@@ -574,7 +591,7 @@ function AcpChrome({
               <EmptyState onPick={sendPrompt} />
             </ThreadPrimitive.Empty>
 
-            {state.activity.length > 0 && (
+            {!restricted && state.activity.length > 0 && (
               <div className="mb-2 flex">
                 <ToolDensityToggle density={toolDensity} onToggle={onToggleToolDensity} />
               </div>
@@ -673,25 +690,31 @@ function AcpChrome({
                 disabled={state.workerRestarting || state.workerStopped || Boolean(state.startupError)}
               />
 
-              <ModeSwitchFailedNotice failure={state.modeSwitchFailed} onDismiss={dismissModeSwitchFailed} />
+              {!restricted && (
+                <ModeSwitchFailedNotice failure={state.modeSwitchFailed} onDismiss={dismissModeSwitchFailed} />
+              )}
 
-              <ConfigOptionSwitchFailedNotice
-                failure={state.configOptionSwitchFailed}
-                configOptions={state.configOptions}
-                onDismiss={dismissConfigOptionSwitchFailed}
-              />
+              {!restricted && (
+                <ConfigOptionSwitchFailedNotice
+                  failure={state.configOptionSwitchFailed}
+                  configOptions={state.configOptions}
+                  onDismiss={dismissConfigOptionSwitchFailed}
+                />
+              )}
 
-              <ContextPrimerBanner
-                sessionId={sessionId}
-                available={state.contextPrimerAvailable}
-                onInsertPrimer={(text) =>
-                  setPrimerPrefill({
-                    id: `primer-${state.contextPrimerAvailable?.resetSeq ?? 0}-${Date.now()}`,
-                    text,
-                  })
-                }
-                onDismiss={dismissPrimer}
-              />
+              {!restricted && (
+                <ContextPrimerBanner
+                  sessionId={sessionId}
+                  available={state.contextPrimerAvailable}
+                  onInsertPrimer={(text) =>
+                    setPrimerPrefill({
+                      id: `primer-${state.contextPrimerAvailable?.resetSeq ?? 0}-${Date.now()}`,
+                      text,
+                    })
+                  }
+                  onDismiss={dismissPrimer}
+                />
+              )}
 
               <Composer
                 sessionId={sessionId}
@@ -714,6 +737,7 @@ function AcpChrome({
                 primerPrefill={primerPrefill}
                 queuedPrompts={state.queuedPrompts}
                 editQueuedPrompt={editQueuedPrompt}
+                restricted={restricted}
               />
             </>
           )}
@@ -1432,25 +1456,29 @@ export function RateLimitRecoverySection({
   sessionId,
   currentAgent,
   onPrefill,
+  enabled = true,
   children,
 }: {
   sessionId: string;
   currentAgent: string | null;
   onPrefill: (text: string) => void;
-  children: (renderProps: { onSwitchAgent: () => void }) => React.ReactNode;
+  enabled?: boolean;
+  children: (renderProps: { onSwitchAgent?: () => void }) => React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
   return (
     <>
-      {children({ onSwitchAgent: () => setOpen(true) })}
-      <SwitchAgentModal
-        open={open}
-        sessionId={sessionId}
-        currentAgent={currentAgent}
-        onClose={() => setOpen(false)}
-        onPrefill={onPrefill}
-        trigger="rate_limit"
-      />
+      {children({ onSwitchAgent: enabled ? () => setOpen(true) : undefined })}
+      {enabled && (
+        <SwitchAgentModal
+          open={open}
+          sessionId={sessionId}
+          currentAgent={currentAgent}
+          onClose={() => setOpen(false)}
+          onPrefill={onPrefill}
+          trigger="rate_limit"
+        />
+      )}
     </>
   );
 }
@@ -1899,7 +1927,15 @@ export function SnoozedWorkerStoppedBanner({ sessionId, snoozedUntil }: { sessio
   );
 }
 
-export function StartupErrorBanner({ sessionId, message }: { sessionId: string; message: string }) {
+export function StartupErrorBanner({
+  sessionId,
+  message,
+  restricted = false,
+}: {
+  sessionId: string;
+  message: string;
+  restricted?: boolean;
+}) {
   const isAuth = /authentic|login|api[_ -]?key/i.test(message);
   const isCapacity = /capacity full|max_concurrent_workers/i.test(message);
   // Match the exact `Display` of `AcpError::ProjectPathMissing`.
@@ -1944,86 +1980,91 @@ export function StartupErrorBanner({ sessionId, message }: { sessionId: string; 
       {retryState === "failed" && retryError && (
         <div className="mt-2 text-xs text-rose-100/90">Retry failed: {retryError}</div>
       )}
-      <div className="mt-2 text-xs text-rose-200/80">
-        {isAuth ? (
-          <>
-            The adapter is installed but has no Claude credentials. Either set{" "}
-            <code className="rounded bg-rose-900/60 px-1">ANTHROPIC_API_KEY</code> in the env that runs{" "}
-            <code className="rounded bg-rose-900/60 px-1">aoe serve</code>, or run{" "}
-            <code className="rounded bg-rose-900/60 px-1">claude /login</code> in a terminal to write credentials to{" "}
-            <code className="rounded bg-rose-900/60 px-1">~/.claude</code>, then restart aoe.
-          </>
-        ) : isCapacity ? (
-          <>
-            All structured view worker slots are in use. Either raise{" "}
-            <code className="rounded bg-rose-900/60 px-1">[acp] max_concurrent_workers</code> in{" "}
-            <code className="rounded bg-rose-900/60 px-1">config.toml</code> and restart{" "}
-            <code className="rounded bg-rose-900/60 px-1">aoe serve</code>, or free a slot by deleting an existing
-            structured view session or switching one to the tmux view. Reinstalling the adapter won't help; the adapter
-            is fine, the cap is the limit.
-          </>
-        ) : isProjectPathMissing ? (
-          <>
-            The session's working directory no longer exists on disk:
-            {missingPath && (
-              <pre className="mt-1 whitespace-pre-wrap break-all rounded bg-rose-900/40 p-2 text-xs">{missingPath}</pre>
-            )}
-            Reinstalling the adapter won't help; the adapter is fine, the cwd is gone. Two paths forward:
-            <ol className="mt-1 list-decimal space-y-0.5 pl-5">
-              <li>
-                Restore the directory at the path above (e.g.{" "}
-                <code className="rounded bg-rose-900/60 px-1">git worktree move</code> it back, or recreate it), then
-                click <strong>Retry</strong>.
-              </li>
-              <li>
-                Stop <code className="rounded bg-rose-900/60 px-1">aoe serve</code>, edit{" "}
-                <code className="rounded bg-rose-900/60 px-1">project_path</code> for this session in{" "}
-                <code className="rounded bg-rose-900/60 px-1">
-                  ~/.agent-of-empires/profiles/&lt;profile&gt;/sessions.json
-                </code>{" "}
-                to point at the new location, then start <code className="rounded bg-rose-900/60 px-1">aoe serve</code>{" "}
-                again.
-              </li>
-            </ol>
-          </>
-        ) : isNativeBinaryLaunchFail ? (
-          <>
-            The adapter is installed but its bundled Claude Code native sub-binary couldn't launch. The binary exists on
-            disk, the kernel rejected the <code className="rounded bg-rose-900/60 px-1">execve</code>. Reinstalling the
-            adapter won't help; the binary is already there. Likely causes:
-            <ul className="mt-1 list-disc space-y-0.5 pl-5">
-              <li>
-                Architecture mismatch (e.g. an <code className="rounded bg-rose-900/60 px-1">arm64</code> binary inside
-                an <code className="rounded bg-rose-900/60 px-1">amd64</code> sandbox container, or vice versa).
-              </li>
-              <li>Container image missing the dynamic loader or a glibc version old enough to refuse the binary.</li>
-              <li>
-                Host <code className="rounded bg-rose-900/60 px-1">node_modules</code> bind-mounted into a container of
-                a different arch.
-              </li>
-            </ul>
-            Open the agent log below for the verbatim adapter error, or see{" "}
-            <a
-              href="https://agent-of-empires.com/docs/structured-view#native-binary-launch-failure"
-              target="_blank"
-              rel="noreferrer"
-              className="underline hover:text-rose-100"
-            >
-              the troubleshooting guide
-            </a>
-            .
-          </>
-        ) : (
-          <>
-            Run <code className="rounded bg-rose-900/60 px-1">aoe acp doctor --fix</code> from a terminal, or install
-            the adapter manually:
-            <pre className="mt-1 whitespace-pre-wrap rounded bg-rose-900/40 p-2 text-xs">
-              npm install -g @agentclientprotocol/claude-agent-acp@latest
-            </pre>
-          </>
-        )}
-      </div>
-      <AgentLogDisclosure sessionId={sessionId} />
+      {!restricted && (
+        <div className="mt-2 text-xs text-rose-200/80">
+          {isAuth ? (
+            <>
+              The adapter is installed but has no Claude credentials. Either set{" "}
+              <code className="rounded bg-rose-900/60 px-1">ANTHROPIC_API_KEY</code> in the env that runs{" "}
+              <code className="rounded bg-rose-900/60 px-1">aoe serve</code>, or run{" "}
+              <code className="rounded bg-rose-900/60 px-1">claude /login</code> in a terminal to write credentials to{" "}
+              <code className="rounded bg-rose-900/60 px-1">~/.claude</code>, then restart aoe.
+            </>
+          ) : isCapacity ? (
+            <>
+              All structured view worker slots are in use. Either raise{" "}
+              <code className="rounded bg-rose-900/60 px-1">[acp] max_concurrent_workers</code> in{" "}
+              <code className="rounded bg-rose-900/60 px-1">config.toml</code> and restart{" "}
+              <code className="rounded bg-rose-900/60 px-1">aoe serve</code>, or free a slot by deleting an existing
+              structured view session or switching one to the tmux view. Reinstalling the adapter won't help; the
+              adapter is fine, the cap is the limit.
+            </>
+          ) : isProjectPathMissing ? (
+            <>
+              The session's working directory no longer exists on disk:
+              {missingPath && (
+                <pre className="mt-1 whitespace-pre-wrap break-all rounded bg-rose-900/40 p-2 text-xs">
+                  {missingPath}
+                </pre>
+              )}
+              Reinstalling the adapter won't help; the adapter is fine, the cwd is gone. Two paths forward:
+              <ol className="mt-1 list-decimal space-y-0.5 pl-5">
+                <li>
+                  Restore the directory at the path above (e.g.{" "}
+                  <code className="rounded bg-rose-900/60 px-1">git worktree move</code> it back, or recreate it), then
+                  click <strong>Retry</strong>.
+                </li>
+                <li>
+                  Stop <code className="rounded bg-rose-900/60 px-1">aoe serve</code>, edit{" "}
+                  <code className="rounded bg-rose-900/60 px-1">project_path</code> for this session in{" "}
+                  <code className="rounded bg-rose-900/60 px-1">
+                    ~/.agent-of-empires/profiles/&lt;profile&gt;/sessions.json
+                  </code>{" "}
+                  to point at the new location, then start{" "}
+                  <code className="rounded bg-rose-900/60 px-1">aoe serve</code> again.
+                </li>
+              </ol>
+            </>
+          ) : isNativeBinaryLaunchFail ? (
+            <>
+              The adapter is installed but its bundled Claude Code native sub-binary couldn't launch. The binary exists
+              on disk, the kernel rejected the <code className="rounded bg-rose-900/60 px-1">execve</code>. Reinstalling
+              the adapter won't help; the binary is already there. Likely causes:
+              <ul className="mt-1 list-disc space-y-0.5 pl-5">
+                <li>
+                  Architecture mismatch (e.g. an <code className="rounded bg-rose-900/60 px-1">arm64</code> binary
+                  inside an <code className="rounded bg-rose-900/60 px-1">amd64</code> sandbox container, or vice
+                  versa).
+                </li>
+                <li>Container image missing the dynamic loader or a glibc version old enough to refuse the binary.</li>
+                <li>
+                  Host <code className="rounded bg-rose-900/60 px-1">node_modules</code> bind-mounted into a container
+                  of a different arch.
+                </li>
+              </ul>
+              Open the agent log below for the verbatim adapter error, or see{" "}
+              <a
+                href="https://agent-of-empires.com/docs/structured-view#native-binary-launch-failure"
+                target="_blank"
+                rel="noreferrer"
+                className="underline hover:text-rose-100"
+              >
+                the troubleshooting guide
+              </a>
+              .
+            </>
+          ) : (
+            <>
+              Run <code className="rounded bg-rose-900/60 px-1">aoe acp doctor --fix</code> from a terminal, or install
+              the adapter manually:
+              <pre className="mt-1 whitespace-pre-wrap rounded bg-rose-900/40 p-2 text-xs">
+                npm install -g @agentclientprotocol/claude-agent-acp@latest
+              </pre>
+            </>
+          )}
+        </div>
+      )}
+      {!restricted && <AgentLogDisclosure sessionId={sessionId} />}
     </div>
   );
 }

@@ -591,7 +591,13 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
     // rather than locking it per row. See #1088.
     #[cfg(feature = "serve")]
     let worker_states = state.acp_supervisor.worker_states_snapshot().await;
-    let mut sessions: Vec<SessionResponse> = instances
+    let visible_instances: Vec<&Instance> = instances
+        .iter()
+        .filter(|inst| {
+            !state.maya_restricted || crate::server::maya_restricted::is_restricted_session(inst)
+        })
+        .collect();
+    let mut sessions: Vec<SessionResponse> = visible_instances
         .iter()
         .map(|inst| {
             let plan_summary = if inst.is_structured() {
@@ -650,7 +656,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
     // once via the shared cache above.
     #[cfg(feature = "serve")]
     {
-        for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
+        for (resp, inst) in sessions.iter_mut().zip(visible_instances.iter().copied()) {
             if resp.acp_capable {
                 continue;
             }
@@ -735,7 +741,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
-        for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
+        for (resp, inst) in sessions.iter_mut().zip(visible_instances.iter().copied()) {
             resp.default_name = crate::session::civilizations::is_default_civ_name(&inst.title);
             if inflight.contains(&inst.id) {
                 resp.smart_rename = SmartRenameState::Running;
@@ -931,7 +937,6 @@ pub async fn update_workspace_ordering(
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
-
     if body.order.len() > MAX_ORDER_ENTRIES {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1083,6 +1088,16 @@ pub async fn rename_session(
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
+    if state.maya_restricted && body.rename_branch {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "maya_restricted",
+                "message": "Maya restricted rename accepts only a title"
+            })),
+        )
+            .into_response();
+    }
     let title = body.title.trim().to_string();
     if title.is_empty() {
         return (
@@ -1109,6 +1124,9 @@ pub async fn rename_session(
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return super::session_not_found();
         };
+        if state.maya_restricted && !crate::server::maya_restricted::is_restricted_session(inst) {
+            return super::session_not_found();
+        }
         (
             inst.worktree_info.clone(),
             inst.project_path.clone(),
@@ -2770,6 +2788,37 @@ pub async fn force_smart_rename(
         return resp;
     }
 
+    if state.maya_restricted {
+        let Some((first_user_prompt, _)) = state
+            .acp_event_store
+            .first_turn_context(&id, crate::session::smart_rename::FIRST_TURN_AGENT_BYTES)
+        else {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "message": "No prompt to name this session from yet" })),
+            )
+                .into_response();
+        };
+        return match crate::server::maya_restricted::apply_first_turn_name(
+            &state,
+            &id,
+            &first_user_prompt,
+        )
+        .await
+        {
+            Ok(true) => StatusCode::ACCEPTED.into_response(),
+            Ok(false) => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "message": "Session already has a custom name" })),
+            )
+                .into_response(),
+            Err(error) => {
+                tracing::error!(target: "smart_rename", session = %id, %error, "Maya first-turn naming failed");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        };
+    }
+
     let Some((profile, tool, command, project_path, sandboxed, title, structured)) = ({
         let instances = state.instances.read().await;
         instances.iter().find(|i| i.id == id).map(|i| {
@@ -4388,12 +4437,65 @@ pub struct CreateSessionBody {
     pub fork_from: Option<String>,
 }
 
+/// The complete caller-controlled surface for session creation in the Maya
+/// restricted profile. Every execution- or authority-bearing field is built
+/// below from server-owned constants instead of being accepted from JSON.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MayaRestrictedCreateBody {
+    #[serde(default)]
+    title: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum CreateSessionRequestBody {
+    MayaRestricted(MayaRestrictedCreateBody),
+    Ordinary(CreateSessionBody),
+}
+
 fn create_body_uses_worktree(body: &CreateSessionBody) -> bool {
     body.worktree_enabled || body.worktree_branch.is_some()
 }
 
 fn create_body_combines_scratch_and_worktree(body: &CreateSessionBody) -> bool {
     body.scratch && create_body_uses_worktree(body)
+}
+
+fn maya_restricted_create_body(body: MayaRestrictedCreateBody) -> CreateSessionBody {
+    CreateSessionBody {
+        title: body.title,
+        path: crate::server::maya_restricted::PROJECT_PATH.into(),
+        tool: "codex".into(),
+        group: String::new(),
+        yolo_mode: false,
+        worktree_enabled: false,
+        worktree_branch: None,
+        create_new_branch: false,
+        base_branch: None,
+        sandbox: false,
+        extra_args: String::new(),
+        sandbox_image: None,
+        extra_env: Vec::new(),
+        extra_repo_paths: Vec::new(),
+        command_override: String::new(),
+        custom_instruction: None,
+        profile: None,
+        #[cfg(feature = "serve")]
+        view: crate::session::View::Structured,
+        #[cfg(feature = "serve")]
+        agent_name: None,
+        #[cfg(feature = "serve")]
+        agent_model: None,
+        #[cfg(feature = "serve")]
+        agent_effort: None,
+        scratch: false,
+        trust_hooks: None,
+        #[cfg(feature = "serve")]
+        import_acp_session_id: None,
+        #[cfg(feature = "serve")]
+        fork_from: None,
+    }
 }
 
 /// Resolve the one-shot fork seed for a `fork_from` create request. A
@@ -4684,14 +4786,38 @@ pub(crate) fn run_create_hooks(
 
 pub async fn create_session(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<CreateSessionBody>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<CreateSessionRequestBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return super::read_only_response();
     }
-    let Json(body) = match body {
+    let Json(request) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
+    };
+    let body = match (state.maya_restricted, request) {
+        (true, CreateSessionRequestBody::MayaRestricted(body)) => maya_restricted_create_body(body),
+        (false, CreateSessionRequestBody::Ordinary(body)) => body,
+        (true, CreateSessionRequestBody::Ordinary(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "maya_restricted",
+                    "message": "Maya restricted session creation accepts only an optional title"
+                })),
+            )
+                .into_response();
+        }
+        (false, CreateSessionRequestBody::MayaRestricted(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "validation_failed",
+                    "message": "Session creation requires path and tool"
+                })),
+            )
+                .into_response();
+        }
     };
 
     // Scratch sessions are server-provisioned; the worktree path is the
@@ -4973,6 +5099,7 @@ pub async fn create_session(
         scratch: body.scratch,
         trust_hooks: body.trust_hooks,
         custom_instruction: body.custom_instruction,
+        allow_hooks: !state.maya_restricted,
         profile,
         // Never decoded from the request body: only the plugin host path
         // stamps these, through create_structured_session. See #2897.
@@ -6840,6 +6967,69 @@ mod tests {
 
     fn create_body_from_json(value: serde_json::Value) -> CreateSessionBody {
         serde_json::from_value(value).expect("valid CreateSessionBody")
+    }
+
+    #[test]
+    fn maya_restricted_create_accepts_only_title_and_projects_fixed_authority() {
+        let request: CreateSessionRequestBody = serde_json::from_value(serde_json::json!({
+            "title": "Review strategy"
+        }))
+        .expect("title-only request");
+        let CreateSessionRequestBody::MayaRestricted(request) = request else {
+            panic!("title-only request must use restricted shape")
+        };
+        let exact = maya_restricted_create_body(request);
+        assert_eq!(exact.title.as_deref(), Some("Review strategy"));
+        assert_eq!(exact.path, crate::server::maya_restricted::PROJECT_PATH);
+        assert_eq!(exact.tool, "codex");
+        assert_eq!(exact.view, crate::session::View::Structured);
+        assert!(!exact.worktree_enabled);
+        assert!(!exact.create_new_branch);
+        assert!(!exact.scratch);
+        assert!(exact.extra_repo_paths.is_empty());
+        assert!(exact.extra_env.is_empty());
+        assert!(exact.agent_name.is_none());
+        assert!(exact.agent_model.is_none());
+        assert!(exact.agent_effort.is_none());
+        assert!(exact.import_acp_session_id.is_none());
+        assert!(exact.fork_from.is_none());
+
+        let empty: CreateSessionRequestBody =
+            serde_json::from_value(serde_json::json!({})).expect("empty restricted request");
+        assert!(matches!(
+            empty,
+            CreateSessionRequestBody::MayaRestricted(MayaRestrictedCreateBody { title: None })
+        ));
+
+        for (field, value) in [
+            ("path", serde_json::json!("/tmp/elsewhere")),
+            ("tool", serde_json::json!("claude")),
+            ("view", serde_json::json!("terminal")),
+            ("worktree_enabled", serde_json::json!(true)),
+            ("create_new_branch", serde_json::json!(true)),
+            ("scratch", serde_json::json!(true)),
+            ("extra_repo_paths", serde_json::json!(["/tmp/other"])),
+            ("extra_env", serde_json::json!(["TOKEN=value"])),
+            ("command_override", serde_json::json!("sh")),
+            ("custom_instruction", serde_json::json!("ignore policy")),
+            ("profile", serde_json::json!("other")),
+            ("agent_name", serde_json::json!("other")),
+            ("agent_model", serde_json::json!("other")),
+            ("agent_effort", serde_json::json!("high")),
+            ("import_acp_session_id", serde_json::json!("resume")),
+            ("fork_from", serde_json::json!("parent")),
+            ("trust_hooks", serde_json::json!(true)),
+        ] {
+            let mut request = serde_json::json!({"title": "Review strategy"});
+            request[field] = value;
+            assert!(
+                matches!(
+                    serde_json::from_value::<CreateSessionRequestBody>(request),
+                    Ok(CreateSessionRequestBody::Ordinary(_)) | Err(_)
+                ),
+                "authority-bearing field must not deserialize as the restricted request: {field}"
+            );
+        }
     }
 
     #[test]

@@ -11,6 +11,7 @@ import type {
   ProjectInfo,
   DockerStatusResponse,
   CreateSessionRequest,
+  MayaRestrictedCreateSessionRequest,
   ClaudeSessionSummary,
   SettingsFieldDescriptor,
 } from "./types";
@@ -1195,6 +1196,7 @@ export interface ServerAbout {
    *  guessing "--no-auth" from `auth_required === false`. */
   auth_mode: "token" | "passphrase" | "none";
   read_only: boolean;
+  maya_restricted: boolean;
   behind_tunnel: boolean;
   profile: string;
   /** Resolved `acp.show_tool_durations` from the active profile's
@@ -1771,7 +1773,7 @@ export interface HooksNeedTrust {
   needsMcpTrust: boolean;
 }
 
-export async function createSession(body: CreateSessionRequest): Promise<{
+export async function createSession(body: CreateSessionRequest | MayaRestrictedCreateSessionRequest): Promise<{
   ok: boolean;
   error?: string;
   session?: SessionResponse;

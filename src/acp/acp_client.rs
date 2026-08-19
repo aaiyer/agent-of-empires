@@ -25,15 +25,14 @@ use agent_client_protocol::schema::v1::{
     ElicitationFormCapabilities, EmbeddedResource, EmbeddedResourceResource,
     FileSystemCapabilities, ForkSessionRequest, ForkSessionResponse, ImageContent, Implementation,
     InitializeRequest, InitializeResponse, KillTerminalRequest, KillTerminalResponse,
-    LoadSessionRequest, LoadSessionResponse, McpServer, MessageId, NewSessionRequest,
-    NewSessionResponse, PermissionOptionKind, PromptRequest, PromptResponse, ReadTextFileRequest,
-    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigId, SessionConfigValueId, SessionId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
-    StopReason, TerminalId, TerminalOutputRequest, TerminalOutputResponse, TextContent,
-    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
-    WriteTextFileResponse,
+    LoadSessionResponse, McpServer, MessageId, NewSessionResponse, PermissionOptionKind,
+    PromptRequest, PromptResponse, ReadTextFileRequest, ReadTextFileResponse,
+    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionConfigId, SessionConfigValueId, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TerminalId,
+    TerminalOutputRequest, TerminalOutputResponse, TextContent, WaitForTerminalExitRequest,
+    WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
@@ -112,6 +111,108 @@ pub enum AcpError {
     /// conversation keeps its prior context.
     #[error("conversation reset failed: {0}")]
     ResetFailed(String),
+}
+
+/// ACP's generated v1 request types omit an empty `additionalDirectories`
+/// array during serialization. Maya's restricted adapter contract requires
+/// the complete workspace-authority projection to be explicit on the wire, so
+/// these request types intentionally serialize all three authority fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExactNewSessionRequest {
+    cwd: PathBuf,
+    additional_directories: Vec<PathBuf>,
+    mcp_servers: Vec<McpServer>,
+}
+
+impl ExactNewSessionRequest {
+    fn new(cwd: PathBuf, mcp_servers: Vec<McpServer>) -> Self {
+        Self {
+            cwd,
+            additional_directories: Vec::new(),
+            mcp_servers,
+        }
+    }
+}
+
+impl agent_client_protocol::JsonRpcMessage for ExactNewSessionRequest {
+    fn matches_method(method: &str) -> bool {
+        method == "session/new"
+    }
+
+    fn method(&self) -> &str {
+        "session/new"
+    }
+
+    fn to_untyped_message(
+        &self,
+    ) -> Result<agent_client_protocol::UntypedMessage, agent_client_protocol::Error> {
+        agent_client_protocol::UntypedMessage::new(self.method(), self)
+    }
+
+    fn parse_message(
+        method: &str,
+        params: &impl serde::Serialize,
+    ) -> Result<Self, agent_client_protocol::Error> {
+        if !Self::matches_method(method) {
+            return Err(agent_client_protocol::Error::method_not_found());
+        }
+        agent_client_protocol::util::json_cast_params(params)
+    }
+}
+
+impl agent_client_protocol::JsonRpcRequest for ExactNewSessionRequest {
+    type Response = NewSessionResponse;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExactLoadSessionRequest {
+    cwd: PathBuf,
+    additional_directories: Vec<PathBuf>,
+    mcp_servers: Vec<McpServer>,
+    session_id: SessionId,
+}
+
+impl ExactLoadSessionRequest {
+    fn new(session_id: String, cwd: PathBuf, mcp_servers: Vec<McpServer>) -> Self {
+        Self {
+            cwd,
+            additional_directories: Vec::new(),
+            mcp_servers,
+            session_id: SessionId::from(session_id),
+        }
+    }
+}
+
+impl agent_client_protocol::JsonRpcMessage for ExactLoadSessionRequest {
+    fn matches_method(method: &str) -> bool {
+        method == "session/load"
+    }
+
+    fn method(&self) -> &str {
+        "session/load"
+    }
+
+    fn to_untyped_message(
+        &self,
+    ) -> Result<agent_client_protocol::UntypedMessage, agent_client_protocol::Error> {
+        agent_client_protocol::UntypedMessage::new(self.method(), self)
+    }
+
+    fn parse_message(
+        method: &str,
+        params: &impl serde::Serialize,
+    ) -> Result<Self, agent_client_protocol::Error> {
+        if !Self::matches_method(method) {
+            return Err(agent_client_protocol::Error::method_not_found());
+        }
+        agent_client_protocol::util::json_cast_params(params)
+    }
+}
+
+impl agent_client_protocol::JsonRpcRequest for ExactLoadSessionRequest {
+    type Response = LoadSessionResponse;
 }
 
 /// Boxed payload for `AcpError::IncompatibleAgent`. Carries the
@@ -6741,8 +6842,11 @@ async fn run_connection_task<W, R>(
                             if !seed_history_replay {
                                 suppress_for_block.store(true, Ordering::Relaxed);
                             }
-                            let req = LoadSessionRequest::new(stored.clone(), agent_cwd.clone())
-                                .mcp_servers(mcp_servers.clone());
+                            let req = ExactLoadSessionRequest::new(
+                                stored.clone(),
+                                agent_cwd.clone(),
+                                mcp_servers.clone(),
+                            );
                             // #2976 Phase B: v2 runner owns session/load.
                             let load_result = if let Some(control) = control_client.as_ref() {
                                 establish_session_v2::<LoadSessionResponse>(
@@ -6852,8 +6956,7 @@ async fn run_connection_task<W, R>(
                             session = %session_label,
                             "creating fresh session via session/new"
                         );
-                        let req =
-                            NewSessionRequest::new(agent_cwd.clone()).mcp_servers(mcp_servers);
+                        let req = ExactNewSessionRequest::new(agent_cwd.clone(), mcp_servers);
                         // #2976 Phase B: v2 runner owns session/new.
                         let new_session = if let Some(control) = control_client.as_ref() {
                             establish_session_v2::<NewSessionResponse>(control, "session/new", &req)
@@ -8063,8 +8166,10 @@ async fn run_connection_task<W, R>(
                             old_id = %acp_session_id.0,
                             "conversation reset: issuing fresh session/new on the live worker"
                         );
-                        let req = NewSessionRequest::new(agent_cwd.clone())
-                            .mcp_servers(mcp_servers_for_reset.clone());
+                        let req = ExactNewSessionRequest::new(
+                            agent_cwd.clone(),
+                            mcp_servers_for_reset.clone(),
+                        );
                         match await_reset_request(
                             reset_deadline,
                             || connection.send_request(req).block_task(),
@@ -11104,6 +11209,70 @@ done
             source_profile: None,
             mcp_servers: Vec::new(),
         }
+    }
+
+    /// Restricted startup must bind the full workspace authority on the
+    /// production JSON-RPC transport and must not negotiate caller-controlled
+    /// model, provider, or mode state after the adapter starts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn maya_restricted_session_new_wire_is_exact_and_has_no_authority_setters() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (script, capture) = write_reset_fake_agent(tmp.path(), 0, 0, 0);
+        let mut config = reset_fake_spawn_config(
+            &script,
+            std::path::Path::new(crate::server::maya_restricted::PROJECT_PATH),
+        );
+        config.source_profile = Some(crate::server::maya_restricted::PROFILE_NAME.into());
+        let client = AcpClient::spawn(config, AcpSessionId("maya-restricted-wire".into()))
+            .await
+            .expect("spawn scripted fake agent");
+        client.shutdown().await.expect("shutdown fake agent");
+
+        let wire = std::fs::read_to_string(capture).expect("read capture");
+        let session_new: serde_json::Value = wire
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid JSON-RPC"))
+            .find(|message| message["method"] == "session/new")
+            .expect("session/new request");
+        assert_eq!(
+            session_new["params"],
+            serde_json::json!({
+                "cwd": crate::server::maya_restricted::PROJECT_PATH,
+                "additionalDirectories": [],
+                "mcpServers": [],
+            })
+        );
+        for forbidden_method in [
+            "providers/set",
+            "providers/disable",
+            "session/set_mode",
+            "session/set_config_option",
+            "session/set_model",
+        ] {
+            assert!(
+                !wire.lines().any(|line| {
+                    serde_json::from_str::<serde_json::Value>(line)
+                        .is_ok_and(|message| message["method"] == forbidden_method)
+                }),
+                "restricted startup emitted forbidden {forbidden_method}; wire capture:\n{wire}"
+            );
+        }
+
+        let load = ExactLoadSessionRequest::new(
+            "stored-id".into(),
+            std::path::PathBuf::from(crate::server::maya_restricted::PROJECT_PATH),
+            Vec::new(),
+        );
+        assert_eq!(
+            serde_json::to_value(load).expect("serialize session/load"),
+            serde_json::json!({
+                "cwd": crate::server::maya_restricted::PROJECT_PATH,
+                "additionalDirectories": [],
+                "mcpServers": [],
+                "sessionId": "stored-id",
+            })
+        );
     }
 
     /// The deadline starts before enqueueing. If it has already expired

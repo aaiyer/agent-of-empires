@@ -141,21 +141,17 @@ import { DisconnectBanner } from "./components/DisconnectBanner";
 import { ElevationPrompt } from "./components/ElevationPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { DashboardUpdateBanner } from "./components/DashboardUpdateBanner";
+import { MayaRestrictedApp } from "./components/MayaRestrictedApp";
 
 // Pre-#1832 per-browser tour-seen flag. Read once on load to migrate users who
 // already dismissed the tour to the backend; no longer written.
 const LEGACY_TOUR_SEEN_KEY = "aoe-tour-seen";
 
 export default function App() {
-  // Apply the user-selected theme as CSS custom properties on the root
-  // element. Runs once on mount + on settings-driven theme changes.
-  // The pre-React /theme-bootstrap.js (referenced from index.html)
-  // paints the cached theme before hydration; this hook keeps it in
-  // sync with the server's view.
-  useResolvedTheme();
   const [loginRequired, setLoginRequired] = useState<boolean | null>(null);
   const [loginAuthenticated, setLoginAuthenticated] = useState(true);
   const [tokenExpired, setTokenExpired] = useState(false);
+  const [deploymentAbout, setDeploymentAbout] = useState<ServerAbout | null | undefined>(undefined);
   const [idleDecayWindowMs, setIdleDecayWindowMs] = useState(IDLE_DECAY_WINDOW_MS);
   const [unreadIndicatorEnabled, setUnreadIndicatorEnabled] = useState(true);
   const [sessionRowTagMode, setSessionRowTagMode] = useState<SessionRowTagMode>("branch");
@@ -199,8 +195,20 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (loginRequired === null || (loginRequired && !loginAuthenticated)) return;
+    let cancelled = false;
+    fetchAbout().then((about) => {
+      if (!cancelled) setDeploymentAbout(about);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [loginAuthenticated, loginRequired]);
+
+  useEffect(() => {
+    if (!deploymentAbout || deploymentAbout.maya_restricted) return;
     fetchSettings().then(applyAppSettings);
-  }, [applyAppSettings]);
+  }, [applyAppSettings, deploymentAbout]);
 
   const handleTokenSuccess = () => {
     setTokenExpired(false);
@@ -237,6 +245,20 @@ export default function App() {
     // Paint the app-shell chrome immediately instead of a blank surface while
     // loginStatus() resolves, so a PWA cold launch fills in progressively.
     return <AppShellSkeleton />;
+  }
+
+  if (deploymentAbout === undefined) return <AppShellSkeleton />;
+
+  if (deploymentAbout === null) {
+    return (
+      <div className="flex h-dvh items-center justify-center bg-surface-950 text-sm text-red-400">
+        Could not load server identity.
+      </div>
+    );
+  }
+
+  if (deploymentAbout.maya_restricted) {
+    return <MayaRestrictedApp about={deploymentAbout} loginRequired={loginRequired} onLogout={handleLogout} />;
   }
 
   return (
@@ -287,6 +309,9 @@ function AppContent({
   onLogout: () => void;
   onSettingsRefresh: () => Promise<void> | void;
 }) {
+  // Ordinary upstream mode retains the configurable theme surface. The Maya
+  // restricted shell never mounts this hook or its settings/theme requests.
+  useResolvedTheme();
   // Wire the localStorage write chokepoint and pull the server-side UI-state
   // blob into localStorage. AppContent only mounts past auth, so this runs as
   // the authenticated user. Background (does NOT gate render): blocking first
