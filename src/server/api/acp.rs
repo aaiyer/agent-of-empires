@@ -360,6 +360,21 @@ pub async fn spawn_acp(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
+    if state.maya_restricted
+        && (req.agent.is_some()
+            || req.model.is_some()
+            || !req.additional_dirs.is_empty()
+            || !req.provider_env.is_empty())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "maya_restricted",
+                "message": "Maya restricted ACP spawn does not accept agent, model, root, or environment overrides"
+            })),
+        )
+            .into_response();
+    }
     {
         let instances = state.instances.read().await;
         if !instances.iter().any(|i| i.id == id) {

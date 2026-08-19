@@ -576,6 +576,11 @@ export interface CreateSessionRequest {
   fork_from?: string;
 }
 
+/** Complete POST /api/sessions body accepted by the Maya restricted profile. */
+export interface MayaRestrictedCreateSessionRequest {
+  title?: string;
+}
+
 /** A discoverable existing Claude Code session on disk, returned by
  *  `GET /api/claude-sessions` for the import picker. See #2276. */
 export interface ClaudeSessionSummary {

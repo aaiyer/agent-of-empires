@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -37,6 +38,12 @@ impl AuthMode {
 
 #[derive(Args)]
 pub struct ServeArgs {
+    /// Run the server-authoritative Maya chat surface. This profile is pinned
+    /// to the `maya` profile, loopback port 3773, passphrase authentication,
+    /// the Maya repository, and the root-owned Codex ACP wrapper.
+    #[arg(long, conflicts_with_all = ["status", "stop", "restart", "daemon", "open"])]
+    pub maya_restricted: bool,
+
     /// Port to listen on (default: 8080; debug builds default to 8081 so a
     /// `cargo run` instance does not collide with an installed release `aoe`).
     #[arg(long)]
@@ -152,6 +159,17 @@ pub struct ServeArgs {
     #[arg(long, env = "AOE_SERVE_PASSPHRASE")]
     pub passphrase: Option<String>,
 
+    /// Read the Maya restricted passphrase from a root-owned, service-group
+    /// readable systemd credential file. The secret is read from the validated
+    /// open file and is never copied into serve.passphrase.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "maya_restricted",
+        conflicts_with = "passphrase"
+    )]
+    pub passphrase_file: Option<PathBuf>,
+
     /// Open the dashboard URL in the default browser once the server is ready.
     /// Ignored under --daemon, --remote, SSH (SSH_CONNECTION/SSH_TTY), or when
     /// no display server is reachable on Linux/BSD.
@@ -192,9 +210,128 @@ impl ServeArgs {
     /// state isolated, but two daemons cannot share a port, so the default
     /// shifts as well.
     pub fn resolved_port(&self) -> u16 {
-        self.port
-            .unwrap_or(if cfg!(debug_assertions) { 8081 } else { 8080 })
+        self.port.unwrap_or(if self.maya_restricted {
+            crate::server::maya_restricted::PORT
+        } else if cfg!(debug_assertions) {
+            8081
+        } else {
+            8080
+        })
     }
+}
+
+const MAX_CREDENTIAL_BYTES: u64 = 4096;
+
+#[cfg(unix)]
+fn validate_credential_metadata(
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    len: u64,
+    effective_gid: u32,
+) -> Result<()> {
+    if uid != 0 {
+        bail!("--passphrase-file must be owned by root");
+    }
+    if gid != effective_gid {
+        bail!("--passphrase-file group must match the process effective group");
+    }
+    if mode & 0o777 != 0o440 {
+        bail!("--passphrase-file mode must be exactly 0440");
+    }
+    if len == 0 || len > MAX_CREDENTIAL_BYTES {
+        bail!("--passphrase-file must contain 1..={MAX_CREDENTIAL_BYTES} bytes");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_root_credential(path: &std::path::Path) -> Result<String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    if !path.is_absolute() {
+        bail!("--passphrase-file must be an absolute path");
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("opening passphrase credential {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspecting passphrase credential {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("--passphrase-file must name a regular file");
+    }
+    // SAFETY: getegid has no preconditions and reads process identity only.
+    let effective_gid = unsafe { libc::getegid() };
+    validate_credential_metadata(
+        metadata.uid(),
+        metadata.gid(),
+        metadata.mode(),
+        metadata.len(),
+        effective_gid,
+    )?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_CREDENTIAL_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading passphrase credential {}", path.display()))?;
+    if bytes.len() as u64 != metadata.len() || bytes.len() as u64 > MAX_CREDENTIAL_BYTES {
+        bail!("--passphrase-file changed while it was being read");
+    }
+    if bytes.ends_with(b"\r\n") {
+        bytes.truncate(bytes.len() - 2);
+    } else if bytes.ends_with(b"\n") {
+        bytes.truncate(bytes.len() - 1);
+    }
+    if bytes.is_empty() || bytes.iter().any(|byte| matches!(*byte, 0 | b'\n' | b'\r')) {
+        bail!("--passphrase-file must contain one non-empty line");
+    }
+    String::from_utf8(bytes).context("--passphrase-file must contain UTF-8")
+}
+
+#[cfg(not(unix))]
+fn read_root_credential(_path: &std::path::Path) -> Result<String> {
+    bail!("--passphrase-file is supported only on Unix")
+}
+
+fn validate_maya_restricted_args(
+    profile: &str,
+    args: &ServeArgs,
+    auth_mode: AuthMode,
+) -> Result<()> {
+    if !args.maya_restricted {
+        if args.passphrase_file.is_some() {
+            bail!("--passphrase-file requires --maya-restricted");
+        }
+        return Ok(());
+    }
+    if profile != crate::server::maya_restricted::PROFILE_NAME {
+        bail!("--maya-restricted requires --profile maya");
+    }
+    if args.host != crate::server::maya_restricted::HOST
+        || args.resolved_port() != crate::server::maya_restricted::PORT
+    {
+        bail!("--maya-restricted requires --host 127.0.0.1 --port 3773");
+    }
+    if auth_mode != AuthMode::Passphrase {
+        bail!("--maya-restricted requires --auth=passphrase");
+    }
+    if args.passphrase.is_some() || args.passphrase_file.is_none() {
+        bail!("--maya-restricted requires only --passphrase-file, not --passphrase or its environment alias");
+    }
+    if args.remote
+        || args.behind_proxy
+        || args.read_only
+        || !args.allowed_host.is_empty()
+        || !args.allowed_origin.is_empty()
+        || args.tunnel_name.is_some()
+        || args.tunnel_url.is_some()
+        || args.no_tailscale
+    {
+        bail!("--maya-restricted disables remote, proxy, read-only, tunnel, and extra authority options");
+    }
+    Ok(())
 }
 
 /// Pure check used by both the CLI validator and its unit tests.
@@ -436,6 +573,8 @@ pub struct ServeLaunch {
     #[serde(default)]
     pub instance_id: Option<String>,
     pub profile: String,
+    #[serde(default)]
+    pub maya_restricted: bool,
     pub host: String,
     pub port: u16,
     pub auth_mode: AuthMode,
@@ -454,6 +593,8 @@ pub struct ServeLaunch {
     pub allowed_host: Vec<String>,
     #[serde(default)]
     pub allowed_origin: Vec<String>,
+    #[serde(default)]
+    pub passphrase_file: Option<PathBuf>,
 }
 
 const SERVE_LAUNCH_SCHEMA: u32 = 2;
@@ -466,6 +607,7 @@ impl ServeLaunch {
     /// is injected by the caller after recall.
     fn to_serve_args(&self, passphrase: Option<String>) -> ServeArgs {
         ServeArgs {
+            maya_restricted: self.maya_restricted,
             port: Some(self.port),
             host: self.host.clone(),
             auth: Some(self.auth_mode),
@@ -481,6 +623,7 @@ impl ServeLaunch {
             stop: false,
             status: false,
             passphrase,
+            passphrase_file: self.passphrase_file.clone(),
             open: false,
             daemon_child: false,
             restart: false,
@@ -934,10 +1077,17 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
     let is_localhost = host_is_localhost(&args.host);
 
     let auth_mode = resolve_auth_mode(args.auth, args.no_auth);
+    validate_maya_restricted_args(profile, &args, auth_mode)?;
+    let credential_passphrase = args
+        .passphrase_file
+        .as_deref()
+        .map(read_root_credential)
+        .transpose()?;
+    let effective_passphrase = credential_passphrase.as_ref().or(args.passphrase.as_ref());
 
     validate_auth_combination(
         auth_mode,
-        args.passphrase.is_some(),
+        effective_passphrase.is_some(),
         is_localhost,
         args.behind_proxy,
         args.remote,
@@ -1043,7 +1193,7 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
     }
 
     // Passphrase strength check
-    if let Some(ref passphrase) = args.passphrase {
+    if let Some(passphrase) = effective_passphrase {
         if let Some(warning) = crate::server::login::check_passphrase_strength(passphrase) {
             eprintln!("{}", warning);
             eprintln!();
@@ -1051,7 +1201,7 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
     }
 
     // Block remote mode without passphrase
-    if args.remote && args.passphrase.is_none() {
+    if args.remote && effective_passphrase.is_none() {
         bail!(
             "Refusing to start in remote mode without a passphrase.\n\
              --remote exposes terminal access to the internet.\n\
@@ -1095,11 +1245,12 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
         tunnel_url: args.tunnel_url.as_deref(),
         no_tailscale: args.no_tailscale,
         is_daemon: false,
-        passphrase: args.passphrase.as_deref(),
+        passphrase: effective_passphrase.map(String::as_str),
         behind_proxy: args.behind_proxy,
         open_browser: args.open,
         extra_allowed_hosts: args.allowed_host.clone(),
         extra_allowed_origins: args.allowed_origin.clone(),
+        maya_restricted: args.maya_restricted,
     })
     .await;
 
@@ -1261,6 +1412,10 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
         &args.host,
     ]);
 
+    if args.maya_restricted {
+        cmd.arg("--maya-restricted");
+    }
+
     if args.no_auth {
         cmd.arg("--no-auth");
     }
@@ -1301,6 +1456,9 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
     if let Some(ref passphrase) = args.passphrase {
         // Pass via env var to avoid exposing the passphrase in the process list
         cmd.env("AOE_SERVE_PASSPHRASE", passphrase);
+    }
+    if let Some(ref path) = args.passphrase_file {
+        cmd.arg("--passphrase-file").arg(path);
     }
     if !profile.is_empty() {
         cmd.args(["--profile", profile]);
@@ -1376,6 +1534,7 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
         pid,
         instance_id: Some(instance_id),
         profile: profile.to_string(),
+        maya_restricted: args.maya_restricted,
         host: args.host.clone(),
         port: args.resolved_port(),
         auth_mode: resolve_auth_mode(args.auth, args.no_auth),
@@ -1388,6 +1547,7 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
         no_tailscale: args.no_tailscale,
         allowed_host: args.allowed_host.clone(),
         allowed_origin: args.allowed_origin.clone(),
+        passphrase_file: args.passphrase_file.clone(),
     };
     if let Err(e) = write_serve_launch(&launch) {
         tracing::warn!(target: "serve.lifecycle", error = %e, "failed to write serve.launch");
@@ -1905,6 +2065,7 @@ mod tests {
             pid: 4242,
             instance_id: Some("instance-1".to_string()),
             profile: "work".to_string(),
+            maya_restricted: false,
             host: "0.0.0.0".to_string(),
             port: 9090,
             auth_mode: AuthMode::Passphrase,
@@ -1917,6 +2078,7 @@ mod tests {
             no_tailscale: true,
             allowed_host: vec!["aoe.example.com".to_string()],
             allowed_origin: vec!["https://aoe.example.com:8443".to_string()],
+            passphrase_file: None,
         }
     }
 
@@ -2208,5 +2370,60 @@ mod tests {
         launch.auth_mode = AuthMode::Token;
         launch.remote = false;
         assert!(!launch_needs_passphrase(&launch));
+    }
+
+    fn maya_restricted_args() -> ServeArgs {
+        let mut args = sample_launch().to_serve_args(None);
+        args.maya_restricted = true;
+        args.host = "127.0.0.1".to_string();
+        args.port = Some(crate::server::maya_restricted::PORT);
+        args.auth = Some(AuthMode::Passphrase);
+        args.behind_proxy = false;
+        args.read_only = false;
+        args.remote = false;
+        args.tunnel_name = None;
+        args.tunnel_url = None;
+        args.no_tailscale = false;
+        args.daemon = false;
+        args.allowed_host.clear();
+        args.allowed_origin.clear();
+        args.passphrase_file = Some(PathBuf::from("/etc/maya-devbox/aoe-passphrase"));
+        args
+    }
+
+    #[test]
+    fn maya_restricted_cli_accepts_only_the_frozen_launch_shape() {
+        let args = maya_restricted_args();
+        assert!(validate_maya_restricted_args("maya", &args, AuthMode::Passphrase).is_ok());
+        assert_eq!(args.resolved_port(), 3773);
+
+        let mut wrong_profile = maya_restricted_args();
+        assert!(
+            validate_maya_restricted_args("default", &wrong_profile, AuthMode::Passphrase).is_err()
+        );
+        wrong_profile.host = "0.0.0.0".to_string();
+        assert!(
+            validate_maya_restricted_args("maya", &wrong_profile, AuthMode::Passphrase).is_err()
+        );
+
+        let mut plaintext = maya_restricted_args();
+        plaintext.passphrase = Some("argv-or-env-secret".to_string());
+        assert!(validate_maya_restricted_args("maya", &plaintext, AuthMode::Passphrase).is_err());
+
+        let mut widened = maya_restricted_args();
+        widened.allowed_host.push("maya.example.com".to_string());
+        assert!(validate_maya_restricted_args("maya", &widened, AuthMode::Passphrase).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maya_credential_metadata_requires_root_service_group_and_exact_mode() {
+        assert!(validate_credential_metadata(0, 1001, 0o100440, 32, 1001).is_ok());
+        assert!(validate_credential_metadata(1001, 1001, 0o100440, 32, 1001).is_err());
+        assert!(validate_credential_metadata(0, 0, 0o100440, 32, 1001).is_err());
+        assert!(validate_credential_metadata(0, 1001, 0o100400, 32, 1001).is_err());
+        assert!(validate_credential_metadata(0, 1001, 0o100444, 32, 1001).is_err());
+        assert!(validate_credential_metadata(0, 1001, 0o100440, 0, 1001).is_err());
+        assert!(validate_credential_metadata(0, 1001, 0o100440, 4097, 1001).is_err());
     }
 }
