@@ -67,6 +67,8 @@ pub(crate) async fn respawn_paired_if_dead(
 
     let mut inst_for_blocking = inst.clone();
     let tmux_name_clone = tmux_name.clone();
+    let command =
+        crate::server::maya_restricted::paired_shell_command(state.maya_restricted, inst, index)?;
     // Two failure modes the user can land in:
     //   1. Pane is dead but the tmux session still exists (shell exit
     //      under `remain-on-exit on`). `kill_terminal_if_dead` clears
@@ -98,7 +100,7 @@ pub(crate) async fn respawn_paired_if_dead(
                 "paired terminal session missing at WS upgrade, recreating"
             );
         }
-        inst_for_blocking.start_terminal_with_size_indexed(index, None)?;
+        inst_for_blocking.start_terminal_with_size_indexed_command(index, None, command)?;
         Ok(true)
     })
     .await

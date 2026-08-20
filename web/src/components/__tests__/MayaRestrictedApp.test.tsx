@@ -54,6 +54,12 @@ vi.mock("../acp/StructuredView", () => ({
   ),
 }));
 
+vi.mock("../PairedTerminal", () => ({
+  PairedShellPane: ({ sessionId, terminalIndex }: { sessionId: string | null; terminalIndex?: number }) => (
+    <div data-testid="paired-shell" data-session-id={sessionId ?? ""} data-terminal-index={terminalIndex} />
+  ),
+}));
+
 const ABOUT = {
   acp_show_tool_durations: true,
   acp_replay_events: 0,
@@ -242,6 +248,17 @@ describe("MayaRestrictedApp", () => {
     expect(view.getAttribute("data-trashed-at")).toBe("2026-08-20T04:00:00Z");
     expect(view.getAttribute("data-has-restore")).toBe("true");
     expect(view.getAttribute("data-restricted")).toBe("true");
+  });
+
+  it("composes exactly one fixed index-zero paired shell beside the active structured view", async () => {
+    sessionsFixture = [session()];
+    renderApp("/session/s-1");
+
+    expect(await screen.findByTestId("structured-view")).toBeTruthy();
+    const shells = screen.getAllByTestId("paired-shell");
+    expect(shells).toHaveLength(1);
+    expect(shells[0].getAttribute("data-session-id")).toBe("s-1");
+    expect(shells[0].getAttribute("data-terminal-index")).toBe("0");
   });
 
   it("does not emit an empty title override", () => {
