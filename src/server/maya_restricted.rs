@@ -9,6 +9,8 @@ use super::AppState;
 
 pub const PROFILE_NAME: &str = "maya";
 pub const PROJECT_PATH: &str = "/home/aaiyer/maya/maya-main";
+pub const MAGIC_DNS_HOST: &str = "maya-devbox.tail564f89.ts.net";
+pub const MAGIC_DNS_ORIGIN: &str = "https://maya-devbox.tail564f89.ts.net";
 pub const HOST: &str = "127.0.0.1";
 pub const PORT: u16 = 3773;
 pub const CODEX_COMMAND: &str = "/usr/bin/sudo";
