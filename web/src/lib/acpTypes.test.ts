@@ -1306,6 +1306,32 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
     expect(state.turnActive).toBe(false);
   });
 
+  it("history replay settlement closes the imported turn and unblocks queue drain", () => {
+    let state: AcpState = {
+      ...emptyAcpState(),
+      serverTurnActive: true,
+      turnActive: true,
+      queuedPrompts: [
+        {
+          id: "queued-after-import",
+          text: "continue the resumed work",
+          queuedAt: "2026-08-20T00:00:00.000Z",
+        },
+      ],
+    };
+
+    state = applyEvent(state, {
+      session_id: "s-imported",
+      seq: 762,
+      event: { Stopped: { reason: "history_replay_complete" } },
+    });
+
+    expect(state.serverTurnActive).toBe(false);
+    expect(state.turnActive).toBe(false);
+    expect(state.queuedPrompts).toHaveLength(1);
+    expect(state.queuedPrompts.length > 0 && !state.turnActive).toBe(true);
+  });
+
   it("late Stopped from a prior turn does NOT clobber a fresh follow-up", async () => {
     // #1170. The user taps Send the instant the prior turn ends, so the
     // optimistic dispatch lands before that turn's Stopped frame. The
