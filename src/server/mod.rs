@@ -1149,13 +1149,24 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // rotates on quick tunnels and the bind is forced to loopback, so
     // `--allowed-host` cannot cover this path.
     let tunnel_host: Option<String> = tunnel_handle.as_ref().and_then(|h| host_from_url(&h.url));
-    let (allowed_hosts, allowed_origins) = resolve_access_policy(
-        host,
-        local_port,
-        &extra_allowed_hosts,
-        &extra_allowed_origins,
-        tunnel_host.as_deref(),
-    );
+    let (allowed_hosts, allowed_origins) = if maya_restricted {
+        resolve_access_policy_for_mode(
+            true,
+            host,
+            local_port,
+            &extra_allowed_hosts,
+            &extra_allowed_origins,
+            tunnel_host.as_deref(),
+        )
+    } else {
+        resolve_access_policy(
+            host,
+            local_port,
+            &extra_allowed_hosts,
+            &extra_allowed_origins,
+            tunnel_host.as_deref(),
+        )
+    };
     tracing::info!(
         target: "http.access",
         ?allowed_hosts,
@@ -2194,6 +2205,17 @@ fn resolve_access_policy(
     extra_origins: &[String],
     tunnel_host: Option<&str>,
 ) -> (Vec<String>, Vec<String>) {
+    resolve_access_policy_for_mode(false, host, port, extra_hosts, extra_origins, tunnel_host)
+}
+
+fn resolve_access_policy_for_mode(
+    maya_restricted: bool,
+    host: &str,
+    port: u16,
+    extra_hosts: &[String],
+    extra_origins: &[String],
+    tunnel_host: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
     let mut hosts: Vec<String> = Vec::new();
     let mut origins: Vec<String> = Vec::new();
 
@@ -2212,29 +2234,37 @@ fn resolve_access_policy(
         push_origin(&mut origins, format!("https://{hb}:{port}"));
     }
 
-    for h in extra_hosts {
-        let nh = norm_host(h);
-        if nh.is_empty() {
-            continue;
-        }
-        push_unique(&mut hosts, nh.clone());
-        let hb = bracket_if_ipv6(&nh);
-        push_origin(&mut origins, format!("http://{hb}:{port}"));
-        push_origin(&mut origins, format!("https://{hb}:{port}"));
-        push_origin(&mut origins, format!("http://{hb}"));
-        push_origin(&mut origins, format!("https://{hb}"));
-    }
-
-    if let Some(th) = tunnel_host {
-        let nh = norm_host(th);
-        if !nh.is_empty() {
+    if maya_restricted {
+        // The restricted deployment has one authenticated private browser
+        // origin. Do not let launcher-provided --allowed-* values or a tunnel
+        // probe widen that contract.
+        push_unique(&mut hosts, maya_restricted::MAGIC_DNS_HOST.to_string());
+        push_origin(&mut origins, maya_restricted::MAGIC_DNS_ORIGIN.to_string());
+    } else {
+        for h in extra_hosts {
+            let nh = norm_host(h);
+            if nh.is_empty() {
+                continue;
+            }
             push_unique(&mut hosts, nh.clone());
-            push_origin(&mut origins, format!("https://{}", bracket_if_ipv6(&nh)));
+            let hb = bracket_if_ipv6(&nh);
+            push_origin(&mut origins, format!("http://{hb}:{port}"));
+            push_origin(&mut origins, format!("https://{hb}:{port}"));
+            push_origin(&mut origins, format!("http://{hb}"));
+            push_origin(&mut origins, format!("https://{hb}"));
         }
-    }
 
-    for o in extra_origins {
-        push_origin(&mut origins, o.clone());
+        if let Some(th) = tunnel_host {
+            let nh = norm_host(th);
+            if !nh.is_empty() {
+                push_unique(&mut hosts, nh.clone());
+                push_origin(&mut origins, format!("https://{}", bracket_if_ipv6(&nh)));
+            }
+        }
+
+        for o in extra_origins {
+            push_origin(&mut origins, o.clone());
+        }
     }
 
     (hosts, origins)
@@ -6280,6 +6310,39 @@ mod tests {
     }
 
     #[test]
+    fn maya_restricted_policy_allows_only_private_magic_dns() {
+        let (hosts, origins) = resolve_access_policy_for_mode(
+            true,
+            "127.0.0.1",
+            3773,
+            &vecs(&["operator.example.com"]),
+            &vecs(&["https://operator.example.com"]),
+            Some("unexpected-tunnel.example.com"),
+        );
+        assert_eq!(
+            evaluate_access(
+                Some(maya_restricted::MAGIC_DNS_HOST),
+                Some(maya_restricted::MAGIC_DNS_ORIGIN),
+                &hosts,
+                &origins,
+            ),
+            AccessDecision::Allow
+        );
+        assert_eq!(
+            evaluate_access(
+                Some("evil.example.com"),
+                Some("https://evil.example.com"),
+                &hosts,
+                &origins,
+            ),
+            AccessDecision::DenyHost
+        );
+        assert!(!hosts.contains(&"operator.example.com".to_string()));
+        assert!(!hosts.contains(&"unexpected-tunnel.example.com".to_string()));
+        assert!(!origins.contains(&"https://operator.example.com".to_string()));
+    }
+
+    #[test]
     fn tailscale_host_auto_injected() {
         let (h, o) =
             resolve_access_policy("127.0.0.1", 8080, &[], &[], Some("host.tailnet.ts.net"));
@@ -6466,6 +6529,62 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&about_body).unwrap();
         assert_eq!(payload["profile"], "maya");
         assert_eq!(payload["maya_restricted"], true);
+    }
+
+    #[tokio::test]
+    async fn maya_restricted_router_allows_magic_dns_and_denies_evil_host() {
+        use tower::ServiceExt;
+
+        let (allowed_hosts, allowed_origins) = resolve_access_policy_for_mode(
+            true,
+            "127.0.0.1",
+            3773,
+            &vecs(&["operator.example.com"]),
+            &vecs(&["https://operator.example.com"]),
+            Some("unexpected-tunnel.example.com"),
+        );
+        let mut state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            allowed_hosts,
+            allowed_origins,
+            None,
+        );
+        Arc::get_mut(&mut state)
+            .expect("unique test state")
+            .maya_restricted = true;
+
+        let app = test_support::build_router_for_test(state.clone());
+        let allowed = axum::http::Request::builder()
+            .uri("/api/about")
+            .header("host", maya_restricted::MAGIC_DNS_HOST)
+            .header("origin", maya_restricted::MAGIC_DNS_ORIGIN)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let mut allowed = allowed;
+        let remote: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        allowed
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        assert_eq!(
+            app.oneshot(allowed).await.unwrap().status(),
+            axum::http::StatusCode::OK
+        );
+
+        let app = test_support::build_router_for_test(state);
+        let denied = axum::http::Request::builder()
+            .uri("/api/about")
+            .header("host", "evil.example.com")
+            .header("origin", "https://evil.example.com")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let mut denied = denied;
+        denied
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        assert_eq!(
+            app.oneshot(denied).await.unwrap().status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
     }
 
     #[tokio::test]
