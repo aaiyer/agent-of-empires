@@ -15,6 +15,7 @@ import {
 } from "../lib/api";
 import type { MayaRestrictedCreateSessionRequest } from "../lib/types";
 import { MainPaneSkeleton } from "./AppShellSkeleton";
+import { PairedShellPane } from "./PairedTerminal";
 
 const StructuredView = lazy(() =>
   import("./acp/StructuredView").then((module) => ({ default: module.StructuredView })),
@@ -275,7 +276,7 @@ export function MayaRestrictedApp({
           )}
         </aside>
 
-        <main className="min-w-0 flex-1">
+        <main className="flex min-w-0 flex-1">
           {!activeSessionId ? (
             <div className="flex h-full items-center justify-center text-sm text-text-dim">
               Create or select a Codex chat.
@@ -285,19 +286,26 @@ export function MayaRestrictedApp({
           ) : !active ? (
             <div className="flex h-full items-center justify-center text-sm text-text-dim">Chat not found.</div>
           ) : (
-            <Suspense fallback={<MainPaneSkeleton />}>
-              <StructuredView
-                sessionId={active.id}
-                acpWorkerState={active.acp_worker_state ?? "absent"}
-                tool="codex"
-                acpAgent={active.acp_agent ?? "codex"}
-                archivedAt={active.archived_at ?? null}
-                snoozedUntil={null}
-                trashedAt={active.trashed_at ?? null}
-                onRestore={active.trashed_at ? () => restoreChat(active.id) : undefined}
-                restricted
-              />
-            </Suspense>
+            <>
+              <div className="flex min-w-0 flex-1">
+                <Suspense fallback={<MainPaneSkeleton />}>
+                  <StructuredView
+                    sessionId={active.id}
+                    acpWorkerState={active.acp_worker_state ?? "absent"}
+                    tool="codex"
+                    acpAgent={active.acp_agent ?? "codex"}
+                    archivedAt={active.archived_at ?? null}
+                    snoozedUntil={null}
+                    trashedAt={active.trashed_at ?? null}
+                    onRestore={active.trashed_at ? () => restoreChat(active.id) : undefined}
+                    restricted
+                  />
+                </Suspense>
+              </div>
+              <div className="flex w-2/5 min-w-80 border-l border-surface-800">
+                <PairedShellPane session={active} sessionId={active.id} terminalIndex={0} />
+              </div>
+            </>
           )}
         </main>
       </div>
