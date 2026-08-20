@@ -140,6 +140,14 @@ const FAST_EXIT_THRESHOLD: Duration = Duration::from_secs(10);
 /// `spawn_agent` before the adapter starts.
 pub(crate) const ACP_AGENT_ENV: &str = "AOE_ACP_AGENT_ENV";
 
+/// Private text carried in a valid ACP `agent_message_chunk` notification to
+/// fence runner-owned `session/load` history replay on the main relay. The
+/// daemon consumes this marker before transcript mapping; it is never exposed
+/// as assistant text. Keeping the barrier on the relay (rather than the
+/// sibling control socket) gives it the same ordering as every preceding
+/// replay notification.
+pub(crate) const HISTORY_REPLAY_BARRIER_TEXT: &str = "\u{001e}aoe.history-replay-barrier.v1";
+
 /// Pipe-read buffer for the agent's stdout. 64KB matches the default
 /// pipe size on macOS/Linux.
 const STDOUT_READ_BUF: usize = 64 * 1024;
@@ -1296,6 +1304,9 @@ impl RunnerShared {
         request: serde_json::Value,
     ) -> Result<(String, serde_json::Value), serde_json::Value> {
         if let Some(cached) = self.handshake.lock().await.session.clone() {
+            if method == "session/load" {
+                self.emit_history_replay_barrier(&cached.0).await;
+            }
             return Ok(cached);
         }
         // ACP load resumes the provider session named by the request. Its
@@ -1329,7 +1340,41 @@ impl RunnerShared {
         };
         let cached = (acp_session_id, result);
         self.handshake.lock().await.session = Some(cached.clone());
+        if method == "session/load" {
+            self.emit_history_replay_barrier(&cached.0).await;
+        }
         Ok(cached)
+    }
+
+    /// Publish the `session/load` replay commit point on the main relay.
+    ///
+    /// The stdout fanout is the sole reader of agent output. It resolves the
+    /// load response only after forwarding every earlier notification. This
+    /// method runs after that response resolves and writes the barrier through
+    /// the same relay writer before `SessionReady` is emitted on the separate
+    /// control socket. A slow daemon may therefore observe `SessionReady`
+    /// before it has *processed* all replay, but it cannot process this marker
+    /// until all preceding relay frames have been processed.
+    async fn emit_history_replay_barrier(&self, acp_session_id: &str) {
+        let marker = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": acp_session_id,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": HISTORY_REPLAY_BARRIER_TEXT,
+                    }
+                }
+            }
+        });
+        let Ok(mut line) = serde_json::to_vec(&marker) else {
+            return;
+        };
+        line.push(b'\n');
+        self.deliver_line(&line).await;
     }
 
     /// The ACP session id the runner established, if any.
@@ -2078,6 +2123,145 @@ mod tests {
             Some("stored"),
             "later prompts, cancellation, and reattach must use the resumed identity"
         );
+    }
+
+    /// Regression for the production two-socket race: control-channel
+    /// `SessionReady` can be consumed before a slow daemon has reduced the
+    /// relay's replay notifications. The replay settlement must therefore
+    /// ride the relay itself, after the complete replay prefix, rather than be
+    /// inferred from `SessionReady` on the sibling socket.
+    #[tokio::test]
+    async fn session_load_barrier_follows_large_replay_on_main_relay() {
+        const REPLAY_LINES: usize = 256;
+
+        let script = r#"
+IFS= read -r ignored
+i=0
+while [ "$i" -lt "$AOE_TEST_REPLAY_COUNT" ]; do
+  i=$((i + 1))
+  printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"stored","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"replay-%s"}}}}\n' "$i"
+done
+printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$AOE_TEST_RESPONSE_ID"
+"#;
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env("AOE_TEST_REPLAY_COUNT", REPLAY_LINES.to_string())
+            .env("AOE_TEST_RESPONSE_ID", RUNNER_REQUEST_ID_BASE.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn large replay fixture");
+        let agent_stdin = Arc::new(Mutex::new(child.stdin.take().expect("fixture stdin")));
+        let agent_stdout = child.stdout.take().expect("fixture stdout");
+        let shared = Arc::new(RunnerShared::new());
+        let fanout = tokio::spawn(fanout_agent_stdout(
+            agent_stdout,
+            Arc::clone(&shared),
+            "fixture-session".into(),
+        ));
+
+        // Production topology: one raw relay socket plus a separate framed
+        // control socket, both sharing the same runner and agent stdio.
+        let (daemon_relay, runner_relay) = UnixStream::pair().expect("relay socket pair");
+        let relay_handler = tokio::spawn(handle_connection(
+            runner_relay,
+            Arc::clone(&shared),
+            Arc::clone(&agent_stdin),
+            "fixture-session".into(),
+        ));
+        let (relay_read, relay_write) = daemon_relay.into_split();
+        let mut relay_reader = BufReader::new(relay_read);
+        // Deterministic socket rendezvous: this line is buffered if the relay
+        // handler has not installed its outbound yet, then drained by
+        // install_outbound. Reading it proves the production relay writer is
+        // installed without scheduler polling or sleeps.
+        let ready_line = b"{\"jsonrpc\":\"2.0\",\"method\":\"fixture/relay_ready\"}\n";
+        shared.deliver_line(ready_line).await;
+        let mut line = String::new();
+        relay_reader
+            .read_line(&mut line)
+            .await
+            .expect("relay readiness rendezvous");
+        assert_eq!(line.as_bytes(), ready_line);
+
+        let (daemon_control, runner_control) = UnixStream::pair().expect("control socket pair");
+        let control_handler = tokio::spawn(handle_control_connection(
+            runner_control,
+            Arc::clone(&shared),
+            Arc::clone(&agent_stdin),
+            "fixture-session".into(),
+        ));
+        let (mut control_read, mut control_write) = daemon_control.into_split();
+        assert!(matches!(
+            control_protocol::read_frame(&mut control_read)
+                .await
+                .expect("read hello"),
+            Some(ControlBody::Hello { .. })
+        ));
+        control_protocol::write_frame(
+            &mut control_write,
+            &ControlBody::Attach {
+                control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .expect("write attach");
+        control_protocol::write_frame(
+            &mut control_write,
+            &ControlBody::EstablishSession {
+                method: "session/load".into(),
+                request: serde_json::json!({"sessionId": "stored"}),
+            },
+        )
+        .await
+        .expect("write load");
+
+        // Deliberately do not read the relay yet. This reproduces the live
+        // scheduler shape where control readiness overtook relay reduction.
+        assert_eq!(
+            control_protocol::read_frame(&mut control_read)
+                .await
+                .expect("read load result"),
+            Some(ControlBody::SessionReady {
+                acp_session_id: "stored".into(),
+                result: serde_json::json!({}),
+            })
+        );
+
+        for expected in 1..=REPLAY_LINES {
+            line.clear();
+            relay_reader
+                .read_line(&mut line)
+                .await
+                .expect("read replay notification");
+            let value: serde_json::Value =
+                serde_json::from_str(&line).expect("valid replay notification");
+            assert_eq!(
+                value["params"]["update"]["content"]["text"],
+                format!("replay-{expected}"),
+                "replay order must be preserved before settlement"
+            );
+        }
+        line.clear();
+        relay_reader
+            .read_line(&mut line)
+            .await
+            .expect("read replay barrier");
+        let barrier: serde_json::Value =
+            serde_json::from_str(&line).expect("valid replay barrier notification");
+        assert_eq!(
+            barrier["params"]["update"]["content"]["text"], HISTORY_REPLAY_BARRIER_TEXT,
+            "settlement must be the last frame in the replay prefix"
+        );
+
+        drop(relay_write);
+        drop(control_read);
+        drop(control_write);
+        relay_handler.await.expect("relay handler");
+        control_handler.await.expect("control handler");
+        fanout.await.expect("stdout fanout");
+        child.wait().await.expect("fixture exits");
     }
 
     /// Only `session/load` has a request-owned identity. A successful-looking

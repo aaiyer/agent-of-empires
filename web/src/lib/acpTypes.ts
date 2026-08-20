@@ -1607,7 +1607,15 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // clear the "Stopping..." state regardless of reason. See #1727.
     next.cancelling = false;
     next.cancelEscalatesAt = null;
-    next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
+    // An imported session replays all historical user prompts before one
+    // ordered settlement barrier. That barrier closes the complete historical
+    // prefix, not merely one turn; retiring one counter left the composer in
+    // Waiting when the imported transcript contained multiple prompts. Normal
+    // turn terminals retain their one-at-a-time race protection.
+    next.lastStoppedSeq =
+      event.Stopped.reason === "history_replay_complete"
+        ? next.pendingUserPromptSeq
+        : Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
     next.turnActive = isTurnActive(next);
     // Clear the "monitoring" badge once the monitor has fired and that turn
     // ends. The monitor firing makes the agent act (a tool call after the

@@ -2066,6 +2066,35 @@ describe("turnActive derivation from prompt/stop counters (#1170)", () => {
     expect(state.turnActive).toBe(false);
   });
 
+  it("history replay settlement retires the complete imported prefix and unblocks queue drain", () => {
+    let state: AcpState = {
+      ...emptyAcpState(),
+      pendingUserPromptSeq: 9,
+      lastStoppedSeq: 2,
+      turnActive: true,
+      queuedPrompts: [
+        {
+          id: "queued-after-import",
+          text: "continue the resumed work",
+          queuedAt: "2026-08-20T00:00:00.000Z",
+        },
+      ],
+    };
+
+    state = applyEvent(state, {
+      session_id: "s-imported",
+      seq: 762,
+      event: { Stopped: { reason: "history_replay_complete" } },
+    });
+
+    expect(state.lastStoppedSeq).toBe(9);
+    expect(state.turnActive).toBe(false);
+    expect(state.queuedPrompts).toHaveLength(1);
+    // Exact reducer-side predicate used by the queue drain before its
+    // transport/worker readiness gates.
+    expect(state.queuedPrompts.length > 0 && !state.turnActive).toBe(true);
+  });
+
   it("late Stopped from prior turn does NOT clobber turnActive after a fresh follow-up", async () => {
     // The bug. Prior turn: pendingUserPromptSeq=1, lastStoppedSeq=0
     // (turnActive=true). User submits a follow-up before the prior

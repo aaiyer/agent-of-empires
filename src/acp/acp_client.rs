@@ -4238,6 +4238,38 @@ fn is_transcript_event(event: &Event) -> bool {
     )
 }
 
+/// Identify the runner's ordered `session/load` replay barrier before the
+/// private marker can enter transcript mapping or watchdog bookkeeping.
+fn is_history_replay_barrier(update: &SessionUpdate) -> bool {
+    matches!(
+        update,
+        SessionUpdate::AgentMessageChunk(chunk)
+            if matches!(
+                &chunk.content,
+                ContentBlock::Text(text)
+                    if text.text == crate::process::runner::HISTORY_REPLAY_BARRIER_TEXT
+            )
+    )
+}
+
+/// Consume a relay barrier and return the seeded import identity it commits.
+/// `None` means the update is ordinary ACP traffic; `Some(None)` is the
+/// expected barrier for an ordinary suppressed load; `Some(Some(id))` is the
+/// one armed seeded-load settlement. Taking the identity makes duplicate or
+/// replayed barriers idempotent and binds the later assignment to the exact
+/// stored id that armed this load.
+fn consume_history_replay_barrier(
+    update: &SessionUpdate,
+    armed: &std::sync::Mutex<Option<String>>,
+) -> Option<Option<String>> {
+    is_history_replay_barrier(update).then(|| {
+        armed
+            .lock()
+            .expect("seeded replay barrier mutex poisoned")
+            .take()
+    })
+}
+
 /// Cheap discriminant for log breadcrumbs (matches the one in
 /// event_store, kept separate so this module doesn't depend on the
 /// store's private helper).
@@ -6002,6 +6034,12 @@ async fn run_connection_task<W, R>(
     let suppress_history_replay = Arc::new(AtomicBool::new(false));
     let suppress_for_notif = suppress_history_replay.clone();
     let suppress_for_block = suppress_history_replay.clone();
+    // Runner-mediated imported loads arm one in-order settlement marker.
+    // The marker rides the relay after every preceding replay notification;
+    // direct stdio has no marker and retains its response-ordered settlement.
+    let seeded_replay_barrier_armed = Arc::new(std::sync::Mutex::new(None::<String>));
+    let seeded_replay_barrier_for_notif = seeded_replay_barrier_armed.clone();
+    let seeded_replay_barrier_for_block = seeded_replay_barrier_armed.clone();
     let session_label_for_notif = session_label.clone();
 
     // Watchdog inputs (only consulted when `mode` is `Resume { in_flight_turn: true }`):
@@ -6112,6 +6150,8 @@ async fn run_connection_task<W, R>(
             move |notification: SessionNotification, _cx| {
                 let event_tx = event_tx_for_notif.clone();
                 let suppress = suppress_for_notif.clone();
+                let seeded_replay_barrier_armed =
+                    seeded_replay_barrier_for_notif.clone();
                 let session_label = session_label_for_notif.clone();
                 let last_event_at = last_event_at_for_notif.clone();
                 let first_event_after_attach =
@@ -6136,6 +6176,32 @@ async fn run_connection_task<W, R>(
                 let prompt_in_flight = prompt_in_flight_for_notif.clone();
                 let tool_context_cache = tool_context_cache_for_notif.clone();
                 async move {
+                    if let Some(settled_acp_session_id) = consume_history_replay_barrier(
+                        &notification.update,
+                        &seeded_replay_barrier_armed,
+                    ) {
+                        // The runner emits a barrier for every successful load.
+                        // Only an imported/seeded load arms settlement; ordinary
+                        // loads consume the marker without manufacturing a turn
+                        // terminal. `swap` makes duplicate markers idempotent.
+                        if let Some(acp_session_id) = settled_acp_session_id {
+                            // Preserve the durable commit order: replay events,
+                            // terminal settlement, then the assignment that
+                            // clears import_pending. If the daemon dies before
+                            // settlement, import_pending remains retryable; it
+                            // can never publish a completed import whose store
+                            // still lacks the terminal boundary.
+                            let _ = event_tx
+                                .send(Event::Stopped {
+                                    reason: "history_replay_complete".into(),
+                                })
+                                .await;
+                            let _ = event_tx
+                                .send(Event::AcpSessionAssigned { acp_session_id })
+                                .await;
+                        }
+                        return Ok(());
+                    }
                     last_event_at
                         .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
                     let suppressing = suppress.load(Ordering::Relaxed);
@@ -6862,6 +6928,14 @@ async fn run_connection_task<W, R>(
                             // normally.
                             if !seed_history_replay {
                                 suppress_for_block.store(true, Ordering::Relaxed);
+                            } else if control_client.is_some() {
+                                // Arm before sending session/load: the runner can
+                                // relay the ordered barrier before SessionReady
+                                // resolves on the sibling control socket.
+                                *seeded_replay_barrier_for_block
+                                    .lock()
+                                    .expect("seeded replay barrier mutex poisoned") =
+                                    Some(stored.clone());
                             }
                             let req = ExactLoadSessionRequest::new(
                                 stored.clone(),
@@ -6916,11 +6990,13 @@ async fn run_connection_task<W, R>(
                                     // dead pipe). The server-side listener treats a
                                     // same-id Assigned as a no-op, so this doesn't
                                     // rewrite sessions.json.
-                                    let _ = event_tx_for_block
-                                        .send(Event::AcpSessionAssigned {
-                                            acp_session_id: stored.clone(),
-                                        })
-                                        .await;
+                                    if !(seed_history_replay && control_client.is_some()) {
+                                        let _ = event_tx_for_block
+                                            .send(Event::AcpSessionAssigned {
+                                                acp_session_id: stored.clone(),
+                                            })
+                                            .await;
+                                    }
                                     // LoadSessionResponse carries config_options
                                     // (including the model selector, category
                                     // Model) so the structured view picker
@@ -6943,7 +7019,7 @@ async fn run_connection_task<W, R>(
                                     // accepted. Ordinary resume loads suppress
                                     // their duplicate transcript and must not
                                     // manufacture a turn boundary. See #2276.
-                                    if seed_history_replay {
+                                    if seed_history_replay && control_client.is_none() {
                                         let _ = event_tx_for_block
                                             .send(Event::Stopped {
                                                 reason: "history_replay_complete".into(),
@@ -11249,6 +11325,52 @@ done
         let wire = std::fs::read_to_string(capture).expect("read history replay capture");
         assert_eq!(wire.matches("\"method\":\"session/load\"").count(), 1);
         assert_eq!(wire.matches("\"method\":\"session/new\"").count(), 0);
+    }
+
+    #[test]
+    fn runner_history_replay_barrier_is_private_and_exact() {
+        let barrier: SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {
+                "type": "text",
+                "text": crate::process::runner::HISTORY_REPLAY_BARRIER_TEXT,
+            }
+        }))
+        .expect("deserialize runner replay barrier");
+        assert!(is_history_replay_barrier(&barrier));
+
+        let armed = std::sync::Mutex::new(None);
+        assert_eq!(
+            consume_history_replay_barrier(&barrier, &armed),
+            Some(None),
+            "ordinary load consumes its relay marker without settlement"
+        );
+        *armed.lock().expect("barrier test mutex") = Some("stored-history".into());
+        assert_eq!(
+            consume_history_replay_barrier(&barrier, &armed),
+            Some(Some("stored-history".into())),
+            "seeded load settles at its armed relay marker"
+        );
+        assert_eq!(
+            consume_history_replay_barrier(&barrier, &armed),
+            Some(None),
+            "a replayed barrier is idempotent"
+        );
+
+        let ordinary: SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "ordinary assistant text" }
+        }))
+        .expect("deserialize ordinary agent chunk");
+        assert!(
+            !is_history_replay_barrier(&ordinary),
+            "ordinary transcript content must not become a settlement"
+        );
+        assert_eq!(
+            consume_history_replay_barrier(&ordinary, &armed),
+            None,
+            "ordinary transcript content remains ordinary ACP traffic"
+        );
     }
 
     /// Restricted resume success keeps the exact stored authority and follows
