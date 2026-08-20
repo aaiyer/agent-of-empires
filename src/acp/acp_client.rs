@@ -555,8 +555,13 @@ pub struct SpawnConfig {
     /// `agent_capabilities.load_session = true`, the connection task
     /// sends `LoadSessionRequest` instead of `NewSessionRequest`. On
     /// load failure the task falls back to `session/new` and emits a
-    /// `SessionContextReset` event.
+    /// `SessionContextReset` event, except in Maya restricted mode, where a
+    /// stored id is resume-only and any load failure stops the spawn.
     pub stored_acp_session_id: Option<String>,
+    /// Preserve stored ACP session identity in the server-authoritative Maya
+    /// profile. A restricted spawn with a stored id may only resume that exact
+    /// id; it must never replace it through a `session/new` fallback.
+    pub maya_restricted: bool,
     /// When `Some`, this spawn is a structured fork: instead of `session/new`
     /// or `session/load`, the connection task sends `session/fork` with this
     /// parent ACP session id (provided the agent advertises the fork
@@ -758,6 +763,7 @@ pub enum ResetSessionOutcome {
 enum ConnectMode {
     Fresh {
         stored_acp_session_id: Option<String>,
+        maya_restricted: bool,
         /// Seed the event store from the `session/load` history replay
         /// instead of suppressing it (imported session, empty store). See
         /// #2276.
@@ -2582,6 +2588,7 @@ impl AcpClient {
         //    a real `aoe` binary, and as a safety valve.
         let mode = ConnectMode::Fresh {
             stored_acp_session_id: config.stored_acp_session_id.clone(),
+            maya_restricted: config.maya_restricted,
             seed_history_replay: config.seed_history_replay,
             fork_from: config.fork_from.clone(),
         };
@@ -7310,15 +7317,18 @@ async fn run_connection_task<W, R>(
                 }
                 ConnectMode::Fresh {
                     stored_acp_session_id,
+                    maya_restricted,
                     seed_history_replay,
                     fork_from,
                 } => {
                     // Decide whether to resume the prior agent session or create
                     // a fresh one. session/load is only attempted when the agent
                     // advertises support AND we have a stored id to feed it. On
-                    // load failure (id GC'd, agent state lost, etc.) we fall
-                    // through to session/new and emit SessionContextReset so the
-                    // UI can show a notice and clear stale token-usage hints.
+                    // load failure (id GC'd, agent state lost, etc.) ordinary
+                    // sessions fall through to session/new and emit
+                    // SessionContextReset so the UI can show a notice and clear
+                    // stale token-usage hints. Maya restricted sessions with a
+                    // stored id are resume-only and fail closed instead.
                     let mut acp_session_id: Option<SessionId> = None;
 
                     // Structured fork (when fork_pending is set and the agent
@@ -7463,6 +7473,17 @@ async fn run_connection_task<W, R>(
                             .await;
                     }
 
+                    if acp_session_id.is_none()
+                        && maya_restricted
+                        && stored_acp_session_id.is_some()
+                        && !load_session_capable
+                    {
+                        let stored = stored_acp_session_id.as_deref().unwrap();
+                        return Err(acp_internal_error(format!(
+                            "Maya restricted session `{stored}` cannot be resumed because the agent does not advertise session/load; refusing session/new fallback"
+                        )));
+                    }
+
                     if acp_session_id.is_none() && load_session_capable {
                         if let Some(stored) = stored_acp_session_id.clone() {
                             info!(
@@ -7595,6 +7616,19 @@ async fn run_connection_task<W, R>(
                                         session = %session_label,
                                         stored_id = %stored,
                                         "session/load failed for imported session; failing import (no session/new fallback): {e}"
+                                    );
+                                    return Err(e);
+                                }
+                                Err(mut e) if maya_restricted => {
+                                    warn!(
+                                        target: "acp.protocol",
+                                        session = %session_label,
+                                        stored_id = %stored,
+                                        "session/load failed for Maya restricted session; refusing session/new fallback: {e}"
+                                    );
+                                    e.message = format!(
+                                        "Maya restricted session/load failed for stored session `{stored}`; refusing session/new fallback: {}",
+                                        e.message
                                     );
                                     return Err(e);
                                 }
@@ -11865,6 +11899,7 @@ mod tests {
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
+            maya_restricted: false,
             fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
@@ -11940,6 +11975,7 @@ mod tests {
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
+            maya_restricted: false,
             fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
@@ -12036,6 +12072,7 @@ mod tests {
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
+            maya_restricted: false,
             fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
@@ -12256,6 +12293,7 @@ done
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: Some("stored-history".into()),
+            maya_restricted: false,
             fork_from: None,
             seed_history_replay,
             artifact_dir: None,
@@ -12371,6 +12409,225 @@ done
         let wire = std::fs::read_to_string(capture).expect("read history replay capture");
         assert_eq!(wire.matches("\"method\":\"session/load\"").count(), 1);
         assert_eq!(wire.matches("\"method\":\"session/new\"").count(), 0);
+    }
+
+    /// Restricted resume success keeps the exact stored authority and follows
+    /// the same replay-suppression behavior as an ordinary reattach.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn maya_restricted_load_success_retains_exact_stored_id() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (script, capture) = write_history_replay_fake_agent(tmp.path());
+        let mut config = history_replay_spawn_config(&script, tmp.path(), false);
+        config.maya_restricted = true;
+        let client = AcpClient::spawn(config, AcpSessionId("restricted-history-load".into()))
+            .await
+            .expect("spawn scripted history replay agent");
+        let events = collect_history_load_events(client).await;
+
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::AcpSessionAssigned { acp_session_id } => {
+                        Some(acp_session_id.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["stored-history"],
+            "restricted load success must retain only the exact stored id; events: {events:?}"
+        );
+        let wire = std::fs::read_to_string(capture).expect("read history replay capture");
+        assert_eq!(wire.matches("\"method\":\"session/load\"").count(), 1);
+        assert_eq!(wire.matches("\"method\":\"session/new\"").count(), 0);
+    }
+
+    /// Write a scripted stdio ACP agent that advertises session/load, rejects
+    /// the stored id, and would mint a distinct replacement id if the client
+    /// falls back to session/new. Capturing the production JSON-RPC wire makes
+    /// the forbidden fallback directly observable.
+    #[cfg(unix)]
+    fn write_load_failure_fake_agent(
+        dir: &std::path::Path,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let capture = dir.join("load-failure-capture.ndjson");
+        let script_path = dir.join("fake-load-failure-agent.sh");
+        let script = r#"#!/bin/sh
+CAPTURE=__CAPTURE__
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CAPTURE"
+  id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
+  case $line in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}\n' "$id"
+      ;;
+    *'"method":"session/load"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"stored session unavailable"}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"replacement-id"}}\n' "$id"
+      ;;
+  esac
+done
+"#
+        .replace("__CAPTURE__", capture.to_str().expect("utf8 tmp path"));
+        std::fs::write(&script_path, script).expect("write fake load failure agent");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake load failure agent");
+        (script_path, capture)
+    }
+
+    #[cfg(unix)]
+    fn load_failure_spawn_config(
+        script: &std::path::Path,
+        cwd: &std::path::Path,
+        maya_restricted: bool,
+    ) -> SpawnConfig {
+        SpawnConfig {
+            agent_key: "codex".into(),
+            spec: AgentSpec {
+                command: script.to_string_lossy().into_owned(),
+                args: vec![],
+                description: "scripted load failure fake".into(),
+                env_allowlist: None,
+            },
+            cwd: cwd.to_path_buf(),
+            additional_dirs: vec![],
+            provider_env: vec![],
+            host_environment: vec![],
+            default_effort: None,
+            default_mode: None,
+            socket_path: None,
+            stored_acp_session_id: Some("stored-authority".into()),
+            maya_restricted,
+            fork_from: None,
+            seed_history_replay: false,
+            artifact_dir: None,
+            sandbox_info: None,
+            source_profile: None,
+            mcp_servers: Vec::new(),
+        }
+    }
+
+    /// Ordinary upstream behavior is intentionally unchanged: a failed load
+    /// resets context, creates a replacement session, and publishes its id.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordinary_load_failure_still_falls_back_to_session_new() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (script, capture) = write_load_failure_fake_agent(tmp.path());
+        let config = load_failure_spawn_config(&script, tmp.path(), false);
+        let mut client = AcpClient::spawn(config, AcpSessionId("ordinary-load-failure".into()))
+            .await
+            .expect("ordinary spawn retains session/new fallback");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut events = Vec::new();
+        loop {
+            let event = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("ordinary load fallback did not publish replacement authority")
+                .expect("ordinary load fallback event stream ended early");
+            let assigned_replacement = matches!(
+                &event,
+                Event::AcpSessionAssigned { acp_session_id }
+                    if acp_session_id == "replacement-id"
+            );
+            events.push(event);
+            if assigned_replacement {
+                break;
+            }
+        }
+        client.shutdown().await.expect("shutdown fake agent");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::SessionContextReset { reason } if reason.contains("session/load failed")
+        )));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    Event::AcpSessionAssigned { acp_session_id }
+                        if acp_session_id == "replacement-id"
+                ))
+                .count(),
+            1,
+            "ordinary fallback must assign exactly the replacement id; events: {events:?}"
+        );
+        let wire = std::fs::read_to_string(capture).expect("read load failure capture");
+        assert_eq!(wire.matches("\"method\":\"session/load\"").count(), 1);
+        assert_eq!(wire.matches("\"method\":\"session/new\"").count(), 1);
+    }
+
+    /// A restricted stored-id spawn is resume-only. The same real load error
+    /// must reach the caller visibly while issuing no session/new, publishing
+    /// no replacement authority, and leaving the stored identity as the only
+    /// authority named by the failed handshake.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn maya_restricted_load_failure_refuses_session_new_fallback() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (script, capture) = write_load_failure_fake_agent(tmp.path());
+        let config = load_failure_spawn_config(&script, tmp.path(), true);
+        let mut client =
+            AcpClient::spawn(config, AcpSessionId("maya-restricted-load-failure".into()))
+                .await
+                .expect("initialize succeeds before the load failure is published");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut events = Vec::new();
+        let message = loop {
+            let event = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("restricted load failure did not become visible")
+                .expect("restricted load failure event stream ended silently");
+            let startup_error = match &event {
+                Event::AgentStartupError { message } => Some(message.clone()),
+                _ => None,
+            };
+            events.push(event);
+            if let Some(message) = startup_error {
+                break message;
+            }
+        };
+        assert!(
+            message.contains("stored-authority")
+                && message.contains("refusing session/new fallback")
+                && message.contains("stored session unavailable"),
+            "restricted load failure must remain visible and identify the retained authority: {message}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::SessionContextReset { .. } | Event::AcpSessionAssigned { .. }
+            )),
+            "restricted load failure must neither clear nor replace stored authority; events: {events:?}"
+        );
+        let wire = std::fs::read_to_string(capture).expect("read load failure capture");
+        assert_eq!(wire.matches("\"method\":\"session/load\"").count(), 1);
+        assert_eq!(
+            wire.matches("\"method\":\"session/new\"").count(),
+            0,
+            "restricted resume failure must not request a replacement id; wire capture:\n{wire}"
+        );
+        assert!(
+            !wire.contains("replacement-id"),
+            "without session/new the agent cannot mint a replacement id for AcpSessionAssigned; wire capture:\n{wire}"
+        );
+        assert!(
+            wire.lines().any(|line| {
+                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|message| {
+                    message["method"] == "session/load"
+                        && message["params"]["sessionId"] == "stored-authority"
+                })
+            }),
+            "the failed handshake must use the exact stored authority; wire capture:\n{wire}"
+        );
     }
 
     /// Write a scripted stdio ACP agent for the conversation-reset tests
@@ -12559,6 +12816,7 @@ done
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
+            maya_restricted: false,
             fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
@@ -12580,10 +12838,24 @@ done
             &script,
             std::path::Path::new(crate::server::maya_restricted::PROJECT_PATH),
         );
+        config.maya_restricted = true;
         config.source_profile = Some(crate::server::maya_restricted::PROFILE_NAME.into());
-        let client = AcpClient::spawn(config, AcpSessionId("maya-restricted-wire".into()))
+        let mut client = AcpClient::spawn(config, AcpSessionId("maya-restricted-wire".into()))
             .await
             .expect("spawn scripted fake agent");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let event = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("restricted session/new did not assign authority")
+                .expect("restricted session/new event stream ended early");
+            if matches!(
+                event,
+                Event::AcpSessionAssigned { ref acp_session_id } if acp_session_id == "sid-1"
+            ) {
+                break;
+            }
+        }
         client.shutdown().await.expect("shutdown fake agent");
 
         let wire = std::fs::read_to_string(capture).expect("read capture");
@@ -13220,6 +13492,7 @@ done
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
+            maya_restricted: false,
             fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
@@ -13258,6 +13531,7 @@ done
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
+            maya_restricted: false,
             fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
