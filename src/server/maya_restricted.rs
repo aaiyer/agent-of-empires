@@ -126,6 +126,14 @@ fn session_ws_suffix(path: &str) -> Option<&str> {
     Some(suffix)
 }
 
+fn restricted_session_id(path: &str) -> Option<&str> {
+    let rest = path
+        .strip_prefix("/api/sessions/")
+        .or_else(|| path.strip_prefix("/sessions/"))?;
+    let id = rest.split('/').next()?;
+    (!id.is_empty()).then_some(id)
+}
+
 pub fn route_allowed(method: &Method, path: &str) -> bool {
     if path == "/api/about" && *method == Method::GET {
         return true;
@@ -141,9 +149,11 @@ pub fn route_allowed(method: &Method, path: &str) -> bool {
     }
     if let Some(rest) = path.strip_prefix("/api/sessions/") {
         if !rest.contains('/') {
-            return *method == Method::PATCH;
+            return matches!(*method, Method::PATCH | Method::DELETE);
         }
         return match (method, session_api_suffix(path)) {
+            (&Method::PATCH, Some("archive")) => true,
+            (&Method::POST, Some("trash" | "restore")) => true,
             (
                 &Method::POST,
                 Some(
@@ -192,10 +202,7 @@ pub async fn enforce_routes(
         )
             .into_response();
     }
-    let session_id = path
-        .strip_prefix("/api/sessions/")
-        .or_else(|| path.strip_prefix("/sessions/"))
-        .and_then(|rest| rest.split('/').next());
+    let session_id = restricted_session_id(path);
     if let Some(session_id) = session_id {
         let allowed = state
             .instances
@@ -227,6 +234,10 @@ mod tests {
             (Method::GET, "/api/sessions"),
             (Method::POST, "/api/sessions"),
             (Method::PATCH, "/api/sessions/s-1"),
+            (Method::DELETE, "/api/sessions/s-1"),
+            (Method::PATCH, "/api/sessions/s-1/archive"),
+            (Method::POST, "/api/sessions/s-1/trash"),
+            (Method::POST, "/api/sessions/s-1/restore"),
             (Method::POST, "/api/sessions/s-1/smart-rename"),
             (Method::POST, "/api/sessions/s-1/acp/prompt"),
             (Method::POST, "/api/sessions/s-1/acp/cancel"),
@@ -249,9 +260,15 @@ mod tests {
             (Method::PATCH, "/api/settings"),
             (Method::GET, "/api/profiles"),
             (Method::GET, "/api/projects"),
+            (Method::DELETE, "/api/workspaces"),
             (Method::POST, "/api/git/clone"),
             (Method::GET, "/api/mcp/servers"),
             (Method::GET, "/api/plugins"),
+            (Method::POST, "/api/sessions/s-1/archive"),
+            (Method::PATCH, "/api/sessions/s-1/trash"),
+            (Method::DELETE, "/api/sessions/s-1/trash"),
+            (Method::POST, "/api/sessions/s-1/archive/extra"),
+            (Method::DELETE, "/api/sessions/s-1/delete-worktree"),
             (Method::POST, "/api/sessions/s-1/acp/switch-agent"),
             (Method::POST, "/api/sessions/s-1/acp/config-option"),
             (Method::GET, "/sessions/s-1/live-ws"),
@@ -261,6 +278,20 @@ mod tests {
                 "expected denied: {method} {path}"
             );
         }
+    }
+
+    #[test]
+    fn lifecycle_routes_bind_the_identity_guard_to_the_exact_session() {
+        for path in [
+            "/api/sessions/s-1",
+            "/api/sessions/s-1/archive",
+            "/api/sessions/s-1/trash",
+            "/api/sessions/s-1/restore",
+        ] {
+            assert_eq!(restricted_session_id(path), Some("s-1"), "path: {path}");
+        }
+        assert_eq!(restricted_session_id("/api/workspaces"), None);
+        assert_eq!(restricted_session_id("/api/sessions/"), None);
     }
 
     #[test]
