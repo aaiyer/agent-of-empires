@@ -2259,6 +2259,47 @@ export async function restoreSession(id: string): Promise<SessionResponse | null
   }
 }
 
+export interface PurgeSessionResult {
+  ok: boolean;
+  deleted?: boolean;
+  error?: string;
+}
+
+/** Permanently remove one already-trashed Maya restricted session without
+ *  granting any project, worktree, branch, sandbox, or scratch cleanup
+ *  authority. The server may report `kept` if a concurrent restore won. */
+export async function purgeSession(id: string): Promise<PurgeSessionResult> {
+  try {
+    const res = await fetch(`/api/sessions/${id}`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        delete_worktree: false,
+        delete_branch: false,
+        delete_sandbox: false,
+        force_delete: false,
+        keep_scratch: false,
+      }),
+    });
+    const data = (await res.json().catch(() => ({}))) as {
+      status?: string;
+      message?: string;
+    };
+    if (!res.ok) {
+      return { ok: false, error: data.message || `Server error (${res.status})` };
+    }
+    if (data.status !== "deleted" && data.status !== "kept") {
+      return { ok: false, error: "Server did not confirm the purge result" };
+    }
+    return { ok: true, deleted: data.status === "deleted" };
+  } catch (e) {
+    return {
+      ok: false,
+      error: `Network error: ${e instanceof Error ? e.message : "connection failed"}`,
+    };
+  }
+}
+
 /** Stop a session, matching the TUI's `x` keybind: kills the tmux pane and
  *  stops (but does not remove) the Docker container for plain sessions, or
  *  shuts down the worker for structured-view sessions. The session record is
