@@ -2005,6 +2005,125 @@ fn open_log_file(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    async fn run_session_handshake_fixture(
+        method: &str,
+        request: serde_json::Value,
+        result: serde_json::Value,
+    ) -> (ControlBody, Arc<RunnerShared>) {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": RUNNER_REQUEST_ID_BASE,
+            "result": result,
+        });
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("IFS= read -r ignored; printf '%s\\n' \"$AOE_TEST_RESPONSE\"")
+            .env("AOE_TEST_RESPONSE", response.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn bounded ACP fixture");
+        let agent_stdin = Arc::new(Mutex::new(child.stdin.take().expect("fixture stdin")));
+        let agent_stdout = child.stdout.take().expect("fixture stdout");
+        let shared = Arc::new(RunnerShared::new());
+        let fanout = tokio::spawn(fanout_agent_stdout(
+            agent_stdout,
+            Arc::clone(&shared),
+            "fixture-session".into(),
+        ));
+
+        let (daemon, runner) = UnixStream::pair().expect("control socket pair");
+        let handler = tokio::spawn(handle_control_connection(
+            runner,
+            Arc::clone(&shared),
+            Arc::clone(&agent_stdin),
+            "fixture-session".into(),
+        ));
+        let (mut daemon_read, mut daemon_write) = daemon.into_split();
+        assert_eq!(
+            control_protocol::read_frame(&mut daemon_read)
+                .await
+                .expect("read hello"),
+            Some(ControlBody::Hello {
+                control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+                session_id: "fixture-session".into(),
+            })
+        );
+        control_protocol::write_frame(
+            &mut daemon_write,
+            &ControlBody::EstablishSession {
+                method: method.into(),
+                request,
+            },
+        )
+        .await
+        .expect("write establish-session frame");
+        let outcome = control_protocol::read_frame(&mut daemon_read)
+            .await
+            .expect("read handshake outcome")
+            .expect("handshake outcome frame");
+
+        drop(daemon_read);
+        drop(daemon_write);
+        handler.await.expect("control handler");
+        fanout.await.expect("agent stdout fanout");
+        child.wait().await.expect("fixture exits");
+        (outcome, shared)
+    }
+
+    /// A successful ACP `session/load` may return an empty result. The
+    /// requested session id is the resumed provider identity, so the runner
+    /// must publish and cache that exact id instead of rejecting the load or
+    /// allowing the daemon to fall back to a fresh conversation.
+    #[tokio::test]
+    async fn session_load_without_response_session_id_uses_requested_identity() {
+        let (outcome, shared) = run_session_handshake_fixture(
+            "session/load",
+            serde_json::json!({"sessionId": "stored"}),
+            serde_json::json!({}),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            ControlBody::SessionReady {
+                acp_session_id: "stored".into(),
+                result: serde_json::json!({}),
+            },
+            "the control channel must publish the exact resumed identity"
+        );
+        assert_eq!(
+            shared.acp_session_id().await.as_deref(),
+            Some("stored"),
+            "later prompts, cancellation, and reattach must use the resumed identity"
+        );
+    }
+
+    /// Only `session/load` has a request-owned identity. A successful-looking
+    /// `session/new` response without `sessionId` remains malformed and must
+    /// neither publish SessionReady nor populate the handshake cache.
+    #[tokio::test]
+    async fn session_new_without_response_session_id_is_rejected() {
+        let (outcome, shared) = run_session_handshake_fixture(
+            "session/new",
+            serde_json::json!({"cwd": "/workspace"}),
+            serde_json::json!({}),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            ControlBody::HandshakeFailed {
+                error: transport_error("session/new response missing sessionId"),
+            }
+        );
+        assert_eq!(
+            shared.acp_session_id().await,
+            None,
+            "a malformed session/new response must not be cached"
+        );
+    }
+
     #[test]
     fn parse_request_extracts_id_and_method() {
         let line =
