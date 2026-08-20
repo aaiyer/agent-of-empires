@@ -6532,6 +6532,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn maya_restricted_router_denies_terminal_authority_overrides() {
+        use axum::http::{Method, StatusCode};
+        use tower::ServiceExt;
+
+        let mut instance = Instance::new("Maya", maya_restricted::PROJECT_PATH);
+        instance.id = "maya-terminal-route-test".to_string();
+        instance.tool = "codex".to_string();
+        instance.view = crate::session::View::Structured;
+        instance.source_profile = maya_restricted::PROFILE_NAME.to_string();
+
+        let mut state = test_support::build_test_app_state_with_policy(
+            vec![instance],
+            vecs(&["localhost"]),
+            Vec::new(),
+            None,
+        );
+        let state_mut = Arc::get_mut(&mut state).expect("unique test state");
+        state_mut.maya_restricted = true;
+        state_mut.profile = maya_restricted::PROFILE_NAME.to_string();
+        let app = test_support::build_router_for_test(state);
+        let remote: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        for (method, uri) in [
+            (
+                Method::POST,
+                "/api/sessions/maya-terminal-route-test/terminal?index=1",
+            ),
+            (
+                Method::POST,
+                "/api/sessions/maya-terminal-route-test/terminal?index=0&index=0",
+            ),
+            (
+                Method::POST,
+                "/api/sessions/maya-terminal-route-test/terminal?index=0&command=sh",
+            ),
+            (
+                Method::POST,
+                "/api/sessions/maya-terminal-route-test/terminal?index=wat",
+            ),
+            (
+                Method::DELETE,
+                "/api/sessions/maya-terminal-route-test/terminal",
+            ),
+            (
+                Method::POST,
+                "/api/sessions/maya-terminal-route-test/container-terminal?index=0",
+            ),
+            (Method::GET, "/sessions/maya-terminal-route-test/live-ws"),
+            (
+                Method::GET,
+                "/sessions/maya-terminal-route-test/terminal/live-ws?index=0&env=x",
+            ),
+            (
+                Method::GET,
+                "/sessions/maya-terminal-route-test/container-terminal/live-ws?index=0",
+            ),
+        ] {
+            let mut request = axum::http::Request::builder()
+                .method(method.clone())
+                .uri(uri)
+                .header("host", "localhost")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(remote));
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
     async fn maya_restricted_router_allows_magic_dns_and_denies_evil_host() {
         use tower::ServiceExt;
 
