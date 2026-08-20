@@ -38,6 +38,7 @@ fn spawn_config_with_shim_env(shim: PathBuf, env: Vec<(String, String)>) -> Spaw
         default_mode: None,
         socket_path: None,
         stored_acp_session_id: None,
+        maya_restricted: false,
         fork_from: None,
         seed_history_replay: false,
         artifact_dir: None,
