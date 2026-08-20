@@ -1,10 +1,18 @@
 import { lazy, Suspense, useCallback, useState } from "react";
-import { LogOut, MessageSquarePlus, Pencil } from "lucide-react";
+import { Archive, ArchiveRestore, LogOut, MessageSquarePlus, Pencil, RotateCcw, Trash2, X } from "lucide-react";
 import { useMatch, useNavigate } from "react-router-dom";
 
 import { useSessions } from "../hooks/useSessions";
 import { AcpPrefsProvider } from "../lib/acpPrefs";
-import { createSession, renameSession, type ServerAbout } from "../lib/api";
+import {
+  createSession,
+  purgeSession,
+  renameSession,
+  restoreSession,
+  setSessionArchive,
+  trashSession,
+  type ServerAbout,
+} from "../lib/api";
 import type { MayaRestrictedCreateSessionRequest } from "../lib/types";
 import { MainPaneSkeleton } from "./AppShellSkeleton";
 
@@ -32,10 +40,12 @@ export function MayaRestrictedApp({
   const navigate = useNavigate();
   const sessionMatch = useMatch("/session/:sessionId");
   const activeSessionId = sessionMatch?.params.sessionId ?? null;
-  const { sessions, loaded, error, injectSession, refresh } = useSessions();
+  const { sessions, loaded, error, injectSession, refresh, applySession } = useSessions();
   const [newTitle, setNewTitle] = useState("");
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [pendingSessionId, setPendingSessionId] = useState<string | null>(null);
 
   const createChat = useCallback(async () => {
     if (creating) return;
@@ -64,6 +74,65 @@ export function MayaRestrictedApp({
       await refresh();
     },
     [refresh],
+  );
+
+  const applyLifecycle = useCallback(
+    async (id: string, action: () => ReturnType<typeof restoreSession>, failureMessage: string) => {
+      setPendingSessionId(id);
+      setActionError(null);
+      const updated = await action();
+      setPendingSessionId(null);
+      if (!updated) {
+        setActionError(failureMessage);
+        return false;
+      }
+      applySession(updated);
+      return true;
+    },
+    [applySession],
+  );
+
+  const archiveChat = useCallback(
+    (id: string, archived: boolean) =>
+      applyLifecycle(
+        id,
+        () => setSessionArchive(id, archived),
+        archived ? "Could not archive chat" : "Could not unarchive chat",
+      ),
+    [applyLifecycle],
+  );
+
+  const trashChat = useCallback(
+    (id: string) => applyLifecycle(id, () => trashSession(id), "Could not move chat to trash"),
+    [applyLifecycle],
+  );
+
+  const restoreChat = useCallback(
+    (id: string) => applyLifecycle(id, () => restoreSession(id), "Could not restore chat"),
+    [applyLifecycle],
+  );
+
+  const purgeChat = useCallback(
+    async (id: string, title: string, trashedAt: string | null | undefined) => {
+      if (!trashedAt || pendingSessionId) return;
+      if (!window.confirm(`Permanently delete "${title}"? This cannot be undone.`)) return;
+
+      setPendingSessionId(id);
+      setActionError(null);
+      const result = await purgeSession(id);
+      setPendingSessionId(null);
+      if (!result.ok) {
+        setActionError(result.error ?? "Could not permanently delete chat");
+        return;
+      }
+      await refresh();
+      if (!result.deleted) {
+        setActionError("Chat was restored before it could be permanently deleted");
+        return;
+      }
+      if (activeSessionId === id) navigate("/");
+    },
+    [activeSessionId, navigate, pendingSessionId, refresh],
   );
 
   const active = sessions.find((session) => session.id === activeSessionId) ?? null;
@@ -106,7 +175,7 @@ export function MayaRestrictedApp({
                 {creating ? "Creating…" : "New"}
               </button>
             </div>
-            {createError && <p className="mt-2 text-xs text-red-400">{createError}</p>}
+            {(createError || actionError) && <p className="mt-2 text-xs text-red-400">{createError || actionError}</p>}
           </div>
 
           <nav aria-label="Chats" className="min-h-0 flex-1 overflow-y-auto p-2">
@@ -127,15 +196,69 @@ export function MayaRestrictedApp({
                 >
                   {session.title}
                 </button>
-                <button
-                  type="button"
-                  aria-label={`Rename ${session.title}`}
-                  title="Rename chat"
-                  onClick={() => void rename(session.id, session.title)}
-                  className="mr-1 rounded p-1 text-text-dim opacity-60 hover:bg-surface-700 hover:text-text-primary group-hover:opacity-100"
-                >
-                  <Pencil className="h-3.5 w-3.5" />
-                </button>
+                <div className="flex shrink-0 items-center gap-0.5 pr-1">
+                  <button
+                    type="button"
+                    aria-label={`Rename ${session.title}`}
+                    title="Rename chat"
+                    onClick={() => void rename(session.id, session.title)}
+                    disabled={pendingSessionId !== null}
+                    className="rounded p-1 text-text-dim opacity-60 hover:bg-surface-700 hover:text-text-primary disabled:opacity-30 group-hover:opacity-100"
+                  >
+                    <Pencil className="h-3.5 w-3.5" />
+                  </button>
+                  {session.trashed_at ? (
+                    <>
+                      <button
+                        type="button"
+                        aria-label={`Restore ${session.title}`}
+                        title="Restore chat"
+                        onClick={() => void restoreChat(session.id)}
+                        disabled={pendingSessionId !== null}
+                        className="rounded p-1 text-text-dim opacity-60 hover:bg-surface-700 hover:text-text-primary disabled:opacity-30 group-hover:opacity-100"
+                      >
+                        <RotateCcw className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Delete ${session.title} permanently`}
+                        title="Delete permanently"
+                        onClick={() => void purgeChat(session.id, session.title, session.trashed_at)}
+                        disabled={pendingSessionId !== null}
+                        className="rounded p-1 text-status-error/80 opacity-60 hover:bg-status-error/10 hover:text-status-error disabled:opacity-30 group-hover:opacity-100"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        aria-label={`${session.archived_at ? "Unarchive" : "Archive"} ${session.title}`}
+                        title={session.archived_at ? "Unarchive chat" : "Archive chat"}
+                        onClick={() => void archiveChat(session.id, !session.archived_at)}
+                        disabled={pendingSessionId !== null}
+                        className="rounded p-1 text-text-dim opacity-60 hover:bg-surface-700 hover:text-text-primary disabled:opacity-30 group-hover:opacity-100"
+                      >
+                        {session.archived_at ? (
+                          <ArchiveRestore className="h-3.5 w-3.5" />
+                        ) : (
+                          <Archive className="h-3.5 w-3.5" />
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Move ${session.title} to trash`}
+                        title="Move to trash"
+                        onClick={() => void trashChat(session.id)}
+                        disabled={pendingSessionId !== null}
+                        className="rounded p-1 text-text-dim opacity-60 hover:bg-surface-700 hover:text-status-error disabled:opacity-30 group-hover:opacity-100"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </>
+                  )}
+                </div>
               </div>
             ))}
           </nav>
@@ -168,9 +291,10 @@ export function MayaRestrictedApp({
                 acpWorkerState={active.acp_worker_state ?? "absent"}
                 tool="codex"
                 acpAgent={active.acp_agent ?? "codex"}
-                archivedAt={null}
+                archivedAt={active.archived_at ?? null}
                 snoozedUntil={null}
-                trashedAt={null}
+                trashedAt={active.trashed_at ?? null}
+                onRestore={active.trashed_at ? () => restoreChat(active.id) : undefined}
                 restricted
               />
             </Suspense>
