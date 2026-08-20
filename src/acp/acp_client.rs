@@ -6864,7 +6864,8 @@ async fn run_connection_task<W, R>(
                                         target: "acp.protocol",
                                         session = %session_label,
                                         stored_id = %stored,
-                                        "session/load succeeded; suppressing post-load history replay"
+                                        seed_history_replay,
+                                        "session/load succeeded"
                                     );
                                     // Capture available mode info from the
                                     // load response before consuming resp.
@@ -6908,6 +6909,25 @@ async fn run_connection_task<W, R>(
                                         config_options_event(resp.config_options)
                                     {
                                         let _ = event_tx_for_block.send(event).await;
+                                    }
+                                    // Imported sessions deliberately retain the
+                                    // transcript notifications replayed during
+                                    // session/load. Those historical events can
+                                    // end in an assistant chunk, which the UI
+                                    // correctly treats as an active turn until a
+                                    // terminal event arrives. The replay itself
+                                    // has no prompt response for this connection,
+                                    // so close that seeded historical boundary
+                                    // exactly once after the successful load is
+                                    // accepted. Ordinary resume loads suppress
+                                    // their duplicate transcript and must not
+                                    // manufacture a turn boundary. See #2276.
+                                    if seed_history_replay {
+                                        let _ = event_tx_for_block
+                                            .send(Event::Stopped {
+                                                reason: "history_replay_complete".into(),
+                                            })
+                                            .await;
                                     }
                                     acp_session_id = Some(SessionId::from(stored));
                                 }
@@ -11015,6 +11035,182 @@ mod tests {
                 .any(|(k, _)| k == "CLAUDE_CONFIG_DIR"),
             "CLAUDE_CONFIG_DIR must not land in inherit_env"
         );
+    }
+
+    /// Write a scripted stdio ACP agent whose successful session/load replays
+    /// one historical user turn ending in an assistant chunk before it answers
+    /// the load request. This is the production transport ordering used by
+    /// imported sessions: notifications arrive during the load handshake, and
+    /// the load response itself carries no prompt-completion boundary.
+    #[cfg(unix)]
+    fn write_history_replay_fake_agent(
+        dir: &std::path::Path,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let capture = dir.join("history-replay-capture.ndjson");
+        let script_path = dir.join("fake-history-replay-agent.sh");
+        let script = r#"#!/bin/sh
+CAPTURE=__CAPTURE__
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CAPTURE"
+  id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
+  case $line in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}\n' "$id"
+      ;;
+    *'"method":"session/load"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"stored-history","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"old question"}}}}\n'
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"stored-history","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"old answer"}}}}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      ;;
+  esac
+done
+"#
+        .replace("__CAPTURE__", capture.to_str().expect("utf8 tmp path"));
+        std::fs::write(&script_path, script).expect("write fake history replay agent");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake history replay agent");
+        (script_path, capture)
+    }
+
+    #[cfg(unix)]
+    fn history_replay_spawn_config(
+        script: &std::path::Path,
+        cwd: &std::path::Path,
+        seed_history_replay: bool,
+    ) -> SpawnConfig {
+        SpawnConfig {
+            agent_key: "codex".into(),
+            spec: AgentSpec {
+                command: script.to_string_lossy().into_owned(),
+                args: vec![],
+                description: "scripted history replay fake".into(),
+                env_allowlist: None,
+            },
+            cwd: cwd.to_path_buf(),
+            additional_dirs: vec![],
+            provider_env: vec![],
+            host_environment: vec![],
+            default_effort: None,
+            default_mode: None,
+            socket_path: None,
+            stored_acp_session_id: Some("stored-history".into()),
+            fork_from: None,
+            seed_history_replay,
+            artifact_dir: None,
+            sandbox_info: None,
+            source_profile: None,
+            mcp_servers: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn collect_history_load_events(mut client: AcpClient) -> Vec<Event> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut events = Vec::new();
+        let mut shutdown_sent = false;
+        loop {
+            let event = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("history load connection did not settle");
+            let Some(event) = event else {
+                break;
+            };
+            if matches!(&event, Event::AcpSessionAssigned { acp_session_id } if acp_session_id == "stored-history")
+                && !shutdown_sent
+            {
+                client
+                    .shutdown()
+                    .await
+                    .expect("shutdown fake history agent");
+                shutdown_sent = true;
+            }
+            events.push(event);
+        }
+        assert!(
+            shutdown_sent,
+            "successful load must assign the stored session id"
+        );
+        events
+    }
+
+    /// Regression: a seeded imported transcript can end with an assistant
+    /// chunk. Without the terminal emitted by the successful load branch, the
+    /// persisted reducer remains turn-active and disables the composer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn seeded_history_load_ends_replayed_assistant_turn_exactly_once() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (script, capture) = write_history_replay_fake_agent(tmp.path());
+        let config = history_replay_spawn_config(&script, tmp.path(), true);
+        let client = AcpClient::spawn(config, AcpSessionId("seeded-history-load".into()))
+            .await
+            .expect("spawn scripted history replay agent");
+        let events = collect_history_load_events(client).await;
+
+        let visible: Vec<(&str, Option<&str>)> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::UserPromptSent { text, .. } => Some(("user", Some(text.as_str()))),
+                Event::AgentMessageChunk { text } => Some(("assistant", Some(text.as_str()))),
+                Event::Stopped { reason } => Some(("stopped", Some(reason.as_str()))),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            visible,
+            vec![
+                ("user", Some("old question")),
+                ("assistant", Some("old answer")),
+                ("stopped", Some("history_replay_complete")),
+            ],
+            "the accepted seeded replay must retain history and end it once; events: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::Stopped { .. }))
+                .count(),
+            1,
+            "the seeded load must synthesize exactly one terminal event"
+        );
+
+        let wire = std::fs::read_to_string(capture).expect("read history replay capture");
+        assert_eq!(wire.matches("\"method\":\"session/load\"").count(), 1);
+        assert_eq!(wire.matches("\"method\":\"session/new\"").count(), 0);
+    }
+
+    /// Ordinary reattach already owns a complete persisted transcript. It
+    /// suppresses replayed chunks and must not publish the import-only terminal
+    /// boundary, which could otherwise interfere with a real active turn.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordinary_history_load_suppresses_replay_without_synthetic_stop() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (script, capture) = write_history_replay_fake_agent(tmp.path());
+        let config = history_replay_spawn_config(&script, tmp.path(), false);
+        let client = AcpClient::spawn(config, AcpSessionId("ordinary-history-load".into()))
+            .await
+            .expect("spawn scripted history replay agent");
+        let events = collect_history_load_events(client).await;
+
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::UserPromptSent { .. }
+                    | Event::AgentMessageChunk { .. }
+                    | Event::Stopped { .. }
+            )),
+            "ordinary load must suppress duplicate history and synthesize no terminal; events: {events:?}"
+        );
+        assert!(events.iter().any(
+            |event| matches!(event, Event::AcpSessionAssigned { acp_session_id } if acp_session_id == "stored-history")
+        ));
+
+        let wire = std::fs::read_to_string(capture).expect("read history replay capture");
+        assert_eq!(wire.matches("\"method\":\"session/load\"").count(), 1);
+        assert_eq!(wire.matches("\"method\":\"session/new\"").count(), 0);
     }
 
     /// Write a scripted stdio ACP agent for the conversation-reset tests
