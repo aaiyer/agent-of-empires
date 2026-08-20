@@ -94,6 +94,8 @@ interface Props {
    *  (REST-poll-driven, ~3s cadence). Drives the `WorkerResumingBanner`
    *  while the reconciler is mid-spawn/attach. See #1088. */
   acpWorkerState: "absent" | "resuming" | "running";
+  /** True while the runner is replaying an imported transcript. */
+  importPending?: boolean;
   /** Session's `tool` registry key (claude / codex / opencode / gemini
    *  / etc.). Resolves the active AgentProfile that drives card
    *  dispatch and claude-specific capability gates. */
@@ -165,6 +167,7 @@ export function StructuredView(props: Props) {
   const {
     sessionId,
     acpWorkerState,
+    importPending = false,
     tool,
     acpAgent,
     clearAliases,
@@ -205,6 +208,7 @@ export function StructuredView(props: Props) {
                   <AcpChrome
                     sessionId={sessionId}
                     acpWorkerState={acpWorkerState}
+                    importPending={importPending}
                     acpAgent={acpAgent}
                     showClearedTurns={showClearedTurns}
                     onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
@@ -293,6 +297,7 @@ export function StructuredViewRoot({ children }: { children: React.ReactNode }) 
 function AcpChrome({
   sessionId,
   acpWorkerState,
+  importPending,
   acpAgent,
   showClearedTurns,
   onToggleClearedTurns,
@@ -338,6 +343,7 @@ function AcpChrome({
 }: AcpContext & {
   sessionId: string;
   acpWorkerState: "absent" | "resuming" | "running";
+  importPending: boolean;
   acpAgent: string | null;
   showClearedTurns: boolean;
   onToggleClearedTurns: () => void;
@@ -366,6 +372,11 @@ function AcpChrome({
     if (lastClearIndex < 0) return null;
     return { hiddenCount: lastClearIndex };
   })();
+  const restoringChatHistory = shouldShowHistoryRestoreIndicator({
+    importPending,
+    lastSeq: state.lastSeq,
+    turnActive: state.turnActive,
+  });
   // Composer prefill keyed for re-fires; set by the
   // ContextPrimerBanner on click. Local rather than on AcpState
   // because it's a one-shot UI action, not part of the event log.
@@ -737,6 +748,7 @@ function AcpChrome({
   return (
     <StructuredViewRoot>
       <AttentionChime approvals={state.pendingApprovals.length} elicitations={state.pendingElicitations.length} />
+      {restoringChatHistory && <HistoryRestoreIndicator />}
       <PlanStrip plan={state.plan} />
 
       <RateLimitRecoverySection
@@ -871,7 +883,11 @@ function AcpChrome({
                   model…", and the Force end turn watchdog) so the actionable
                   card stands alone; it returns once the turn resumes. See
                   #2145. */}
-                {state.pendingElicitations.length === 0 && state.pendingApprovals.length === 0 ? (
+                {shouldRenderWorkingSpinner({
+                  restoringChatHistory,
+                  pendingElicitations: state.pendingElicitations.length,
+                  pendingApprovals: state.pendingApprovals.length,
+                }) ? (
                   <div className="mt-3 ml-1">
                     <WorkingSpinner
                       thinking={state.thinking}
@@ -940,7 +956,11 @@ function AcpChrome({
                 canSendNow={canSendQueuedNow}
                 sendNowInterrupts={sendNowInterruptsTurn}
                 pendingResume={
-                  status !== "open" || acpWorkerState !== "running" || state.workerStopped || state.workerRestarting
+                  restoringChatHistory ||
+                  status !== "open" ||
+                  acpWorkerState !== "running" ||
+                  state.workerStopped ||
+                  state.workerRestarting
                 }
               />
 
@@ -1747,6 +1767,38 @@ function PendingApproval({
 }
 
 /* ── System notices ──────────────────────────────────────────────── */
+
+/** True while the server-authoritative import marker still covers an
+ * un-settled replay. `lastSeq === 0` covers the initial fetch gap; once replay
+ * starts, turn activity carries the indicator through the ordered settlement. */
+export function shouldShowHistoryRestoreIndicator(opts: {
+  importPending: boolean;
+  lastSeq: number;
+  turnActive: boolean;
+}): boolean {
+  return opts.importPending && (opts.lastSeq === 0 || opts.turnActive);
+}
+
+export function shouldRenderWorkingSpinner(opts: {
+  restoringChatHistory: boolean;
+  pendingElicitations: number;
+  pendingApprovals: number;
+}): boolean {
+  return !opts.restoringChatHistory && opts.pendingElicitations === 0 && opts.pendingApprovals === 0;
+}
+
+export function HistoryRestoreIndicator() {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      data-testid="acp-history-restore-indicator"
+      className="border-b border-surface-800 px-4 py-2 text-xs text-text-muted"
+    >
+      Restoring chat history…
+    </div>
+  );
+}
 
 /** Wires the rate-limit handoff banner to the recovery modal. Owns the
  *  open/close toggle so StructuredView (which is wide and pulls in many

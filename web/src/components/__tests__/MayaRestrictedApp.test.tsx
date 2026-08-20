@@ -63,6 +63,8 @@ vi.mock("../PairedTerminal", () => ({
 const ABOUT = {
   acp_show_tool_durations: true,
   acp_replay_events: 0,
+  acp_compaction_reminder: false,
+  acp_compaction_reminder_percent: 75,
 } as ServerAbout;
 
 function session(overrides: Partial<SessionResponse> = {}): SessionResponse {
