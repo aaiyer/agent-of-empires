@@ -140,7 +140,12 @@ export function MayaRestrictedApp({
 
   return (
     <AcpPrefsProvider
-      value={{ showToolDurations: about.acp_show_tool_durations, replayEvents: about.acp_replay_events }}
+      value={{
+        showToolDurations: about.acp_show_tool_durations,
+        replayEvents: about.acp_replay_events,
+        compactionReminder: about.acp_compaction_reminder,
+        compactionReminderPercent: about.acp_compaction_reminder_percent,
+      }}
     >
       <div className="flex h-dvh min-h-0 bg-surface-950 text-text-primary">
         <aside className="flex w-72 shrink-0 flex-col border-r border-surface-800 bg-surface-900">
@@ -292,6 +297,7 @@ export function MayaRestrictedApp({
                   <StructuredView
                     sessionId={active.id}
                     acpWorkerState={active.acp_worker_state ?? "absent"}
+                    importPending={active.import_pending ?? false}
                     tool="codex"
                     acpAgent={active.acp_agent ?? "codex"}
                     archivedAt={active.archived_at ?? null}

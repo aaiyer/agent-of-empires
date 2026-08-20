@@ -12355,6 +12355,7 @@ done
     ) -> SpawnConfig {
         SpawnConfig {
             agent_key: "codex".into(),
+            tool: "codex".into(),
             spec: AgentSpec {
                 command: script.to_string_lossy().into_owned(),
                 args: vec![],
@@ -12610,6 +12611,7 @@ done
     ) -> SpawnConfig {
         SpawnConfig {
             agent_key: "codex".into(),
+            tool: "codex".into(),
             spec: AgentSpec {
                 command: script.to_string_lossy().into_owned(),
                 args: vec![],
@@ -16159,6 +16161,7 @@ done
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
+            maya_restricted: false,
             fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,

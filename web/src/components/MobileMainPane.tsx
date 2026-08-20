@@ -114,6 +114,7 @@ export function MobileMainPane({
                 key={activeSessionId}
                 sessionId={activeSessionId!}
                 acpWorkerState={activeSession.acp_worker_state ?? "absent"}
+                importPending={activeSession.import_pending ?? false}
                 tool={activeSession.tool}
                 acpAgent={activeSession.acp_agent ?? null}
                 clearAliases={activeSession.clear_aliases}

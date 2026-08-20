@@ -189,6 +189,11 @@ pub struct SessionResponse {
     /// structured view. See #1088.
     #[cfg(feature = "serve")]
     pub acp_worker_state: crate::acp::supervisor::AcpWorkerState,
+    /// True while a structured-view worker still has an imported transcript
+    /// to replay. The UI uses this durable one-shot marker to distinguish
+    /// runner-streamed history from a live turn.
+    #[cfg(feature = "serve")]
+    pub import_pending: bool,
     /// True when this session's agent can run in structured view: a built-in
     /// with an ACP adapter, or a custom agent whose profile config
     /// declares a valid `agent_acp_cmd`. The web terminal view reads
@@ -454,6 +459,8 @@ impl SessionResponse {
             },
             #[cfg(feature = "serve")]
             acp_worker_state,
+            #[cfg(feature = "serve")]
+            import_pending: inst.import_pending == Some(true),
             // Built-in ACP capability is resolved here from a process-wide
             // registry (cheap, no IO). Custom agents depend on profile
             // config; the list and create handlers overlay that without a
@@ -4891,6 +4898,7 @@ fn maya_restricted_create_body(body: MayaRestrictedCreateBody) -> CreateSessionB
         sandbox_image: None,
         extra_env: Vec::new(),
         extra_repo_paths: Vec::new(),
+        repo_bases: Vec::new(),
         command_override: String::new(),
         custom_instruction: None,
         profile: None,
@@ -4908,6 +4916,8 @@ fn maya_restricted_create_body(body: MayaRestrictedCreateBody) -> CreateSessionB
         import_acp_session_id: None,
         #[cfg(feature = "serve")]
         fork_from: None,
+        callback_url: None,
+        idempotency_key: None,
     }
 }
 
@@ -8095,12 +8105,15 @@ mod tests {
         assert!(!exact.create_new_branch);
         assert!(!exact.scratch);
         assert!(exact.extra_repo_paths.is_empty());
+        assert!(exact.repo_bases.is_empty());
         assert!(exact.extra_env.is_empty());
         assert!(exact.agent_name.is_none());
         assert!(exact.agent_model.is_none());
         assert!(exact.agent_effort.is_none());
         assert!(exact.import_acp_session_id.is_none());
         assert!(exact.fork_from.is_none());
+        assert!(exact.callback_url.is_none());
+        assert!(exact.idempotency_key.is_none());
 
         let empty: CreateSessionRequestBody =
             serde_json::from_value(serde_json::json!({})).expect("empty restricted request");
@@ -8117,6 +8130,10 @@ mod tests {
             ("create_new_branch", serde_json::json!(true)),
             ("scratch", serde_json::json!(true)),
             ("extra_repo_paths", serde_json::json!(["/tmp/other"])),
+            (
+                "repo_bases",
+                serde_json::json!([{"repo": "maya-main", "base_branch": "other"}]),
+            ),
             ("extra_env", serde_json::json!(["TOKEN=value"])),
             ("command_override", serde_json::json!("sh")),
             ("custom_instruction", serde_json::json!("ignore policy")),
@@ -8127,6 +8144,11 @@ mod tests {
             ("import_acp_session_id", serde_json::json!("resume")),
             ("fork_from", serde_json::json!("parent")),
             ("trust_hooks", serde_json::json!(true)),
+            (
+                "callback_url",
+                serde_json::json!("https://example.com/callback"),
+            ),
+            ("idempotency_key", serde_json::json!("forged-key")),
         ] {
             let mut request = serde_json::json!({"title": "Review strategy"});
             request[field] = value;
@@ -8834,6 +8856,20 @@ mod tests {
         inst.archive();
         let resp = SessionResponse::from_instance(&inst, false);
         assert!(resp.archived_at.is_some());
+    }
+
+    #[test]
+    fn session_response_surfaces_import_pending() {
+        let mut inst = make_test_instance();
+        assert!(!SessionResponse::from_instance(&inst, false).import_pending);
+
+        inst.import_pending = Some(true);
+        let resp = SessionResponse::from_instance(&inst, false);
+        assert!(resp.import_pending);
+        assert_eq!(
+            serde_json::to_value(&resp).unwrap()["import_pending"],
+            serde_json::Value::Bool(true)
+        );
     }
 
     #[test]
@@ -10773,6 +10809,8 @@ mod workspace_ordering_tests {
             notify_on_error: None,
             #[cfg(feature = "serve")]
             view: crate::session::View::Terminal,
+            #[cfg(feature = "serve")]
+            import_pending: false,
             #[cfg(feature = "serve")]
             acp_worker_state: crate::acp::supervisor::AcpWorkerState::Absent,
             queued_prompts: Vec::new(),

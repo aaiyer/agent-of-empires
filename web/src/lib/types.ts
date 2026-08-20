@@ -126,6 +126,10 @@ export interface SessionResponse {
    *  the supervisor holds a live worker. Drives the sidebar `Resuming…`
    *  chip and the per-session banner in the acp view. See #1088. */
   acp_worker_state?: AcpWorkerState;
+  /** True while an imported structured-view transcript is being replayed by
+   *  the runner. Distinct from worker liveness so the UI labels replayed
+   *  history instead of treating it as a model turn. */
+  import_pending?: boolean;
   /** Smart-rename indicator for structured view sessions. `pending`: still
    *  default-named and eligible, will auto-name on the next prompt; `running`:
    *  a one-shot title call is in flight; `inactive`/absent otherwise. Drives
