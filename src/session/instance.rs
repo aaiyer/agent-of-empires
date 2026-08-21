@@ -3644,28 +3644,11 @@ impl Instance {
         index: u32,
         size: Option<(u16, u16)>,
     ) -> Result<()> {
-        self.start_terminal_with_size_indexed_command(index, size, None)
-    }
-
-    /// Server-owned command variant for a paired host terminal. The normal
-    /// AoE entrypoints above continue to pass `None` and resolve the user's
-    /// login shell exactly as before.
-    pub(crate) fn start_terminal_with_size_indexed_command(
-        &mut self,
-        index: u32,
-        size: Option<(u16, u16)>,
-        command: Option<&str>,
-    ) -> Result<()> {
         let session = self.terminal_tmux_session_indexed(index)?;
 
         let is_new = !session.exists();
         if is_new {
-            session.create_with_size(
-                &self.project_path,
-                command,
-                size,
-                &self.effective_profile(),
-            )?;
+            session.create_with_size(&self.project_path, None, size, &self.effective_profile())?;
             // Apply all configured tmux options to terminal sessions too
             self.apply_terminal_tmux_options(index);
         }

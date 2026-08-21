@@ -116,9 +116,11 @@ interface Props {
    *  project, structured view, default agent), so the client only asks for a
    *  title. See #7. */
   nameOnly?: boolean;
+  /** Maya's server owns every creation field except the optional title. */
+  mayaRestricted?: boolean;
 }
 
-export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }: Props) {
+export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false, mayaRestricted = false }: Props) {
   const baseInitial = buildInitialData();
   const prefillData: WizardData = prefill
     ? {
@@ -180,6 +182,10 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
   } | null>(null);
 
   useEffect(() => {
+    // This is the client-side authority boundary: the Maya server accepts no
+    // agent, project, profile, Docker, settings, or Git discovery requests.
+    // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
+    if (mayaRestricted) return;
     fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
     fetchGroups().then((g) => dispatch({ type: "SET_GROUPS", groups: g }));
     fetchDockerStatus().then((d) => dispatch({ type: "SET_DOCKER", available: d.available }));
@@ -231,7 +237,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
     // (and stomp on user edits) if the parent re-renders with a new object
     // identity.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [mayaRestricted]);
 
   // Probe whether the selected path is a git repository so the worktree
   // toggle can be disabled for a plain folder (e.g. a root picked via "Use
@@ -242,6 +248,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
   // Scratch sessions have no path and never use a worktree, so skip the probe.
   const probePath = state.data.scratch ? "" : state.data.path;
   useEffect(() => {
+    if (mayaRestricted) return;
     if (!probePath) return;
     let cancelled = false;
     fetchIsGitRepo(probePath).then((isRepo) => {
@@ -252,7 +259,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
     return () => {
       cancelled = true;
     };
-  }, [probePath]);
+  }, [mayaRestricted, probePath]);
 
   const handleChange = useCallback((field: string, value: unknown) => {
     dispatch({ type: "SET_FIELD", field, value });
@@ -279,6 +286,16 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
   const handleSubmit = async () => {
     dispatch({ type: "SUBMIT_START" });
     const d = state.data;
+    if (mayaRestricted) {
+      const result = await createSession({ title: d.title.trim() || undefined });
+      if (result.ok) {
+        dispatch({ type: "SUBMIT_SUCCESS" });
+        onCreated(result.session);
+      } else {
+        dispatch({ type: "SUBMIT_ERROR", error: result.error || "Unknown error" });
+      }
+      return;
+    }
     const selectedAgentAcpCapable = isAcpEligible(
       d.tool,
       state.agents.find((a) => a.name === d.tool),

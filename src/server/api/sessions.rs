@@ -6327,22 +6327,6 @@ pub async fn ensure_terminal(
     };
     drop(instances);
 
-    let command = match crate::server::maya_restricted::paired_shell_command(
-        state.maya_restricted,
-        &inst,
-        index,
-    ) {
-        Ok(command) => command,
-        Err(error) => {
-            tracing::warn!(target: "http.api.sessions", session = %id, %error, "rejected paired terminal creation");
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "maya_restricted"})),
-            )
-                .into_response();
-        }
-    };
-
     // Serialize concurrent terminal-ensure calls for the same session so two
     // parallel requests don't both try to create the same tmux session
     // (the second would fail with "duplicate session").
@@ -6389,7 +6373,7 @@ pub async fn ensure_terminal(
 
     let result = tokio::task::spawn_blocking(move || {
         let _ = inst_clone.kill_terminal_if_dead_indexed(index);
-        inst_clone.start_terminal_with_size_indexed_command(index, None, command)
+        inst_clone.start_terminal_with_size_indexed(index, None)
     })
     .await;
 

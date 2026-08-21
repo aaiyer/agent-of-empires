@@ -38,7 +38,7 @@ function toast(n: PluginUiNotification): void {
 // latency, a rate-limited GitHub refresh) crosses the threshold and shows.
 const REFRESH_INDICATOR_DELAY = 250;
 
-export function usePluginUiState() {
+export function usePluginUiState(enabled = true) {
   const [entries, setEntries] = useState<PluginUiEntry[]>([]);
   const [revisions, setRevisions] = useState<Record<string, Record<string, number>>>({});
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -51,6 +51,7 @@ export function usePluginUiState() {
   const pokeRef = useRef<() => void>(() => {});
 
   useEffect(() => {
+    if (!enabled) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let slowTimer: ReturnType<typeof setTimeout> | null = null;
@@ -123,7 +124,7 @@ export function usePluginUiState() {
       if (timer) clearTimeout(timer);
       if (slowTimer) clearTimeout(slowTimer);
     };
-  }, []);
+  }, [enabled]);
 
   const poke = useCallback(() => pokeRef.current(), []);
 

@@ -365,6 +365,8 @@ interface Props {
    *  hidden so end users cannot add, edit, or remove projects. Defaults to
    *  true. See #7. */
   canManageProjects?: boolean;
+  /** Hide workdir, view, agent, fork, and settings authority controls. */
+  canManageSessionAuthority?: boolean;
   sortMode: SidebarSortMode;
   onSortModeChange: (mode: SidebarSortMode) => void;
   pluginSortRef: { pluginId: string; entryId: string } | null;
@@ -852,6 +854,7 @@ function SortableSessionRow({
   onStart?: (workspaceId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   onCreateSession?: (repoPath: string) => void;
+  canManageSessionAuthority?: boolean;
   readOnly?: boolean;
   dragDisabled?: boolean;
   optimistic: OptimisticTriage;
@@ -976,6 +979,7 @@ export const SessionRow = memo(function SessionRow({
   onStart,
   onSwitchView,
   onCreateSession,
+  canManageSessionAuthority = true,
   readOnly,
   indented,
   optimistic,
@@ -1002,6 +1006,7 @@ export const SessionRow = memo(function SessionRow({
   // Open the session wizard prefilled from this row's project (path, agent,
   // and the latest session's options), mirroring the per-project "+" button.
   onCreateSession?: (repoPath: string) => void;
+  canManageSessionAuthority?: boolean;
   readOnly?: boolean;
   indented?: boolean;
   // Optimistic triage overlay for this row plus the parent-owned mutation
@@ -1762,7 +1767,7 @@ export const SessionRow = memo(function SessionRow({
                 >
                   Rename
                 </button>
-                {!readOnly && canEditWorkdir && (
+                {!readOnly && canManageSessionAuthority && canEditWorkdir && (
                   <button
                     onClick={openWorkdirModal}
                     data-testid="sidebar-context-menu-edit-workdir"
@@ -1771,7 +1776,7 @@ export const SessionRow = memo(function SessionRow({
                     Edit workdir name
                   </button>
                 )}
-                {!readOnly && sessionId && canAddProject && (
+                {!readOnly && canManageSessionAuthority && sessionId && canAddProject && (
                   <button
                     onClick={openAddProjectModal}
                     data-testid="sidebar-context-menu-add-project"
@@ -1790,17 +1795,20 @@ export const SessionRow = memo(function SessionRow({
                     Edit group
                   </button>
                 )}
-                {!readOnly && firstSession && (firstSession.view === "structured" || firstSession.acp_capable) && (
-                  <button
-                    onClick={handleSwitchView}
-                    data-testid="sidebar-context-menu-switch-view"
-                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
-                  >
-                    <SquareTerminal className="h-3.5 w-3.5 shrink-0" />
-                    {firstSession.view === "structured" ? "Switch to terminal" : "Switch to structured view"}
-                  </button>
-                )}
-                {!readOnly && acpSession && (
+                {!readOnly &&
+                  canManageSessionAuthority &&
+                  firstSession &&
+                  (firstSession.view === "structured" || firstSession.acp_capable) && (
+                    <button
+                      onClick={handleSwitchView}
+                      data-testid="sidebar-context-menu-switch-view"
+                      className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                    >
+                      <SquareTerminal className="h-3.5 w-3.5 shrink-0" />
+                      {firstSession.view === "structured" ? "Switch to terminal" : "Switch to structured view"}
+                    </button>
+                  )}
+                {!readOnly && canManageSessionAuthority && acpSession && (
                   <button
                     onClick={handleSwitchAgent}
                     data-testid="sidebar-context-menu-switch-agent"
@@ -1810,7 +1818,7 @@ export const SessionRow = memo(function SessionRow({
                     Switch agent
                   </button>
                 )}
-                {!readOnly && acpSession?.acp_session_id && acpSession.acp_can_fork && (
+                {!readOnly && canManageSessionAuthority && acpSession?.acp_session_id && acpSession.acp_can_fork && (
                   <button
                     onClick={() => void handleFork()}
                     data-testid="sidebar-context-menu-fork"
@@ -3127,6 +3135,7 @@ export function WorkspaceSidebar({
   onSwitchView,
   readOnly,
   canManageProjects = true,
+  canManageSessionAuthority = true,
   sortMode,
   onSortModeChange,
   pluginSortRef,
@@ -3948,7 +3957,8 @@ export function WorkspaceSidebar({
                                     onDelete={onDeleteSession}
                                     onStop={onStopSession}
                                     onStart={onStartSession}
-                                    onSwitchView={onSwitchView}
+                                    onSwitchView={canManageSessionAuthority ? onSwitchView : undefined}
+                                    canManageSessionAuthority={canManageSessionAuthority}
                                     onCreateSession={onCreateSession}
                                     readOnly={readOnly}
                                     optimistic={triage.optimisticFor(v.workspace.id)}
@@ -4057,7 +4067,8 @@ export function WorkspaceSidebar({
                                 onDelete={onDeleteSession}
                                 onStop={onStopSession}
                                 onStart={onStartSession}
-                                onSwitchView={onSwitchView}
+                                onSwitchView={canManageSessionAuthority ? onSwitchView : undefined}
+                                canManageSessionAuthority={canManageSessionAuthority}
                                 readOnly={readOnly}
                                 optimistic={triage.optimisticFor(v.workspace.id)}
                                 onPinToggle={triage.pinToggle}
@@ -4134,7 +4145,8 @@ export function WorkspaceSidebar({
                                 onDelete={onDeleteSession}
                                 onStop={onStopSession}
                                 onStart={onStartSession}
-                                onSwitchView={onSwitchView}
+                                onSwitchView={canManageSessionAuthority ? onSwitchView : undefined}
+                                canManageSessionAuthority={canManageSessionAuthority}
                                 readOnly={readOnly}
                                 optimistic={triage.optimisticFor(v.workspace.id)}
                                 onPinToggle={triage.pinToggle}
@@ -4220,7 +4232,8 @@ export function WorkspaceSidebar({
                       onDelete={onDeleteSession}
                       onStop={onStopSession}
                       onStart={onStartSession}
-                      onSwitchView={onSwitchView}
+                      onSwitchView={canManageSessionAuthority ? onSwitchView : undefined}
+                      canManageSessionAuthority={canManageSessionAuthority}
                       readOnly={readOnly}
                       optimistic={triage.optimisticFor(v.workspace.id)}
                       onPinToggle={triage.pinToggle}
@@ -4293,27 +4306,29 @@ export function WorkspaceSidebar({
               onEmptyTrash={() => onEmptyTrash?.()}
             />
           )}
-          <button
-            onClick={onSettings}
-            {...tourAnchor(TOUR_ANCHORS.sidebarSettings)}
-            className="w-8 h-8 shrink-0 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer rounded-md transition-colors"
-            title="Settings"
-            aria-label="Settings"
-          >
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
+          {canManageSessionAuthority && (
+            <button
+              onClick={onSettings}
+              {...tourAnchor(TOUR_ANCHORS.sidebarSettings)}
+              className="w-8 h-8 shrink-0 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer rounded-md transition-colors"
+              title="Settings"
+              aria-label="Settings"
             >
-              <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
-              <circle cx="12" cy="12" r="3" />
-            </svg>
-          </button>
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
+                <circle cx="12" cy="12" r="3" />
+              </svg>
+            </button>
+          )}
         </div>
       </div>
       {/* Resize handle (desktop only). Gated on `open`: when the sidebar is

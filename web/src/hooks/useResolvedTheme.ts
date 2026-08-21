@@ -17,10 +17,11 @@ export interface ThemePickerChangedDetail {
 /** Apply the user's selected theme on mount and on settings updates.
  *  Reads the cached payload from localStorage first to prevent FOUC,
  *  then fetches the authoritative payload and applies it. */
-export function useResolvedTheme(): ResolvedTheme | null {
+export function useResolvedTheme(enabled = true): ResolvedTheme | null {
   const [theme, setTheme] = useState<ResolvedTheme | null>(() => readCachedResolvedTheme());
 
   useEffect(() => {
+    if (!enabled) return;
     // Monotonic sequence numbers tag every in-flight fetch. A fetch's
     // response is applied only if its sequence is greater than the
     // most recently applied one, so a slow mount fetch landing after
@@ -51,7 +52,7 @@ export function useResolvedTheme(): ResolvedTheme | null {
       unmounted = true;
       window.removeEventListener(THEME_PICKER_CHANGED_EVENT, onChange);
     };
-  }, []);
+  }, [enabled]);
 
   return theme;
 }

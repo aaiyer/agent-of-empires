@@ -11,8 +11,9 @@ function isForeground(): boolean {
  * suppression logic. Session polling continues in a backgrounded browser,
  * but that traffic must not make a phone miss a notification.
  */
-export function useDashboardPresence(): void {
+export function useDashboardPresence(enabled = true): void {
   useEffect(() => {
+    if (!enabled) return;
     const report = (active: boolean, keepalive = false) => {
       void fetch("/api/presence", {
         method: "POST",
@@ -46,5 +47,5 @@ export function useDashboardPresence(): void {
       window.removeEventListener("pagehide", clear);
       clear();
     };
-  }, []);
+  }, [enabled]);
 }

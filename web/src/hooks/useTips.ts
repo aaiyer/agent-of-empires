@@ -65,7 +65,7 @@ export interface UseTipsResult {
   setEnabled: (enabled: boolean) => void;
 }
 
-export function useTips(): UseTipsResult {
+export function useTips(enabledForDeployment = true): UseTipsResult {
   const [enabled, setEnabledState] = useState(false);
   const [tips, setTips] = useState<TipDto[]>([]);
   const [loaded, setLoaded] = useState(false);
@@ -73,6 +73,7 @@ export function useTips(): UseTipsResult {
   const [startIndex, setStartIndex] = useState(0);
 
   useEffect(() => {
+    if (!enabledForDeployment) return;
     let active = true;
     fetchTips().then((resp) => {
       if (!active) return;
@@ -85,7 +86,7 @@ export function useTips(): UseTipsResult {
     return () => {
       active = false;
     };
-  }, []);
+  }, [enabledForDeployment]);
 
   const markSeen = useCallback((id: string) => {
     // Optimistic: flip locally so the modal reflects it immediately, then

@@ -101,4 +101,18 @@ describe("SessionWizard hooks-trust flow (#2066)", () => {
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(getByText("Repository hooks require trust.")).toBeTruthy());
   });
+
+  it("sends only the title from the Maya name-only wizard", async () => {
+    createSession.mockResolvedValue({ ok: true, session: { id: "maya-1" } });
+    const onCreated = vi.fn();
+    const { getByPlaceholderText, getByText } = render(
+      <SessionWizard onClose={() => {}} onCreated={onCreated} nameOnly mayaRestricted />,
+    );
+
+    fireEvent.change(getByPlaceholderText("Auto-generated if empty"), { target: { value: "Resume risk work" } });
+    fireEvent.click(getByText(/Launch session/));
+
+    await waitFor(() => expect(createSession).toHaveBeenCalledWith({ title: "Resume risk work" }));
+    expect(onCreated).toHaveBeenCalledWith({ id: "maya-1" });
+  });
 });

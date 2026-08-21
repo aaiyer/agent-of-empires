@@ -9,17 +9,19 @@ import type { ProjectInfo } from "../lib/types";
 // pin/unpin, and re-fetches on window focus / tab visibility so a pin made
 // in the TUI (or another tab) shows up when the user returns here, without
 // a constant poll. See #2047.
-export function useProjects(): {
+export function useProjects(enabled = true): {
   projects: ProjectInfo[];
   refresh: () => Promise<void>;
 } {
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
 
   const refresh = useCallback(async () => {
+    if (!enabled) return;
     setProjects(await fetchProjects());
-  }, []);
+  }, [enabled]);
 
   useEffect(() => {
+    if (!enabled) return;
     void fetchProjects().then(setProjects);
     const onFocus = () => {
       if (document.visibilityState === "visible") void fetchProjects().then(setProjects);
@@ -30,7 +32,7 @@ export function useProjects(): {
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onFocus);
     };
-  }, [refresh]);
+  }, [enabled, refresh]);
 
   return { projects, refresh };
 }

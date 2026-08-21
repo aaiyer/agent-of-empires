@@ -4,10 +4,19 @@
   "surfaces": [
     {
       "id": "maya.restricted-chat-shell",
-      "kind": "vitest",
+      "kind": "mocked-playwright",
       "risk": "high",
-      "specs": ["src/components/__tests__/MayaRestrictedApp.test.tsx"],
-      "components": ["web/src/components/MayaRestrictedApp.tsx"]
+      "specs": [
+        "tests/maya-restricted-shell.spec.ts",
+        "src/lib/__tests__/clientCapabilities.test.ts",
+        "src/components/__tests__/WorkspaceSidebarTrash.test.tsx",
+        "src/components/session-wizard/__tests__/SessionWizard.hooksTrust.test.tsx"
+      ],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx"
+      ]
     },
     {
       "id": "terminal.paired-shell",
