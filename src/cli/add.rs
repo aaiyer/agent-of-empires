@@ -8,7 +8,10 @@ use std::path::PathBuf;
 use crate::containers;
 use crate::session::builder;
 use crate::session::repo_config;
-use crate::session::{civilizations, GroupTree, Instance, SandboxInfo, Storage};
+use crate::session::{
+    acquire_session_identity_lock, civilizations, duplicate_session_error, is_duplicate_session,
+    GroupTree, Instance, SandboxInfo, Storage,
+};
 
 /// Parse one `--repo-base <repo>=<branch>` pair. Split on the first `=` so a
 /// branch containing one still parses.
@@ -633,7 +636,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // The title was resolved before worktree creation (so a tied session could
     // seed its directory leaf from it); run the path-dependent duplicate check
     // now that `path` points at the final worktree/workspace directory.
-    if is_duplicate_session(&instances, &final_title, path.to_str().unwrap_or("")) {
+    if is_duplicate_session(&instances, &final_title, path.to_str().unwrap_or(""), None) {
         cleanup_partial_session(
             &path,
             worktree_info_opt.as_ref(),
@@ -1116,11 +1119,34 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         return Err(e);
     }
 
+    // Hooks and all slow preparation are complete. Serialize only the final
+    // authoritative identity check and insert so a concurrent add or rename
+    // cannot commit the same `(title, project_path)` pair.
+    let _identity_lock = match acquire_session_identity_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            cleanup_partial_session(
+                &path,
+                instance.worktree_info.as_ref(),
+                instance.workspace_info.as_ref(),
+                args.create_branch,
+                if instance.scratch {
+                    Some(std::path::Path::new(&instance.project_path))
+                } else {
+                    None
+                },
+                instance.sandbox_info.as_ref().map(|_| instance.id.as_str()),
+            );
+            return Err(error);
+        }
+    };
+
     let persist_result = storage.update(|all_instances, groups| {
         if is_duplicate_session(
-            all_instances,
+            all_instances.iter(),
             &instance.title,
             instance.project_path.as_str(),
+            None,
         ) {
             return Ok(false);
         }
@@ -1165,6 +1191,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             return Err(e);
         }
     }
+    drop(_identity_lock);
 
     println!("✓ Added session: {}", final_title);
     println!("  Profile: {}", storage.profile());
@@ -1415,22 +1442,6 @@ fn cleanup_partial_session(
             let _ = std::fs::remove_dir_all(scratch);
         }
     }
-}
-
-pub fn is_duplicate_session(instances: &[Instance], title: &str, path: &str) -> bool {
-    let normalized_path = path.trim_end_matches('/');
-    instances.iter().any(|inst| {
-        let existing_path = inst.project_path.trim_end_matches('/');
-        existing_path == normalized_path && inst.title == title
-    })
-}
-
-fn duplicate_session_error(title: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "Session already exists with same title and path: {}\n\
-         Tip: use a different --title or remove the existing session first",
-        title
-    )
 }
 
 /// Sync mirror of `Supervisor::pick_agent_for_tool` so add-time

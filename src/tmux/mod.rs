@@ -37,7 +37,7 @@ pub mod test_support {
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -252,6 +252,37 @@ struct SessionCache {
     data: Option<HashMap<String, i64>>,
     time: Option<Instant>,
 }
+const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn run_tmux_command_with_timeout_inner(
+    cmd: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<Output> {
+    cmd.stdin(Stdio::null());
+    match crate::process::run_with_timeout(cmd, timeout)? {
+        Some(output) => Ok(output),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("tmux command timed out after {}s", timeout.as_secs_f64()),
+        )),
+    }
+}
+
+pub(crate) fn run_tmux_command_with_timeout(cmd: &mut Command) -> std::io::Result<Output> {
+    run_tmux_command_with_timeout_inner(cmd, TMUX_COMMAND_TIMEOUT)
+}
+
+/// Result of the authoritative `list-sessions` scan performed by
+/// [`refresh_session_cache`]. The shared cache intentionally keeps both
+/// no-server and unexpected failures as `data: None` so status pollers retain
+/// their existing conservative `Unknown` behavior; rekeying uses this outcome
+/// to suppress a warning only for the recognized no-server case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCacheRefresh {
+    Populated,
+    NoServer,
+    Unknown,
+}
 
 // Field separator for multi-field tmux `-F` format strings. Must be a
 // printable ASCII byte that does not appear in `sanitize_session_name` output
@@ -292,13 +323,12 @@ fn tmux_no_server_running(stderr: &[u8]) -> bool {
     })
 }
 
-pub fn refresh_session_cache() {
+pub fn refresh_session_cache() -> SessionCacheRefresh {
     let start = Instant::now();
-    let output = tmux_query_command()
-        .args(["list-sessions", "-F", "#{session_name}|#{session_activity}"])
-        .output();
-
-    let new_data = match output {
+    let mut command = tmux_query_command();
+    command.args(["list-sessions", "-F", "#{session_name}|#{session_activity}"]);
+    let output = run_tmux_command_with_timeout(&mut command);
+    let (new_data, outcome) = match output {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             let mut map = HashMap::new();
@@ -308,24 +338,24 @@ pub fn refresh_session_cache() {
                     map.insert(name.to_string(), activity);
                 }
             }
-            Some(map)
+            (Some(map), SessionCacheRefresh::Populated)
+        }
+        Ok(out) if tmux_no_server_running(&out.stderr) => {
+            tracing::trace!(target: "tmux.cache", "no tmux server running; cache cleared");
+            (None, SessionCacheRefresh::NoServer)
         }
         Ok(out) => {
-            if tmux_no_server_running(&out.stderr) {
-                tracing::trace!(target: "tmux.cache", "no tmux server running; cache cleared");
-            } else {
-                tracing::warn!(
-                    target: "tmux.cache",
-                    status = ?out.status,
-                    stderr_bytes = out.stderr.len(),
-                    "list-sessions returned non-zero; cache cleared",
-                );
-            }
-            None
+            tracing::warn!(
+                target: "tmux.cache",
+                status = ?out.status,
+                stderr_bytes = out.stderr.len(),
+                "list-sessions returned non-zero; cache state unknown",
+            );
+            (None, SessionCacheRefresh::Unknown)
         }
         Err(e) => {
-            tracing::warn!(target: "tmux.cache", error = %e, "list-sessions spawn failed; cache cleared");
-            None
+            tracing::warn!(target: "tmux.cache", error = %e, "list-sessions spawn failed; cache state unknown");
+            (None, SessionCacheRefresh::Unknown)
         }
     };
 
@@ -342,6 +372,106 @@ pub fn refresh_session_cache() {
     if let Ok(mut cache) = SESSION_CACHE.write() {
         cache.data = new_data;
         cache.time = Some(Instant::now());
+    }
+    outcome
+}
+
+/// Classify the currently selected agent session without letting an
+/// ambiguous title-derived resolution turn "another live name carries this
+/// id" into confirmed absence.
+fn resolved_agent_existence(
+    id: &str,
+    session: &Session,
+    refresh: SessionCacheRefresh,
+) -> SessionExistence {
+    match refresh {
+        SessionCacheRefresh::NoServer => return SessionExistence::Absent,
+        SessionCacheRefresh::Unknown => return SessionExistence::Unknown,
+        SessionCacheRefresh::Populated => {}
+    }
+    let cache = match SESSION_CACHE.read() {
+        Ok(cache) if cache.time.is_some_and(|time| time.elapsed() <= CACHE_TTL) => cache,
+        _ => return SessionExistence::Unknown,
+    };
+    let Some(names) = cache.data.as_ref() else {
+        return SessionExistence::Unknown;
+    };
+    if names.contains_key(session.name()) {
+        return SessionExistence::Present;
+    }
+    let suffix = id_suffix(id);
+    let shape = NameShape::agent(&suffix);
+    if !names.keys().any(|name| shape.matches(name)) {
+        return SessionExistence::Absent;
+    }
+    // Multiple id-shaped candidates make `Session::new` deliberately retain
+    // the derived name. That is unresolved, not absence.
+    SessionExistence::Unknown
+}
+
+/// Rekey a live title-derived tmux session after its new title is durable.
+///
+/// Returns `Ok(false)` only when tmux authoritatively confirms that no live
+/// session exists. Title writers must persist first while holding the
+/// per-session title and lifecycle locks through this call; rekeying before
+/// commit can strand the pane when persistence fails.
+pub(crate) fn rekey_session(id: &str, old_title: &str, new_title: &str) -> anyhow::Result<bool> {
+    // Name resolution is cache-backed. Force an authoritative scan first so a
+    // process-local snapshot from before another writer's rename cannot point
+    // this mutation at the old title-derived name.
+    let initial_refresh = refresh_session_cache();
+    let session = Session::new(id, old_title)?;
+    match resolved_agent_existence(id, &session, initial_refresh) {
+        SessionExistence::Present => {}
+        SessionExistence::Absent => return Ok(false),
+        SessionExistence::Unknown => {
+            anyhow::bail!("Could not determine whether the tmux session exists")
+        }
+    }
+
+    let new_name = Session::generate_name(id, new_title);
+    let original_name = session.name().to_string();
+    let original_error = match session.rename(&new_name) {
+        Ok(()) => {
+            refresh_session_cache();
+            return Ok(true);
+        }
+        Err(error) => error,
+    };
+
+    // Another process may have rekeyed this id between our scan and
+    // rename-session. Refresh and resolve by the immutable id suffix, then
+    // retry once only when that same live session is confirmed under a newer
+    // name. A transient query failure is not evidence the pane disappeared,
+    // so preserve the original rename error in that case.
+    let retry_refresh = refresh_session_cache();
+    let refreshed = Session::new(id, old_title)?;
+    match resolved_agent_existence(id, &refreshed, retry_refresh) {
+        SessionExistence::Absent => return Ok(false),
+        SessionExistence::Unknown => return Err(original_error),
+        SessionExistence::Present => {}
+    }
+    if refreshed.name() == new_name {
+        return Ok(true);
+    }
+    if refreshed.name() == original_name {
+        return Err(original_error);
+    }
+
+    let retry_error = match refreshed.rename(&new_name) {
+        Ok(()) => {
+            refresh_session_cache();
+            return Ok(true);
+        }
+        Err(error) => error,
+    };
+    let final_refresh = refresh_session_cache();
+    let final_session = Session::new(id, old_title)?;
+    match resolved_agent_existence(id, &final_session, final_refresh) {
+        SessionExistence::Absent => Ok(false),
+        SessionExistence::Unknown => Err(original_error),
+        SessionExistence::Present if final_session.name() == new_name => Ok(true),
+        SessionExistence::Present => Err(retry_error),
     }
 }
 
@@ -570,11 +700,11 @@ fn session_name_from_cache(derived: &str, shape: &NameShape) -> Option<String> {
     if !fresh {
         return None;
     }
-    // A fresh snapshot with no data means the last `list-sessions` itself
-    // failed (no server running, unreachable socket). That is not evidence
-    // about any name, and it is an answer, not a stale snapshot: returning
-    // `None` here would make every caller re-refresh into the same failure,
-    // one subprocess per call from render loops that never had a session.
+    // A fresh snapshot with no data means the last `list-sessions` produced
+    // either no-server or an unexpected failure. Neither selects a live name,
+    // and this is an answer rather than a stale snapshot: returning `None`
+    // would make every caller re-refresh into the same result, one subprocess
+    // per call from render loops.
     let Some(names) = cache.data.as_ref() else {
         return Some(derived.to_string());
     };
@@ -897,8 +1027,9 @@ pub enum SessionExistence {
     Present,
     /// The tmux server answered and the session is not in its list.
     Absent,
-    /// The tmux server could not be reached (refused connection, stale
-    /// socket, spawn failure). This is NOT evidence the session is gone.
+    /// The shared cache cannot establish liveness (including a recognized
+    /// no-server response or an unexpected query failure). This is NOT
+    /// evidence the session is gone.
     Unknown,
 }
 
@@ -920,24 +1051,18 @@ fn session_existence_from_cache(name: &str) -> Option<SessionExistence> {
     Some(match &cache.data {
         Some(map) if map.contains_key(name) => SessionExistence::Present,
         Some(_) => SessionExistence::Absent,
-        // The last refresh's `list-sessions` call itself failed (non-zero
-        // exit or spawn error): a definitive "can't tell", not "absent".
-        // Do not fall back to a fresh `has-session` probe here; during a
-        // real outage that call fails the same way and just burns a
-        // subprocess per session per poll for no new information.
+        // The last refresh could not produce a session list (recognized
+        // no-server response or unexpected query failure): a definitive
+        // "can't tell" for status polling, not "absent". Do not fall back to a
+        // fresh `has-session` probe here; during an outage that call fails the
+        // same way and just burns a subprocess per session per poll for no new
+        // information.
         //
-        // This is also why a fully-down server can never resolve to
-        // `Absent` here: aoe's tmux sessions run with `remain-on-exit on`,
-        // so a dying agent leaves its pane dead but the session itself
-        // `Present` in `list-sessions`. The only way `list-sessions` fails
-        // is the server process itself being gone (crash, `kill-server`,
-        // or the last session in it being killed), and that case is
-        // indistinguishable from a transient connectivity blip from here.
-        // Resolving it to `Unknown` freezes every polled instance at its
+        // Resolving this arm to `Unknown` freezes every polled instance at its
         // prior status until the bounded-window escalation in
-        // `update_status_with_metadata_inner` kicks in; do not "fix" this
-        // arm back to `Absent`, that is the false-Error-latch bug this
-        // tri-state exists to prevent.
+        // `update_status_with_metadata_inner` kicks in; do not collapse it to
+        // `Absent`. Rekeying separately consumes `SessionCacheRefresh` so it
+        // can treat a recognized no-server result as an absent rename target.
         None => SessionExistence::Unknown,
     })
 }
@@ -1215,6 +1340,16 @@ mod tests {
         assert_eq!(cmd.get_program().to_str(), Some("tmux"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn tmux_command_timeout_kills_a_stalled_client() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 5"]);
+        let error = run_tmux_command_with_timeout_inner(&mut command, Duration::from_millis(10))
+            .expect_err("stalled client must time out");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
     #[test]
     fn test_tmux_socket_resolves_under_test() {
         assert!(
@@ -1280,13 +1415,57 @@ mod tests {
     fn probe_session_existence_returns_unknown_when_server_unreachable() {
         let guard = SessionCacheGuard::capture();
         let name = format!("{P}probe_unknown_abc12345");
-        // Simulates the last `list-sessions` call failing (stale socket,
-        // refused connection): the cache is fresh but has no data. This must
-        // resolve straight from the cache, without falling back to a fresh
-        // `has-session` subprocess call (which would just fail the same way
-        // during a real outage).
+        // Simulates `list-sessions` failing unexpectedly (permission denied,
+        // malformed socket, or spawn failure): the cache is fresh but has no
+        // data. This must resolve straight from the cache, without falling
+        // back to a fresh `has-session` subprocess call.
         guard.force_unreachable();
         assert_eq!(probe_session_existence(&name), SessionExistence::Unknown);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rekey_classification_treats_confirmed_no_server_as_absent() {
+        let guard = SessionCacheGuard::capture();
+        let id = "noserverdeadbeef";
+        guard.force_unreachable();
+        let session = Session::new(id, "derived").unwrap();
+        assert_eq!(
+            resolved_agent_existence(id, &session, SessionCacheRefresh::NoServer),
+            SessionExistence::Absent
+        );
+        assert_eq!(
+            resolved_agent_existence(id, &session, SessionCacheRefresh::Unknown),
+            SessionExistence::Unknown
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ambiguous_live_names_are_unknown_not_confirmed_absence() {
+        let guard = SessionCacheGuard::capture();
+        let id = "ambig123deadbeef";
+        let first = format!("{P}first_ambig123");
+        let second = format!("{P}second_ambig123");
+        guard.force_present(&[&first, &second]);
+        let session = Session::new(id, "derived").unwrap();
+        assert_eq!(
+            resolved_agent_existence(id, &session, SessionCacheRefresh::Populated),
+            SessionExistence::Unknown
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn aux_shaped_live_derived_name_is_present_not_absent() {
+        let guard = SessionCacheGuard::capture();
+        let id = "auxshapedeadbeef";
+        let session = Session::new(id, "term rewriting").unwrap();
+        guard.force_present(&[session.name()]);
+        assert_eq!(
+            resolved_agent_existence(id, &session, SessionCacheRefresh::Populated),
+            SessionExistence::Present
+        );
     }
 
     /// A session id long enough that `truncate_id(.., 8)` actually truncates,
@@ -1718,6 +1897,75 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rekey_session_adopts_peer_renamed_pane() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let start_name = Session::generate_name(ID, "Fix login bug");
+        let peer_name = Session::generate_name(ID, "Peer rename");
+        let final_name = Session::generate_name(ID, "Final rename");
+        let start_guard = TmuxTestSession::from_name(start_name.clone());
+        let peer_guard = TmuxTestSession::from_name(peer_name.clone());
+        let final_guard = TmuxTestSession::from_name(final_name.clone());
+        let created = tmux_command()
+            .args(["new-session", "-d", "-s", start_guard.name(), "sleep 60"])
+            .output()
+            .expect("tmux new-session");
+        assert!(created.status.success());
+        refresh_session_cache();
+
+        // A sibling process renames the live pane without refreshing this
+        // process's cache. `rekey_session` must scan first, adopt the
+        // id-matching peer name, and move that same pane to the destination.
+        let peer_rename = tmux_command()
+            .args(["rename-session", "-t", &start_name, &peer_name])
+            .output()
+            .expect("peer tmux rename");
+        assert!(peer_rename.status.success());
+        assert!(rekey_session(ID, "Fix login bug", "Final rename").unwrap());
+        assert!(Session::from_name(&final_name).exists());
+        drop((start_guard, peer_guard, final_guard));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rekey_session_reports_false_for_vanished_pane() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        // Keep the isolated tmux server alive after the target is killed, so
+        // the assertion distinguishes an absent session from a vanished server.
+        let dummy_guard = TmuxTestSession::new("aoe_test_rekey_dummy");
+        let dummy_created = tmux_command()
+            .args(["new-session", "-d", "-s", dummy_guard.name(), "sleep 60"])
+            .output()
+            .expect("dummy tmux new-session");
+        assert!(dummy_created.status.success());
+        let name = Session::generate_name(ID, "Final rename");
+        let guard = TmuxTestSession::from_name(name.clone());
+        let created = tmux_command()
+            .args(["new-session", "-d", "-s", guard.name(), "sleep 60"])
+            .output()
+            .expect("tmux new-session");
+        assert!(created.status.success());
+        // Populate a positive cache entry, then remove the target without
+        // refreshing it. The authoritative refresh inside `rekey_session` must
+        // classify the vanished pane as `Ok(false)`, keeping API/TUI callers
+        // from showing a warning.
+        refresh_session_cache();
+        let killed = tmux_command()
+            .args(["kill-session", "-t", &name])
+            .output()
+            .expect("tmux kill-session");
+        assert!(killed.status.success());
+        assert!(!rekey_session(ID, "Final rename", "No live pane").unwrap());
+        drop((guard, dummy_guard));
     }
 
     /// Verify that the compound-command approach (export + exec) correctly

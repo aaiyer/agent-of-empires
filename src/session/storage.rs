@@ -37,26 +37,45 @@
 //!    crashed peer cannot wedge other aoe processes. Mirrors the pattern
 //!    already used by `recovery.rs` and `logging.rs`.
 //!
+//! Title writers additionally hold an app-global, per-session title flock
+//! across persistence and the post-commit tmux rekey. It is independent of
+//! profile so a cross-profile move and writers using either profile still
+//! serialize. Terminal title writers and launch callers then acquire the
+//! source profile's per-instance lifecycle flock before any profile Storage
+//! mutex/flock: session title -> lifecycle -> Storage.
+//!
 //! All mutation goes through `update` (load -> mutate -> save under both
 //! locks). `save_workspace_ordering` is private and only consumed by
 //! `update_workspace_ordering` internally; the per-profile `save` /
 //! `save_groups` helpers were removed entirely. This keeps it structurally
 //! impossible to bypass the locks.
 //!
-//! Lock-ordering rule across the process: server callers MUST drop
-//! `AppState.instances` (tokio RwLock) before acquiring `Storage`'s
-//! per-profile mutex via `tokio::task::spawn_blocking(... storage.update)`.
-//! The flock can park on a wedged peer for arbitrary time; holding the
-//! tokio RwLock across the wait would block every other reader/writer of
-//! `AppState.instances` and park the worker thread. The cross-process
-//! `flock` is acquired AFTER the in-process mutex and released BEFORE it
-//! (RAII drop order). The closure passed to `update` is
-//! `FnOnce(...) -> Result<R>` and cannot await, so `std::sync::Mutex` is
-//! safe across the body even on the tokio runtime.
-//! Session launch callers additionally hold a per-instance lifecycle flock.
-//! The only permitted order is lifecycle flock, then the short-lived storage
-//! mutex/flock taken by `update`; a caller that already holds a lifecycle lock
-//! must use the internal locked launch path rather than reacquiring it.
+//! Lock-ordering rule across the process: a mutation that can change or create
+//! a `(title, project_path)` pair first acquires the app-global session identity
+//! flock. A title-changing mutation of an existing session then acquires that
+//! session's app-dir title flock, followed by the source profile's lifecycle
+//! flock, before any profile `Storage` lock. A path-only manual edit skips the
+//! title flock but still nests lifecycle and Storage beneath identity. The
+//! identity lock is retained through the durable commit and cache publication,
+//! then released before post-commit tmux rekey; the session-title and lifecycle
+//! locks remain held through rekey. `aoe add` has no existing session id, so it
+//! takes identity directly before Storage. Launch and same-profile restart do
+//! not take identity: their order is session title, lifecycle, then Storage.
+//! A `restart_selected_session` profile move is the exception: it acquires
+//! identity before the session-title and lifecycle locks even when the
+//! `(title, project_path)` pair is unchanged. Code must never acquire identity
+//! or session title while holding lifecycle or Storage.
+//!
+//! Server callers MUST drop `AppState.instances` (tokio RwLock) before
+//! acquiring any flock via `tokio::task::spawn_blocking`. A flock can park on
+//! a wedged peer for arbitrary time; holding the tokio RwLock across the wait
+//! would block every other reader/writer and park the worker thread. The
+//! cross-process storage flock is acquired AFTER the in-process mutex and
+//! released BEFORE it (RAII drop order). The closure passed to `update` is
+//! `FnOnce(...) -> Result<R>` and cannot await, so `std::sync::Mutex` is safe
+//! across the body even on the tokio runtime. A caller already holding the
+//! outer session-title and lifecycle locks must use the internal locked launch
+//! path rather than reacquiring them.
 //!
 //! Closures must remain CPU/memory only (no network, no user input, no tmux
 //! work). A closure that hangs holds both layers indefinitely and blocks
@@ -95,6 +114,15 @@ const WORKSPACE_LOCK_FILENAME: &str = ".workspace-ordering.lock";
 /// Sidecar lock prefix for one session's launch lifecycle. The validated
 /// instance id is appended verbatim, yielding one lock per (profile, instance).
 const INSTANCE_LIFECYCLE_LOCK_PREFIX: &str = ".instance-lifecycle-";
+/// Sidecar lock for every mutation that can create or change a session's
+/// `(title, project_path)` identity. It lives at app scope because TUI renames
+/// can move a row between profiles.
+/// The historical filename is retained so mixed-version processes still
+/// coordinate during an upgrade.
+const SESSION_IDENTITY_LOCK_FILENAME: &str = ".title-mutation.lock";
+/// Sidecar lock prefix for one session's title persistence plus tmux rekey.
+/// Lives at the app-data root so it remains stable across profile moves.
+const SESSION_TITLE_LOCK_PREFIX: &str = ".session-title-";
 
 /// Emit a tracing warn if the cross-process `flock` is held by a peer for
 /// longer than this. Surfaces a wedged peer in `aoe logs` instead of a
@@ -102,8 +130,10 @@ const INSTANCE_LIFECYCLE_LOCK_PREFIX: &str = ".instance-lifecycle-";
 /// observability only, not a timeout.
 const FLOCK_WAIT_WARN_AFTER: Duration = Duration::from_secs(1);
 
-/// Write `content` to `path` atomically (temp file + fsync + rename + dir fsync).
+/// Write `content` atomically (temp file + data/metadata fsync + rename + best-effort dir fsync).
 /// Existing perms are preserved; on a fresh file the result is tempfile's 0o600 default.
+/// All fallible file mutations complete before the final rename, so an error
+/// means the destination was not replaced.
 ///
 /// A symlink at `path` is resolved first and the write lands on the target, so
 /// a user who symlinks `config.toml` (or any other file we own) into a dotfiles
@@ -122,11 +152,11 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
     let existing_perms = fs::metadata(path).ok().map(|m| m.permissions());
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(content)?;
-    tmp.as_file().sync_data()?;
-    let file = tmp.persist(path)?;
     if let Some(perms) = existing_perms {
-        file.set_permissions(perms)?;
+        tmp.as_file().set_permissions(perms)?;
     }
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)?;
     // Best-effort dir fsync so the rename itself survives power loss.
     if let Ok(dir_file) = fs::File::open(dir) {
         let _ = dir_file.sync_all();
@@ -233,6 +263,9 @@ where
     let result = mutate(&mut value);
     if result.is_ok() {
         atomic_write(path, serialize(&value)?.as_bytes())?;
+        // Best-effort here, unlike atomic_write's "every fallible mutation
+        // before the rename" contract: the content is already durably committed,
+        // so re-tightening a pre-existing file to 0o600 must not fail the write.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -361,6 +394,41 @@ pub(crate) fn acquire_storage_flock(dir: &Path, name: &str) -> Result<StorageFlo
     }
     Ok(StorageFlock { file })
 }
+/// Acquire the app-wide session identity-mutation lock.
+///
+/// Callers must take this before loading authoritative profile storage and
+/// retain it through duplicate validation, external rename effects, durable
+/// writes, and any in-memory cache publication. See the module lock order.
+///
+/// Held across slow external effects. The tied worktree rename path
+/// (`session::worktree_edit::edit_worktree_workdir`) may run `git branch -m`
+/// and `git worktree move` while this lock is held. Both mutations are bounded
+/// by `WORKTREE_MUTATION_TIMEOUT`, so a stalled filesystem returns an error
+/// instead of blocking every identity writer indefinitely. Title writers
+/// release this lock after the durable commit and retain their per-session
+/// title and lifecycle locks through the bounded tmux rekey.
+///
+/// Imports, restores, and other creation surfaces that do not use guarded add
+/// or rename paths remain outside this lock. The lock prevents participating
+/// writers from introducing a duplicate; it does not repair existing rows.
+pub(crate) fn acquire_session_identity_lock() -> Result<StorageFlock> {
+    acquire_storage_flock(&get_app_dir()?, SESSION_IDENTITY_LOCK_FILENAME)
+}
+
+/// Serialize one session's title commit and post-commit tmux rekey across
+/// profiles and processes.
+/// Callers must acquire this app-dir lock before a source per-instance
+/// lifecycle flock and before any profile [`Storage`] lock, then hold it until
+/// rekeying finishes. Keeping it separate from lifecycle locks limits its
+/// scope to title writers while still covering cross-profile moves.
+pub(crate) fn acquire_session_title_lock(instance_id: &str) -> Result<StorageFlock> {
+    super::validate_instance_id(instance_id)
+        .context("refusing session title lock for invalid instance id")?;
+    acquire_storage_flock(
+        &get_app_dir()?,
+        &format!("{SESSION_TITLE_LOCK_PREFIX}{instance_id}.lock"),
+    )
+}
 
 pub struct Storage {
     profile: String,
@@ -370,6 +438,8 @@ pub struct Storage {
     /// kernel-event-equivalent dispatcher path; see
     /// `FileWatchService::notify_local_change`. Cheap to clone (`Arc`).
     file_watch: Arc<FileWatchService>,
+    #[cfg(test)]
+    fail_writes_for_test: bool,
 }
 
 // Cross-device-syncable sidebar ordering. Workspaces are a client
@@ -402,6 +472,8 @@ impl Storage {
             sessions_path,
             save_lock,
             file_watch,
+            #[cfg(test)]
+            fail_writes_for_test: false,
         })
     }
 
@@ -424,6 +496,7 @@ impl Storage {
             sessions_path,
             save_lock: save_lock_for(profile),
             file_watch: FileWatchService::noop(),
+            fail_writes_for_test: false,
         }
     }
 
@@ -446,6 +519,8 @@ impl Storage {
             sessions_path,
             save_lock,
             file_watch,
+            #[cfg(test)]
+            fail_writes_for_test: false,
         })
     }
 
@@ -477,6 +552,11 @@ impl Storage {
             profile_dir,
             &format!("{INSTANCE_LIFECYCLE_LOCK_PREFIX}{instance_id}.lock"),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_fail_writes_for_test(&mut self, fail: bool) {
+        self.fail_writes_for_test = fail;
     }
 
     pub fn profile(&self) -> &str {
@@ -689,6 +769,11 @@ impl Storage {
             // notify is guaranteed to read the post-rename file.
             self.file_watch.notify_local_change(&groups_path);
         }
+        #[cfg(test)]
+        if self.fail_writes_for_test {
+            anyhow::bail!("injected sessions write failure");
+        }
+
         atomic_write(&self.sessions_path, &instances_buf)?;
         self.file_watch.notify_local_change(&self.sessions_path);
         Ok(result)
@@ -994,6 +1079,36 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    /// A pre-existing file's non-default mode survives the write: `atomic_write`
+    /// copies the destination's permissions onto the temp file before the
+    /// rename, so a 0o644 file stays 0o644 rather than reverting to
+    /// `NamedTempFile`'s 0o600 default.
+    ///
+    /// The dual half of the contract, that a failure inside `set_permissions`
+    /// leaves the destination unreplaced, is deliberately not exercised here:
+    /// `set_permissions` on a freshly created temp file we own has no reachable
+    /// failure mode without a fault-injection seam, so that guarantee rests on
+    /// the ordering in the code (every fallible step precedes `persist`) rather
+    /// than on a test.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("perms.txt");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        atomic_write(&path, b"new").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "a pre-existing non-default mode must survive the rename"
+        );
     }
 
     #[cfg(unix)]

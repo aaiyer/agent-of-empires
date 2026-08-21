@@ -202,10 +202,6 @@ release `aoe`: app data lives in `~/.agent-of-empires-dev` (macOS/Windows) or
 `aoe_dev_`, and `aoe serve` defaults to port `8081`. Release builds are
 unchanged.
 
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=agent-of-empires/agent-of-empires&type=date&legend=top-left)](https://www.star-history.com/#agent-of-empires/agent-of-empires&type=date&legend=top-left)
-
 ## Acknowledgments
 
 Inspired by [agent-deck](https://github.com/asheshgoplani/agent-deck) (Go + Bubble Tea).

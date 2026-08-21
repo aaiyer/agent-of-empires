@@ -15,8 +15,14 @@ pub(crate) use omp::*;
 /// Iterate directory entries, silently skipping unreadable ones.
 ///
 /// Wraps `std::fs::read_dir` and filters out individual entry errors (e.g.
-/// broken symlinks, transient permission failures) so that one bad entry
-/// doesn't abort the entire directory scan.
+/// transient permission failures) so that one bad entry doesn't abort the
+/// entire directory scan.
+///
+/// This filters `read_dir`'s per-entry `Err` only, which is a much narrower
+/// guarantee than it sounds. Nothing here stats the entry, so a dangling
+/// symlink, a symlink cycle, a directory, or a FIFO is yielded as an ordinary
+/// entry. Callers that need a real file behind the name have to check for
+/// themselves; see `scan_claude_project_dir`.
 pub(crate) fn resilient_read_dir(
     dir: &std::path::Path,
 ) -> Result<impl Iterator<Item = std::fs::DirEntry> + '_> {
@@ -241,10 +247,20 @@ fn scan_claude_project_dir(
             continue;
         }
 
-        let modified = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        // `fs::metadata` rather than `DirEntry::metadata`/`file_type`, which
+        // describe the link rather than its target. A symlinked transcript has
+        // to keep counting (#3399's workaround tells users to make one), and
+        // following the link reports the target's mtime, the one that advances
+        // as Claude appends. A directory, FIFO or dangling link named
+        // `<uuid>.jsonl` is otherwise handed back as a resume id with no
+        // transcript behind it.
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
         if known == Some(stem) && !exclusion.contains(stem) {
             known_hit = Some((stem.to_string(), modified));
@@ -377,6 +393,29 @@ pub(crate) fn claude_poll_fn(
     }
 }
 
+/// The `sh` snippet shipped to `docker exec` to list candidate transcripts.
+///
+/// All three checks dereference: `[ -f ]` for type, `find -L` for freshness,
+/// `ls -tL` for ordering. A symlink's own mtime is frozen at creation, so a
+/// link left undereferenced ages out of the five-minute gate while its target
+/// is still being appended. The host scan reads through links for the same
+/// reason (#3454), and the two have to agree for
+/// `claude_host_transcript_confirmed_absent` to mean anything.
+fn claude_container_list_snippet(dir_name: &str) -> String {
+    format!(
+        r#"
+CLAUDE_HOME="${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
+DIR="$CLAUDE_HOME/projects/{dir_name}"
+[ -d "$DIR" ] || exit 0
+for f in $(ls -tL "$DIR"/*.jsonl 2>/dev/null); do
+  [ -f "$f" ] || continue
+  [ -n "$(find -L "$f" -mmin -5 2>/dev/null)" ] || continue
+  basename "$f" .jsonl
+done
+"#
+    )
+}
+
 /// Capture Claude Code session ID inside a Docker container.
 ///
 /// Lists every fresh (≤ 5 min mtime) UUID-named jsonl in
@@ -390,19 +429,7 @@ pub(crate) fn capture_claude_session_id_in_container(
     exclusion: &HashSet<String>,
     known_session_id: Option<&str>,
 ) -> Result<String> {
-    let dir_name = encode_claude_project_path(container_cwd);
-
-    let snippet = format!(
-        r#"
-CLAUDE_HOME="${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
-DIR="$CLAUDE_HOME/projects/{dir_name}"
-[ -d "$DIR" ] || exit 0
-for f in $(ls -t "$DIR"/*.jsonl 2>/dev/null); do
-  [ -n "$(find "$f" -mmin -5 2>/dev/null)" ] || continue
-  basename "$f" .jsonl
-done
-"#
-    );
+    let snippet = claude_container_list_snippet(&encode_claude_project_path(container_cwd));
 
     let mut cmd = std::process::Command::new("docker");
     cmd.args(["exec", container_name, "sh", "-c", &snippet]);
@@ -3528,6 +3555,88 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Runs the production snippet under `sh` against a real directory, so the
+    /// guard is exercised without Docker. `CLAUDE_CONFIG_DIR` goes to the child
+    /// only, so this needs no `EnvGuard` and no serial key.
+    #[cfg(unix)]
+    #[test]
+    fn test_container_list_snippet_lists_only_regular_files() {
+        let sid = "11111111-1111-4111-8111-111111111111";
+        // `listed` is what the snippet should emit for each shape. The glob
+        // does match a directory, but `ls -tL` on one lists its contents
+        // rather than itself, so that entry never reaches `[ -f ]`; the row
+        // pins the listing step, not the guard.
+        let cases = [
+            ("regular", true),
+            ("symlink-to-transcript", true),
+            ("directory", false),
+            ("dangling-link", false),
+            ("symlink-cycle", false),
+            ("fifo", false),
+        ];
+        for (kind, listed) in cases {
+            let home = tempfile::tempdir().unwrap();
+            let project_path = format!("/tmp/container-scan-probe-{kind}");
+            let dir = home
+                .path()
+                .join("projects")
+                .join(encode_claude_project_path(&project_path));
+            std::fs::create_dir_all(&dir).unwrap();
+            let entry = dir.join(format!("{sid}.jsonl"));
+            match kind {
+                "regular" => std::fs::write(&entry, "{}\n").unwrap(),
+                "symlink-to-transcript" => {
+                    let target = dir.join("target.data");
+                    std::fs::write(&target, "{}\n").unwrap();
+                    std::os::unix::fs::symlink(&target, &entry).unwrap();
+                    // Age the link past the five-minute gate while its target
+                    // stays fresh. Without this the row passes on a link too
+                    // young to distinguish lstat from stat, which is the case
+                    // that actually breaks. BSD `touch` rejects this date
+                    // form, so skip the row where it is unavailable rather
+                    // than let it pass without testing anything.
+                    let aged = std::process::Command::new("touch")
+                        .args(["-h", "-d", "10 minutes ago"])
+                        .arg(&entry)
+                        .status()
+                        .is_ok_and(|s| s.success());
+                    if !aged {
+                        continue;
+                    }
+                }
+                "directory" => std::fs::create_dir(&entry).unwrap(),
+                "dangling-link" => {
+                    std::os::unix::fs::symlink(dir.join("gone.jsonl"), &entry).unwrap()
+                }
+                "symlink-cycle" => std::os::unix::fs::symlink(&entry, &entry).unwrap(),
+                "fifo" => {
+                    // Skipped rather than failed where `mkfifo` is unavailable;
+                    // the other rows still gate the guard.
+                    match std::process::Command::new("mkfifo").arg(&entry).status() {
+                        Ok(s) if s.success() => {}
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            }
+
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(claude_container_list_snippet(&encode_claude_project_path(
+                    &project_path,
+                )))
+                .env("CLAUDE_CONFIG_DIR", home.path())
+                .output()
+                .expect("snippet invocation failed");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(
+                stdout.lines().any(|l| l.trim() == sid),
+                listed,
+                "{kind}: unexpected listing, stdout {stdout:?}",
+            );
+        }
+    }
+
     #[test]
     fn test_encode_pi_project_path() {
         // Every path separator (both flavors) and `:` collapses to `-`, and the
@@ -6600,5 +6709,72 @@ mod tests {
             "drain must be bounded by the deadline even while the pipe stays open"
         );
         assert!(out.is_empty() || out == b"done");
+    }
+
+    /// Every entry here has the exact shape a real transcript has, a `.jsonl`
+    /// extension and a UUID stem, and nothing behind it. `main` hands all four
+    /// back as resume ids: `DirEntry::metadata` is an `lstat`, which succeeds
+    /// on all of them and reports the creation time, so they read as *fresh*
+    /// and win the `best` comparison outright.
+    #[test]
+    fn test_scan_skips_entries_that_are_not_regular_files() {
+        let sid = "11111111-1111-4111-8111-111111111111";
+        for kind in ["directory", "dangling-link", "symlink-cycle", "fifo"] {
+            let home = tempfile::tempdir().unwrap();
+            let project_path = format!("/tmp/scan-probe-{kind}");
+            let project = std::path::Path::new(&project_path);
+            let dir = home
+                .path()
+                .join("projects")
+                .join(encode_claude_project_path(&project.to_string_lossy()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let entry = dir.join(format!("{sid}.jsonl"));
+            match kind {
+                "directory" => std::fs::create_dir(&entry).unwrap(),
+                #[cfg(unix)]
+                "dangling-link" => {
+                    std::os::unix::fs::symlink(dir.join("gone.jsonl"), &entry).unwrap()
+                }
+                // `fs::metadata` returns `ELOOP` here rather than spinning, so
+                // the `Err` arm is what rejects this one, not `is_file`.
+                #[cfg(unix)]
+                "symlink-cycle" => std::os::unix::fs::symlink(&entry, &entry).unwrap(),
+                #[cfg(unix)]
+                "fifo" => {
+                    // Skipped rather than failed where `mkfifo` is unavailable;
+                    // the other three rows still gate the guard.
+                    match std::process::Command::new("mkfifo").arg(&entry).status() {
+                        Ok(s) if s.success() => {}
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            }
+
+            assert_eq!(
+                scan_claude_project_dir(home.path(), project, None, &HashSet::new()).unwrap(),
+                None,
+                "{kind} must not be handed back as a resume id",
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_follows_a_symlinked_transcript() {
+        let home = tempfile::tempdir().unwrap();
+        let project = std::path::Path::new("/tmp/scan-link-probe");
+        let dir = home
+            .path()
+            .join("projects")
+            .join(encode_claude_project_path(&project.to_string_lossy()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = home.path().join("real.jsonl");
+        std::fs::write(&real, "{}\n").unwrap();
+        let sid = "22222222-2222-4222-8222-222222222222";
+        std::os::unix::fs::symlink(&real, dir.join(format!("{sid}.jsonl"))).unwrap();
+
+        let found = scan_claude_project_dir(home.path(), project, None, &HashSet::new()).unwrap();
+        assert_eq!(found.map(|(id, _)| id), Some(sid.to_string()));
     }
 }

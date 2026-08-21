@@ -597,11 +597,13 @@ pub enum SessionBucket {
 
 /// One durable ownership protocol for every session lifecycle transition.
 ///
-/// A transition first acquires the per-instance lifecycle flock, then records
-/// a fresh generation under `Storage::update`. The durable reservation stays
-/// held through hooks, external side effects, and the exact-generation commit;
-/// callers may release the flock while running reentrant hooks. `status` is
-/// presentation state and never proves ownership.
+/// A transition acquires the per-instance lifecycle flock, then records a
+/// fresh generation under `Storage::update`. Terminal launch is the ordered
+/// exception: it first takes the app-global per-session title flock so title
+/// writers and launch cannot derive different tmux names. The durable
+/// reservation stays held through hooks, external side effects, and the
+/// exact-generation commit; callers may release outer flocks for reentrant hooks.
+/// `status` is presentation state and never proves ownership.
 ///
 /// A crashed owner loses both the flock and, after the TTL, its reservation.
 /// Recovery may then acquire a newer generation; exact-generation commits
@@ -1945,20 +1947,27 @@ impl Instance {
     ///
     /// `status` and `idle_entered_at` ARE generation-governed: a strictly newer
     /// disk snapshot (a peer's `commit_reserved_lifecycle_status`) must win over
-    /// the stale in-memory copy. `last_error`/`last_error_check` are NOT: no
-    /// lifecycle writer (`reserve_/commit_/advance_lifecycle_generation`)
-    /// produces an authoritative peer value for them. The only on-disk value is
-    /// the one `reconcile_from_disk` round-trips back from this same in-memory
-    /// poller state, so there is nothing to defer to and the in-memory value
-    /// always wins. Gating it on the generation would let an unrelated
-    /// generation bump (stop/unarchive, which pass `status: None`) discard a
-    /// freshly poller-derived `TMUX_SESSION_GONE_ERROR`, leaving the row stuck
-    /// at `Error`+`None`.
+    /// the stale in-memory copy. `last_error`/`last_error_check`,
+    /// `ever_confirmed_present`, and
+    /// `unknown_since` are NOT generation-governed: no lifecycle writer
+    /// (`reserve_/commit_/advance_lifecycle_generation`) produces an
+    /// authoritative peer value for them. The reachability sentinels are
+    /// serde-skipped, and the only on-disk error value is the one
+    /// `reconcile_from_disk` round-trips back from this same in-memory poller
+    /// state. The in-memory values therefore always win. Gating them on the
+    /// generation would let an unrelated bump discard a poller's confirmed
+    /// reachability and unknown streak, or a freshly derived
+    /// `TMUX_SESSION_GONE_ERROR`, leaving the row stuck at `Error`+`None`.
     pub(crate) fn merge_runtime_from_reload(&mut self, previous: &Self) {
         if self.lifecycle_generation <= previous.lifecycle_generation {
             self.status = previous.status;
             self.idle_entered_at = previous.idle_entered_at;
         }
+        // Reachability sentinels are runtime-only just like poller errors. A
+        // lifecycle generation bump does not make serde-skipped defaults from
+        // disk authoritative.
+        self.ever_confirmed_present = previous.ever_confirmed_present;
+        self.unknown_since = previous.unknown_since;
         self.last_error = previous.last_error.clone();
         self.last_error_check = previous.last_error_check;
         self.last_start_time = previous.last_start_time;
@@ -2238,8 +2247,15 @@ impl Instance {
     }
 
     /// Mark the session archived. Archived sessions sink to the bottom of
-    /// the Attention sort and render in italic+dim style, but remain
-    /// visible. Auto-cleared by the attention-signal hook on Waiting/Error.
+    /// the Attention sort and render in italic+dim style, but remain visible.
+    /// Archive suppresses the attention signal rather than the signal
+    /// clearing archive: `is_urgent` returns false while archived, and the
+    /// attention sort short-circuits the row to its bottom tier.
+    ///
+    /// Cleared by `unarchive`, by `touch_last_accessed`, and by `favorite`
+    /// and `pin`; not by `snooze`.
+    /// `merge_user_action_diff` mirrors those onto disk, and #3465 tracks a
+    /// status transition reaching that mirror without a user gesture.
     ///
     /// Mutual exclusion with `favorite`, `snooze`, and `pin`: archiving
     /// clears `favorited_at`, `snoozed_until`, and `pinned_at`. Archive
@@ -3977,6 +3993,41 @@ impl Instance {
         Ok(())
     }
 
+    /// Reacquire launch locks after user hooks, preserving the global
+    /// title-before-lifecycle order and failing the reservation consistently.
+    fn reacquire_launch_locks_after_hooks(
+        &mut self,
+        storage: &super::storage::Storage,
+        hook_result: Result<()>,
+    ) -> Result<(super::storage::StorageFlock, super::storage::StorageFlock)> {
+        let title_lock = match super::storage::acquire_session_title_lock(&self.id)
+            .context("failed to reacquire instance title lock after hooks")
+        {
+            Ok(lock) => lock,
+            Err(error) => {
+                self.fail_reserved_launch(storage, &error, false);
+                return Err(error);
+            }
+        };
+        let lifecycle_lock = match storage
+            .acquire_instance_lifecycle_lock(&self.id)
+            .context("failed to reacquire instance lifecycle lock after hooks")
+        {
+            Ok(lock) => lock,
+            Err(error) => {
+                self.fail_reserved_launch(storage, &error, false);
+                return Err(error);
+            }
+        };
+        self.reconcile_from_disk();
+        if let Err(error) = hook_result {
+            self.fail_reserved_launch(storage, &error, false);
+            return Err(error);
+        }
+        self.ensure_reservation_current_or_fail(storage)?;
+        Ok((title_lock, lifecycle_lock))
+    }
+
     pub fn start_with_size(&mut self, size: Option<(u16, u16)>) -> Result<()> {
         self.start_with_size_opts(size, false).map(|_| ())
     }
@@ -3997,6 +4048,8 @@ impl Instance {
         let storage = super::storage::Storage::new(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
 
+        let title_lock = super::storage::acquire_session_title_lock(&self.id)
+            .context("failed to acquire instance launch title lock")?;
         let lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance launch lock")?;
@@ -4024,19 +4077,18 @@ impl Instance {
         )?;
 
         // The durable reservation excludes peer launches while user hooks run.
-        // The flock itself must be absent because a hook may invoke aoe for
-        // this same session.
+        // Both flocks must be absent because a hook may invoke aoe for this
+        // same session. Reacquire in the global order afterward and reload the
+        // authoritative title (via `reconcile_from_disk`) before deriving the
+        // tmux launch name: `spawn_prepared_launch`'s `tmux_session()` reads
+        // `self.title`, so the reload guarantees the name comes from the
+        // committed title a concurrent rename may have written during hooks,
+        // never the pre-hook value.
         drop(lifecycle_lock);
+        drop(title_lock);
         let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
-        let _lifecycle_lock = storage
-            .acquire_instance_lifecycle_lock(&self.id)
-            .context("failed to reacquire instance launch lock after hooks")?;
-        self.reconcile_from_disk();
-        if let Err(error) = hook_result {
-            self.fail_reserved_launch(&storage, &error, false);
-            return Err(error);
-        }
-        self.ensure_reservation_current_or_fail(&storage)?;
+        let (_title_lock, _lifecycle_lock) =
+            self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
         self.apply_fresh_launch_intent();
 
         let prepared = match self.prepare_launch_command() {
@@ -4652,9 +4704,8 @@ impl Instance {
     }
 
     fn install_codex_host_hooks(&self, events: &[crate::agents::ResolvedHookEvent]) {
-        match crate::hooks::codex_hooks_json_path_for_host_environment(
-            &self.profile_host_environment(),
-        ) {
+        let environment = self.resolved_host_environment();
+        match crate::hooks::codex_hooks_json_path_for_host_environment(&environment) {
             Ok(hooks_path) => {
                 if let Err(e) = crate::hooks::install_hooks(
                     &hooks_path,
@@ -4678,10 +4729,8 @@ impl Instance {
         // Install hooks in the agent's host settings file, honoring a
         // config-dir override env var (e.g. CLAUDE_CONFIG_DIR) so hooks
         // land where the agent actually reads them.
-        match crate::hooks::agent_settings_path_for_host_environment(
-            hook_cfg,
-            &self.profile_host_environment(),
-        ) {
+        let environment = self.resolved_host_environment();
+        match crate::hooks::agent_settings_path_for_host_environment(hook_cfg, &environment) {
             Ok(settings_path) => {
                 if let Err(e) = crate::hooks::install_hooks(
                     &settings_path,
@@ -6113,6 +6162,8 @@ impl Instance {
         let storage = super::storage::Storage::new(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
 
+        let title_lock = super::storage::acquire_session_title_lock(&self.id)
+            .context("failed to acquire instance start title lock")?;
         let lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance start lock")?;
@@ -6139,18 +6190,16 @@ impl Instance {
         }
 
         // Keep the generation reservation durable, but allow hooks to invoke
-        // aoe against this session without waiting on our flock.
+        // aoe against this session without waiting on either flock. Reacquire
+        // title before lifecycle and reload (`reconcile_from_disk`) before
+        // deriving the launch name: `spawn_prepared_launch`'s `tmux_session()`
+        // reads `self.title`, so the reload guarantees the tmux name comes
+        // from the authoritative committed title, not a pre-hook value.
         drop(lifecycle_lock);
+        drop(title_lock);
         let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
-        let _lifecycle_lock = storage
-            .acquire_instance_lifecycle_lock(&self.id)
-            .context("failed to reacquire instance start lock after hooks")?;
-        self.reconcile_from_disk();
-        if let Err(error) = hook_result {
-            self.fail_reserved_launch(&storage, &error, false);
-            return Err(error);
-        }
-        self.ensure_reservation_current_or_fail(&storage)?;
+        let (_title_lock, _lifecycle_lock) =
+            self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
         let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
         self.apply_fresh_launch_intent();
 
@@ -6555,12 +6604,12 @@ impl Instance {
         self.kill_all_tmux_sessions_uncoordinated();
     }
 
-    /// Break-glass teardown after force-removal has durably deleted the row.
+    /// Tear down tmux resources when no durable lifecycle row exists.
     ///
-    /// A lifecycle reservation cannot be acquired once the row is absent.
-    /// Force-removal is limited to an already-Deleting row, so no launch can
-    /// race this idempotent cleanup.
-    pub(crate) fn kill_all_tmux_sessions_after_forced_removal(&self) {
+    /// Used after force-removal and when rolling back an instance that failed
+    /// before its row was committed. With no row, lifecycle reservation is
+    /// impossible; callers must already know the id cannot race a launch.
+    pub(crate) fn kill_all_tmux_sessions_without_lifecycle_row(&self) {
         self.kill_all_tmux_sessions_uncoordinated();
     }
 
@@ -7563,6 +7612,40 @@ fn pane_has_agent_content(raw_content: &str, tool: &str) -> bool {
     false
 }
 
+/// Find another session that owns the exact title and normalized path.
+///
+/// `exclude_id` lets mutation paths ignore the row being renamed.
+pub(crate) fn find_duplicate_session<'a>(
+    instances: impl IntoIterator<Item = &'a Instance>,
+    title: &str,
+    path: &str,
+    exclude_id: Option<&str>,
+) -> Option<&'a Instance> {
+    let normalized_path = path.trim_end_matches('/');
+    instances.into_iter().find(|inst| {
+        exclude_id != Some(inst.id.as_str())
+            && inst.project_path.trim_end_matches('/') == normalized_path
+            && inst.title == title
+    })
+}
+
+pub(crate) fn is_duplicate_session<'a>(
+    instances: impl IntoIterator<Item = &'a Instance>,
+    title: &str,
+    path: &str,
+    exclude_id: Option<&str>,
+) -> bool {
+    find_duplicate_session(instances, title, path, exclude_id).is_some()
+}
+
+pub(crate) fn duplicate_session_error(title: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Session already exists with same title and path: {}\n\
+         Tip: use a different title or remove the existing session first",
+        title
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7570,80 +7653,83 @@ mod tests {
     use tracing_test::traced_test;
 
     #[test]
-    fn summarize_omp_banner_uses_message_above_anchor() {
-        // #3377: the omp error banner's dismissal footer anchors the reason
-        // extraction; the message line above it (glyph stripped) is returned.
-        let pane = "────\n\
-                     ✘ 401 Incorrect API key provided: sk-dummy.\n\
-                     Dismissed when you send your next message.\n\
-                     ────\n\
-                     ╭── π  > GPT-5.6 Sol ─╮\n\
-                     ╰─                   ─╯";
-        assert_eq!(
-            summarize_error_from_pane(pane),
-            "401 Incorrect API key provided: sk-dummy."
-        );
+    fn summarize_error_from_pane_handles_banner_shapes() {
+        let cases = [
+            (
+                "message above anchor",
+                "────\n\
+                 ✘ 401 Incorrect API key provided: sk-dummy.\n\
+                 Dismissed when you send your next message.\n\
+                 ────\n\
+                 ╭── π  > GPT-5.6 Sol ─╮\n\
+                 ╰─                   ─╯",
+                "401 Incorrect API key provided: sk-dummy.",
+            ),
+            (
+                "multiline message",
+                "────\n\
+                 ✖ 429 Too Many Requests (rate limited). Retry after 30s.\n\
+                    This is a continuation with more detail.\n\
+                    And a third line.\n\
+                 Dismissed when you send your next message.\n\
+                 ────\n\
+                 ╭── π  > GPT-5.6 Sol ─╮\n\
+                 ╰─                   ─╯",
+                "429 Too Many Requests (rate limited). Retry after 30s. This is a continuation with more detail. And a third line.",
+            ),
+            (
+                "terminal lines below stale banner",
+                "────\n\
+                 ✖ 429 Too Many Requests (rate limited). Retry after 30s.\n\
+                 Dismissed when you send your next message.\n\
+                 ────\n\
+                 Error: Retry budget exhausted after 10 retries: Unable to connect. Is the computer able to access the url?\n\
+                 Error: Retry failed after 10 attempts: Unable to connect. Is the computer able to access the url?\n\
+                 ╭── π  > GPT-5.6 Sol ─╮\n\
+                 ╰─                   ─╯",
+                "Error: Retry failed after 10 attempts: Unable to connect. Is the computer able to access the url?",
+            ),
+            (
+                "no banner",
+                "building failed: no such file\n╭── π  > GPT-5.6 Sol ─╮\n╰─   ─╯",
+                "building failed: no such file",
+            ),
+            (
+                "anchor without message",
+                "────\n\
+                 Dismissed when you send your next message.\n\
+                 ────\n\
+                 building failed: no such file\n\
+                 ╭── π  > GPT-5.6 Sol ─╮\n\
+                 ╰─                   ─╯",
+                "building failed: no such file",
+            ),
+        ];
+
+        for (name, pane, expected) in cases {
+            assert_eq!(summarize_error_from_pane(pane), expected, "{name}");
+        }
     }
 
     #[test]
-    fn summarize_omp_banner_joins_multiline_message() {
-        // A wrapped banner message (continuation lines indented) is joined
-        // with single spaces, borders and the anchor excluded.
-        let pane = "────\n\
-                     ✖ 429 Too Many Requests (rate limited). Retry after 30s.\n\
-                        This is a continuation with more detail.\n\
-                        And a third line.\n\
-                     Dismissed when you send your next message.\n\
-                     ────\n\
-                     ╭── π  > GPT-5.6 Sol ─╮\n\
-                     ╰─                   ─╯";
-        assert_eq!(
-            summarize_error_from_pane(pane),
-            "429 Too Many Requests (rate limited). Retry after 30s. This is a continuation with more detail. And a third line."
-        );
-    }
+    fn duplicate_session_normalizes_path_and_excludes_self() {
+        let first = Instance::new("main", "/tmp/repo/");
+        let second = Instance::new("other", "/tmp/repo");
+        let instances = vec![first.clone(), second.clone()];
 
-    #[test]
-    fn summarize_prefers_terminal_lines_below_a_stale_banner() {
-        // When the terminal retry lines sit below the anchor, the word list
-        // picks them instead of the stale banner (lowest signal wins).
-        let pane = "────\n\
-                     ✖ 429 Too Many Requests (rate limited). Retry after 30s.\n\
-                     Dismissed when you send your next message.\n\
-                     ────\n\
-                     Error: Retry budget exhausted after 10 retries: Unable to connect. Is the computer able to access the url?\n\
-                     Error: Retry failed after 10 attempts: Unable to connect. Is the computer able to access the url?\n\
-                     ╭── π  > GPT-5.6 Sol ─╮\n\
-                     ╰─                   ─╯";
-        assert_eq!(
-            summarize_error_from_pane(pane),
-            "Error: Retry failed after 10 attempts: Unable to connect. Is the computer able to access the url?"
-        );
-    }
-
-    #[test]
-    fn summarize_without_banner_keeps_word_list_behavior() {
-        let pane = "building failed: no such file\n╭── π  > GPT-5.6 Sol ─╮\n╰─   ─╯";
-        assert_eq!(
-            summarize_error_from_pane(pane),
-            "building failed: no such file"
-        );
-    }
-
-    #[test]
-    fn summarize_falls_back_when_anchor_has_no_message_lines() {
-        // A banner whose dismissal footer is immediately under the top border
-        // has no collectable message lines: fall through to the word list.
-        let pane = "────\n\
-                     Dismissed when you send your next message.\n\
-                     ────\n\
-                     building failed: no such file\n\
-                     ╭── π  > GPT-5.6 Sol ─╮\n\
-                     ╰─                   ─╯";
-        assert_eq!(
-            summarize_error_from_pane(pane),
-            "building failed: no such file"
-        );
+        assert!(is_duplicate_session(&instances, "main", "/tmp/repo", None));
+        assert!(!is_duplicate_session(
+            &instances,
+            "main",
+            "/tmp/repo/",
+            Some(&first.id)
+        ));
+        assert!(!is_duplicate_session(
+            &instances,
+            "other",
+            "/tmp/elsewhere",
+            None
+        ));
     }
 
     #[test]
@@ -7937,18 +8023,22 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_codex_hook_installer_uses_profile_codex_home() {
+    fn test_codex_hook_installer_uses_resolved_codex_home() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
         std::env::set_var("HOME", tmp.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
 
-        let codex_home = tmp.path().join("profile-codex-home");
+        let profile_codex_home = tmp.path().join("profile-codex-home");
+        let resolved_codex_home = tmp.path().join("before-session-codex-home");
         let profile_dir = crate::session::get_profile_dir("codex-profile").unwrap();
         std::fs::write(
             profile_dir.join("config.toml"),
-            format!("environment = [\"CODEX_HOME={}\"]\n", codex_home.display()),
+            format!(
+                "environment = [\"CODEX_HOME={}\"]\n",
+                profile_codex_home.display()
+            ),
         )
         .unwrap();
 
@@ -7956,13 +8046,18 @@ mod tests {
         inst.tool = "codex".to_string();
         inst.detect_as = "codex".to_string();
         inst.source_profile = "codex-profile".to_string();
+        inst.pending_host_env = vec![(
+            "CODEX_HOME".to_string(),
+            resolved_codex_home.to_string_lossy().into_owned(),
+        )];
         inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
 
-        let hooks_path = codex_home.join("hooks.json");
+        let hooks_path = resolved_codex_home.join("hooks.json");
         let hooks = std::fs::read_to_string(hooks_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&hooks).unwrap();
         assert!(parsed["hooks"]["PreToolUse"].is_array());
         assert!(hooks.contains("aoe-hooks"));
+        assert!(!profile_codex_home.join("hooks.json").exists());
         assert!(!tmp.path().join(".codex").join("hooks.json").exists());
     }
 
@@ -8575,7 +8670,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn launch_hooks_run_without_the_instance_lifecycle_flock() {
+    fn launch_hooks_run_without_title_or_lifecycle_flocks() {
         if !crate::tmux::tmux_command()
             .arg("-V")
             .output()
@@ -8638,17 +8733,25 @@ mod tests {
             let lock_storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
             let id = storage.load().unwrap()[0].id.clone();
             let release_for_lock = release.clone();
+            let (title_tx, title_rx) = std::sync::mpsc::channel();
             let (lock_tx, lock_rx) = std::sync::mpsc::channel();
             let lock = std::thread::spawn(move || {
-                let guard = lock_storage.acquire_instance_lifecycle_lock(&id).unwrap();
-                drop(guard);
+                let title_guard = crate::session::storage::acquire_session_title_lock(&id).unwrap();
+                title_tx.send(()).unwrap();
+                let lifecycle_guard = lock_storage.acquire_instance_lifecycle_lock(&id).unwrap();
+                drop(lifecycle_guard);
+                drop(title_guard);
                 std::fs::write(release_for_lock, b"release").unwrap();
                 lock_tx.send(()).unwrap();
             });
-            let acquired = lock_rx
+            let title_acquired = title_rx
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .is_ok();
-            if !acquired {
+            let both_acquired = title_acquired
+                && lock_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .is_ok();
+            if !both_acquired {
                 std::fs::write(&release, b"release").unwrap();
             }
 
@@ -8659,7 +8762,11 @@ mod tests {
             lock.join().unwrap();
             let _ = instance.tmux_session().unwrap().kill();
             assert!(
-                acquired,
+                title_acquired,
+                "{label} hook ran while the title mutation flock was held"
+            );
+            assert!(
+                both_acquired,
                 "{label} hook ran while the lifecycle flock was held"
             );
             result.unwrap();
@@ -9000,6 +9107,22 @@ mod tests {
         // last_error is runtime-only: the in-memory poller value survives even a
         // newer generation, since no lifecycle writer persists last_error.
         assert_eq!(reloaded.last_error.as_deref(), Some("old observation"));
+    }
+
+    #[test]
+    fn runtime_reload_preserves_reachability_sentinels_across_generation_bump() {
+        let mut previous = Instance::new("session", "/tmp/test");
+        previous.lifecycle_generation = 3;
+        previous.ever_confirmed_present = true;
+        let unknown_since = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        previous.unknown_since = Some(unknown_since);
+
+        let mut reloaded = Instance::new("session", "/tmp/test");
+        reloaded.lifecycle_generation = 4;
+        reloaded.merge_runtime_from_reload(&previous);
+
+        assert!(reloaded.ever_confirmed_present);
+        assert_eq!(reloaded.unknown_since, Some(unknown_since));
     }
 
     #[test]
@@ -10657,9 +10780,8 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_wrap_command_uses_stdin_script() {
-        let original = std::env::var("SHELL").ok();
         for shell in &["/bin/bash", "/bin/zsh", "/usr/bin/fish", "/usr/bin/nu"] {
-            std::env::set_var("SHELL", shell);
+            let _shell = EnvGuard::set(&[("SHELL", shell)]);
             let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
             assert!(
                 wrapped.contains("/dev/fd/3 3<<'AOE_LAUNCH_BODY'"),
@@ -10668,33 +10790,23 @@ mod tests {
             assert!(wrapped.contains("\nstty susp undef\nexec env claude\n"));
             assert!(!wrapped.contains(" -c "));
         }
-        match original {
-            Some(v) => std::env::set_var("SHELL", v),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_wrap_command_posix_shell_uses_login() {
-        let original = std::env::var("SHELL").ok();
-        std::env::set_var("SHELL", "/bin/zsh");
+        let _shell = EnvGuard::set(&[("SHELL", "/bin/zsh")]);
         let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
         assert!(
             wrapped.starts_with("'/bin/zsh' -l /dev/fd/3 "),
             "POSIX shell should use a login descriptor script: {wrapped}",
         );
-        match original {
-            Some(v) => std::env::set_var("SHELL", v),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_wrap_command_fish_skips_login() {
-        let original = std::env::var("SHELL").ok();
-        std::env::set_var("SHELL", "/usr/bin/fish");
+        let _shell = EnvGuard::set(&[("SHELL", "/usr/bin/fish")]);
         let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
         // The bash fallback must not load bash login files because the user's
         // PATH setup belongs to fish.
@@ -10702,26 +10814,17 @@ mod tests {
             wrapped.starts_with("'bash' /dev/fd/3 "),
             "fish should use a non-login bash descriptor script: {wrapped}",
         );
-        match original {
-            Some(v) => std::env::set_var("SHELL", v),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_wrap_command_nu_skips_login() {
-        let original = std::env::var("SHELL").ok();
-        std::env::set_var("SHELL", "/usr/bin/nu");
+        let _shell = EnvGuard::set(&[("SHELL", "/usr/bin/nu")]);
         let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
         assert!(
             wrapped.starts_with("'bash' /dev/fd/3 "),
             "nu should use a non-login bash descriptor script: {wrapped}",
         );
-        match original {
-            Some(v) => std::env::set_var("SHELL", v),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     /// #3265: a login shell's own profile/rc files can `cd` elsewhere
@@ -10730,11 +10833,28 @@ mod tests {
     /// the agent in the wrong directory. The wrapper must re-assert
     /// `working_dir` inside the login shell's own script, after profile
     /// sourcing, so it wins regardless of what those files did.
+    ///
+    /// `#[serial]` on the default key, not `shell_env`: this resolves `bash`
+    /// through the inherited `PATH`, and every test that mutates `PATH`
+    /// process-globally (`update::install`, `acp::node`, `acp::acp_client`)
+    /// carries the default key, so `shell_env` bought no exclusion against
+    /// them. Since #3421 a scrub racing the `which` is a silent skip rather
+    /// than a failure. The `shell_env` holder this stops excluding touches
+    /// only `TERM`/`COLORTERM`/`FORCE_COLOR`/`NO_COLOR`, and `Command`
+    /// snapshots the environment at spawn, so the exposure is that instant.
     #[test]
-    #[serial_test::serial(shell_env)]
+    #[serial_test::serial]
     fn test_wrap_command_reasserts_working_dir_after_login_shell() {
-        let original = std::env::var("SHELL").ok();
-        std::env::set_var("SHELL", "/bin/bash");
+        // The wrapper execs `$SHELL`, so it has to be a shell that exists here.
+        let Ok(bash) = which::which("bash") else {
+            eprintln!("skipping: bash not found on PATH");
+            return;
+        };
+        // The guard restores on unwind; the resolved path matters separately,
+        // because `wrap_command_ignore_suspend` execs `$SHELL` below. The
+        // `repo_config` hook tests used to read this override too and now pin
+        // their own (#3449).
+        let _shell = EnvGuard::set(&[("SHELL", &bash)]);
         let temp = tempfile::tempdir().unwrap();
         let working_dir = temp.path().join("some project's dir");
         std::fs::create_dir(&working_dir).unwrap();
@@ -10749,7 +10869,7 @@ mod tests {
             wrapped.contains("|| exit 1\nstty susp undef"),
             "the cd must exit-on-failure before disabling suspend: {wrapped}",
         );
-        let output = std::process::Command::new("bash")
+        let output = std::process::Command::new(&bash)
             .args(["-c", &wrapped])
             .output()
             .unwrap();
@@ -10762,10 +10882,6 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).trim(),
             working_dir.to_string_lossy(),
         );
-        match original {
-            Some(v) => std::env::set_var("SHELL", v),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     // Additional tests for is_sandboxed
@@ -11803,7 +11919,11 @@ mod tests {
             command
                 .args(["-c", &script])
                 .env_clear()
-                .env("PATH", "/usr/bin:/bin");
+                // `env_clear` is here to control which OMP_STORE_ENV_KEYS the
+                // fingerprint folds in, not to pin a filesystem layout. The
+                // child still needs a PATH that resolves `sha256sum` / `tr`,
+                // so it inherits the caller's.
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default());
             // Pin the exact routing environment a host launch installs into the
             // pane for this HOME, so the check reproduces the fingerprint's env
             // instead of assuming the ambient OMP_STORE_ENV_KEYS are empty. They
@@ -11861,8 +11981,35 @@ mod tests {
         assert!(!command.contains("/dev/pts/*"));
         assert!(command.find("printf").unwrap() < command.rfind("exec sh -c").unwrap());
     }
+    /// The shim dir, then the caller's `PATH`. Shim first, so the fake `tmux`
+    /// wins over any real one; inherited, so a host whose coreutils sit
+    /// outside the FHS layout still resolves them. `OsString` throughout: a
+    /// `PATH` entry need not be UTF-8.
+    #[cfg(unix)]
+    fn test_path_with_shim(bin: &std::path::Path) -> std::ffi::OsString {
+        // An unset or empty PATH is handled separately: `split_paths("")`
+        // yields one EMPTY entry, and an empty PATH element means the current
+        // directory, so joining it would hand the child `<shim>:` and put cwd
+        // on its PATH.
+        let Some(inherited) = std::env::var_os("PATH").filter(|p| !p.is_empty()) else {
+            return bin.as_os_str().to_os_string();
+        };
+        let entries = std::iter::once(bin.to_path_buf())
+            .chain(std::env::split_paths(&inherited))
+            .collect::<Vec<_>>();
+        std::env::join_paths(entries).expect("PATH entries contain no separator")
+    }
+
+    /// `#[serial]` because this reads the inherited PATH, and every test that
+    /// scrubs PATH process-globally carries that same default-key annotation:
+    /// `crate::acp::node`, `crate::acp::acp_client`, and
+    /// `crate::update::install`.
+    /// Not an `EnvGuard` lock: none of them takes `test_support::ENV_LOCK`, so
+    /// a guard would exclude unrelated guard users and leave this window open.
+    /// A future PATH mutator outside the default serial group would reopen it.
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
     fn omp_capture_gate_executes_nested_stdin_scripts() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -11889,7 +12036,7 @@ mod tests {
         std::fs::write(&script, outer).unwrap();
         let status = std::process::Command::new("sh")
             .arg(&script)
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("PATH", test_path_with_shim(&bin))
             .env("TMUX_PANE", "%1")
             .status()
             .unwrap();
@@ -11911,7 +12058,7 @@ mod tests {
         std::fs::write(&script, large_outer).unwrap();
         let status = std::process::Command::new("sh")
             .arg(&script)
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("PATH", test_path_with_shim(&bin))
             .env("TMUX_PANE", "%1")
             .status()
             .unwrap();

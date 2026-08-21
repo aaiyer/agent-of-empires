@@ -56,6 +56,120 @@ fn classify_worktree_add_failure(combined: &str, branch: &str) -> GitError {
 /// yet" path.
 const FETCH_REMOTE: &str = "origin";
 
+/// Upper bound for local git metadata mutations that normally complete in
+/// milliseconds but could otherwise hang indefinitely on a stalled filesystem.
+const WORKTREE_MUTATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MUTATION_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Debug, PartialEq, Eq)]
+enum TimedMutationOutcome {
+    Applied,
+    Unchanged,
+    Indeterminate,
+}
+
+fn classify_timed_mutation(old_exists: bool, new_exists: bool) -> TimedMutationOutcome {
+    match (old_exists, new_exists) {
+        (false, true) => TimedMutationOutcome::Applied,
+        (true, false) => TimedMutationOutcome::Unchanged,
+        _ => TimedMutationOutcome::Indeterminate,
+    }
+}
+
+fn classify_ref_observations(
+    old_exists: Option<bool>,
+    new_exists: Option<bool>,
+) -> TimedMutationOutcome {
+    match (old_exists, new_exists) {
+        (Some(old_exists), Some(new_exists)) => classify_timed_mutation(old_exists, new_exists),
+        _ => TimedMutationOutcome::Indeterminate,
+    }
+}
+
+/// Parse `git worktree list --porcelain -z` and classify a timed-out move.
+///
+/// Porcelain records begin with `worktree <absolute-path>` and are separated
+/// by an empty NUL-delimited field. Paths are compared byte-for-byte: any
+/// relative path, alternate spelling, or malformed listing fails closed to an
+/// indeterminate result rather than guessing from the filesystem.
+fn classify_worktree_move_listing(
+    output: &[u8],
+    from: &Path,
+    to: &Path,
+) -> Option<TimedMutationOutcome> {
+    let from = from.as_os_str().as_encoded_bytes();
+    let to = to.as_os_str().as_encoded_bytes();
+    let mut from_registered = false;
+    let mut to_registered = false;
+    let mut at_record_start = true;
+    let mut fields = output.split(|byte| *byte == 0);
+
+    while let Some(field) = fields.next() {
+        if field.is_empty() {
+            if at_record_start {
+                return fields
+                    .all(|remaining| remaining.is_empty())
+                    .then(|| classify_timed_mutation(from_registered, to_registered));
+            }
+            at_record_start = true;
+            continue;
+        }
+
+        if at_record_start {
+            let path = field.strip_prefix(b"worktree ")?;
+            if path.is_empty() {
+                return None;
+            }
+            from_registered |= path == from;
+            to_registered |= path == to;
+            at_record_start = false;
+        }
+    }
+
+    None
+}
+
+fn canonicalize_move_endpoint(path: &Path) -> PathBuf {
+    path.canonicalize()
+        .or_else(|_| {
+            let parent = path.parent().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+            })?;
+            let file_name = path.file_name().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
+            })?;
+            parent.canonicalize().map(|parent| parent.join(file_name))
+        })
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn observe_worktree_move(repo_path: &Path, from: &Path, to: &Path) -> TimedMutationOutcome {
+    match super::command::run_git_with_timeout(
+        repo_path,
+        ["worktree", "list", "--porcelain", "-z"],
+        MUTATION_OBSERVATION_TIMEOUT,
+    ) {
+        Ok(Some(output)) if output.status.success() => {
+            classify_worktree_move_listing(&output.stdout, from, to)
+                .unwrap_or(TimedMutationOutcome::Indeterminate)
+        }
+        _ => TimedMutationOutcome::Indeterminate,
+    }
+}
+
+fn observe_local_branch_ref(repo_path: &Path, branch: &str) -> Option<bool> {
+    let refname = format!("refs/heads/{branch}");
+    match super::command::run_git_with_timeout(
+        repo_path,
+        ["show-ref", "--verify", "--quiet", &refname],
+        MUTATION_OBSERVATION_TIMEOUT,
+    ) {
+        Ok(Some(output)) if output.status.success() => Some(true),
+        Ok(Some(output)) if output.status.code() == Some(1) => Some(false),
+        _ => None,
+    }
+}
+
 /// Reason recorded on every aoe-created worktree's `git worktree lock`. The
 /// lock makes `git worktree prune` skip the admin entry, so a prune run from a
 /// context that cannot see this checkout (a sibling sandbox, or the host when
@@ -275,8 +389,8 @@ impl GitWorktree {
         let timeout = std::time::Duration::from_secs(10);
         let start = std::time::Instant::now();
 
-        // run_with_timeout drains stderr with a deadline-bounded read, so a
-        // grandchild holding the pipe (credential helper) cannot block this
+        // run_with_timeout captures stderr in a temporary regular file, so a
+        // grandchild that inherits the handle cannot block this
         // past the timeout.
         match crate::process::run_with_timeout(&mut cmd, timeout) {
             Ok(Some(output)) => {
@@ -859,7 +973,7 @@ impl GitWorktree {
         let path_str = path
             .to_str()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid path"))?;
-        let output = super::command::run_git(
+        let Some(output) = super::command::run_git_with_timeout(
             &self.repo_path,
             [
                 "worktree",
@@ -868,7 +982,14 @@ impl GitWorktree {
                 WORKTREE_LOCK_REASON,
                 path_str,
             ],
-        )?;
+            WORKTREE_MUTATION_TIMEOUT,
+        )?
+        else {
+            return Err(GitError::WorktreeCommandFailed(format!(
+                "`git worktree lock` timed out after {}s",
+                WORKTREE_MUTATION_TIMEOUT.as_secs()
+            )));
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(GitError::WorktreeCommandFailed(stderr));
@@ -884,13 +1005,23 @@ impl GitWorktree {
     /// still clears the lock when the checkout directory is already gone, and a
     /// non-zero exit (already unlocked, or no such worktree) is a harmless
     /// no-op rather than an error. That classification is why the call goes
-    /// through `run_git_quiet`: the routine non-zero exit belongs at DEBUG,
+    /// through the quiet helper: the routine non-zero exit belongs at DEBUG,
     /// not in the WARN stream.
+    ///
+    /// Bounded like the mutations it precedes. `move_worktree` calls this
+    /// immediately before its own bounded `git worktree move`, and both touch
+    /// the same `.git/worktrees/<name>/` metadata, so leaving this one
+    /// unbounded would let a stalled filesystem pin every caller's locks
+    /// through the call that runs first.
     pub fn unlock_worktree(&self, path: &Path) {
         let Some(path_str) = path.to_str() else {
             return;
         };
-        let _ = super::command::run_git_quiet(&self.repo_path, ["worktree", "unlock", path_str]);
+        let _ = super::command::run_git_quiet_with_timeout(
+            &self.repo_path,
+            ["worktree", "unlock", path_str],
+            WORKTREE_MUTATION_TIMEOUT,
+        );
     }
 
     /// Convert a worktree's .git file from absolute to relative path.
@@ -1275,12 +1406,22 @@ impl GitWorktree {
         // all subprocess-driven for consistent stderr / exit-code
         // semantics. The subprocess is why `Err(_)` is a real possibility
         // here even though the repo is already open.
-        let output = super::command::run_git(
+        let output = super::command::run_git_with_timeout(
             &self.repo_path,
             ["show-ref", "--verify", "--quiet", &refname],
+            MUTATION_OBSERVATION_TIMEOUT,
         )
         .map_err(|e| {
             GitError::WorktreeCommandFailed(format!("git show-ref --verify {refname}: {e}"))
+        })?
+        .ok_or_else(|| {
+            // Tri-state contract: a timeout is "could not determine", which
+            // must surface as Err so the caller fails closed rather than
+            // treating an unknown ref as absent.
+            GitError::WorktreeCommandFailed(format!(
+                "git show-ref --verify {refname} timed out after {}s",
+                MUTATION_OBSERVATION_TIMEOUT.as_secs()
+            ))
         })?;
         match output.status.code() {
             Some(0) => Ok(true),
@@ -1327,6 +1468,11 @@ impl GitWorktree {
         if to.exists() {
             return Err(GitError::WorktreeAlreadyExists(to.to_path_buf()));
         }
+        // Git reports canonical worktree paths. Resolve both spellings while
+        // the source and destination parent still exist, so a symlinked parent
+        // cannot make a completed timed-out move look indeterminate.
+        let observation_from = canonicalize_move_endpoint(from);
+        let observation_to = canonicalize_move_endpoint(to);
         let from_str = from
             .to_str()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid path"))?;
@@ -1343,8 +1489,44 @@ impl GitWorktree {
         // re-lock at the destination so the relocated checkout keeps its prune
         // protection.
         self.unlock_worktree(from);
-        let output =
-            super::command::run_git(&self.repo_path, ["worktree", "move", from_str, to_str])?;
+        let Some(output) = super::command::run_git_with_timeout(
+            &self.repo_path,
+            ["worktree", "move", from_str, to_str],
+            WORKTREE_MUTATION_TIMEOUT,
+        )?
+        else {
+            match observe_worktree_move(&self.repo_path, &observation_from, &observation_to) {
+                TimedMutationOutcome::Applied => {
+                    if let Err(e) = self.lock_worktree(to) {
+                        tracing::warn!(target: "git.worktree",
+                            to = %to.display(),
+                            error = %e,
+                            "move_worktree: could not re-lock worktree at new path"
+                        );
+                    }
+                    tracing::warn!(target: "git.worktree", to = %to.display(), "timed-out worktree move completed before termination");
+                    return Ok(());
+                }
+                TimedMutationOutcome::Unchanged
+                    if matches!(from.try_exists(), Ok(true))
+                        && matches!(to.try_exists(), Ok(false)) =>
+                {
+                    let _ = self.lock_worktree(from);
+                }
+                TimedMutationOutcome::Unchanged | TimedMutationOutcome::Indeterminate => {
+                    let _ = self.lock_worktree(from);
+                    let _ = self.lock_worktree(to);
+                    return Err(GitError::WorktreeCommandFailed(format!(
+                        "`git worktree move` timed out after {}s and its final location is indeterminate",
+                        WORKTREE_MUTATION_TIMEOUT.as_secs()
+                    )));
+                }
+            }
+            return Err(GitError::WorktreeCommandFailed(format!(
+                "`git worktree move` timed out after {}s without moving",
+                WORKTREE_MUTATION_TIMEOUT.as_secs()
+            )));
+        };
         if !output.status.success() {
             // Restore the lock on the unmoved source so a failed move does not
             // silently leave it unprotected.
@@ -1371,7 +1553,33 @@ impl GitWorktree {
             repo = %self.repo_path.display(),
             "rename_branch: invoking `git branch -m`"
         );
-        let output = super::command::run_git(&self.repo_path, ["branch", "-m", old, new])?;
+        let Some(output) = super::command::run_git_with_timeout(
+            &self.repo_path,
+            ["branch", "-m", old, new],
+            WORKTREE_MUTATION_TIMEOUT,
+        )?
+        else {
+            let old_exists = observe_local_branch_ref(&self.repo_path, old);
+            let new_exists = observe_local_branch_ref(&self.repo_path, new);
+            match classify_ref_observations(old_exists, new_exists) {
+                TimedMutationOutcome::Applied => {
+                    tracing::warn!(target: "git.worktree", old, new, "timed-out branch rename completed before termination");
+                    return Ok(());
+                }
+                TimedMutationOutcome::Unchanged => {
+                    return Err(GitError::WorktreeCommandFailed(format!(
+                        "`git branch -m` timed out after {}s without renaming",
+                        WORKTREE_MUTATION_TIMEOUT.as_secs()
+                    )));
+                }
+                TimedMutationOutcome::Indeterminate => {
+                    return Err(GitError::WorktreeCommandFailed(format!(
+                        "`git branch -m` timed out after {}s and ref state is indeterminate",
+                        WORKTREE_MUTATION_TIMEOUT.as_secs()
+                    )));
+                }
+            }
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(GitError::WorktreeCommandFailed(stderr));
@@ -1581,6 +1789,155 @@ fn walk_worktree_stats(root: &Path) -> WorktreeWalkStats {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn timed_mutation_outcome_requires_exactly_one_observed_side() {
+        let cases = [
+            (false, true, TimedMutationOutcome::Applied),
+            (true, false, TimedMutationOutcome::Unchanged),
+            (false, false, TimedMutationOutcome::Indeterminate),
+            (true, true, TimedMutationOutcome::Indeterminate),
+        ];
+        for (old_exists, new_exists, expected) in cases {
+            assert_eq!(classify_timed_mutation(old_exists, new_exists), expected);
+        }
+    }
+
+    #[test]
+    fn ref_observations_fail_closed_when_either_probe_is_indeterminate() {
+        let cases = [
+            (Some(false), Some(true), TimedMutationOutcome::Applied),
+            (Some(true), Some(false), TimedMutationOutcome::Unchanged),
+            (
+                Some(false),
+                Some(false),
+                TimedMutationOutcome::Indeterminate,
+            ),
+            (Some(true), Some(true), TimedMutationOutcome::Indeterminate),
+            (None, Some(true), TimedMutationOutcome::Indeterminate),
+            (Some(false), None, TimedMutationOutcome::Indeterminate),
+            (None, None, TimedMutationOutcome::Indeterminate),
+        ];
+        for (old_exists, new_exists, expected) in cases {
+            assert_eq!(classify_ref_observations(old_exists, new_exists), expected);
+        }
+    }
+
+    #[test]
+    fn worktree_porcelain_classification_is_exact_and_conservative() {
+        let from = Path::new("/repo/old");
+        let to = Path::new("/repo/new");
+        let cases: &[(&[u8], Option<TimedMutationOutcome>)] = &[
+            (
+                b"worktree /repo/old\0HEAD abc\0branch refs/heads/topic\0\0",
+                Some(TimedMutationOutcome::Unchanged),
+            ),
+            (
+                b"worktree /repo/new\0HEAD abc\0branch refs/heads/topic\0\0",
+                Some(TimedMutationOutcome::Applied),
+            ),
+            (
+                b"worktree /repo/old\0HEAD abc\0\0worktree /repo/new\0HEAD abc\0\0",
+                Some(TimedMutationOutcome::Indeterminate),
+            ),
+            (
+                b"worktree /repo/other\0HEAD abc\0\0",
+                Some(TimedMutationOutcome::Indeterminate),
+            ),
+            (
+                b"worktree /repo/old-suffix\0HEAD abc\0\0",
+                Some(TimedMutationOutcome::Indeterminate),
+            ),
+            (b"HEAD abc\0worktree /repo/new\0\0", None),
+            (b"worktree /repo/new\0HEAD abc\0", None),
+        ];
+
+        for (listing, expected) in cases {
+            let actual = classify_worktree_move_listing(listing, from, to);
+            assert_eq!(
+                actual.as_ref(),
+                expected.as_ref(),
+                "listing: {:?}",
+                String::from_utf8_lossy(listing)
+            );
+        }
+    }
+
+    /// Every git subprocess reachable from `move_worktree` /
+    /// `edit_worktree_workdir` is bounded. The profile-move transaction runs
+    /// them while holding the app-global identity flock, both per-session
+    /// locks, and both profile storage flocks, so one unbounded call pins every
+    /// peer `aoe` process. Pins the whole set rather than one call: the gap
+    /// this closes was `unlock_worktree` sitting one line above an already
+    /// bounded `git worktree move`.
+    ///
+    /// Source-level rather than behavioural because making git itself block on
+    /// `.git` metadata is not reproducible in a unit test; the failure mode is
+    /// a future caller reaching for the unbounded helper, which this catches.
+    #[test]
+    fn every_worktree_mutation_subprocess_is_bounded() {
+        // Whitespace-normalised so rustfmt's line wrapping cannot change the
+        // result: the point is which helper is called, not how it is laid out.
+        let source = include_str!("worktree.rs");
+        let region = source
+            .split_once("impl GitWorktree {")
+            .expect("GitWorktree impl block")
+            .1
+            .split_once("\n#[cfg(test)]")
+            .expect("test module terminates the scanned region")
+            .0;
+        let flat = region.split_whitespace().collect::<Vec<_>>().join(" ");
+        let cases = [
+            ("\"worktree\", \"lock\"", "git worktree lock"),
+            ("\"worktree\", \"unlock\"", "git worktree unlock"),
+            ("\"show-ref\", \"--verify\"", "git show-ref --verify"),
+            ("\"worktree\", \"move\"", "git worktree move"),
+            ("\"branch\", \"-m\"", "git branch -m"),
+        ];
+        for (needle, label) in cases {
+            let at = flat
+                .find(needle)
+                .unwrap_or_else(|| panic!("{label} should still be issued from this module"));
+            // The helper name precedes its argument list, so scan back to the
+            // nearest `run_git*` and require one of the timed variants.
+            let call = flat[..at]
+                .rfind("run_git")
+                .map(|i| &flat[i..])
+                .unwrap_or_default();
+            assert!(
+                call.starts_with("run_git_with_timeout")
+                    || call.starts_with("run_git_quiet_with_timeout"),
+                "{label} must go through a bounded helper, found `{}`",
+                call.split('(').next().unwrap_or(call)
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn worktree_move_observation_canonicalizes_symlinked_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real");
+        std::fs::create_dir(&real_parent).unwrap();
+        let linked_parent = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+        let from = linked_parent.join("old");
+        std::fs::create_dir(&from).unwrap();
+        let to = linked_parent.join("new");
+
+        let observed_from = canonicalize_move_endpoint(&from);
+        let observed_to = canonicalize_move_endpoint(&to);
+        assert_eq!(observed_from, real_parent.join("old"));
+        assert_eq!(observed_to, real_parent.join("new"));
+
+        let mut completed_listing = b"worktree ".to_vec();
+        completed_listing.extend_from_slice(observed_to.as_os_str().as_encoded_bytes());
+        completed_listing.extend_from_slice(b"\0HEAD abc\0branch refs/heads/topic\0\0");
+        assert_eq!(
+            classify_worktree_move_listing(&completed_listing, &observed_from, &observed_to),
+            Some(TimedMutationOutcome::Applied),
+        );
+    }
 
     fn run_git(path: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")
