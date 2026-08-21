@@ -86,6 +86,7 @@ import {
   setSessionSnooze,
   trashSession,
   restoreSession,
+  purgeSession,
   fetchPlugins,
 } from "./lib/api";
 import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
@@ -158,7 +159,6 @@ import { DisconnectBanner } from "./components/DisconnectBanner";
 import { ElevationPrompt } from "./components/ElevationPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { DashboardUpdateBanner } from "./components/DashboardUpdateBanner";
-import { MayaRestrictedApp } from "./components/MayaRestrictedApp";
 
 // Pre-#1832 per-browser tour-seen flag. Read once on load to migrate users who
 // already dismissed the tour to the backend; no longer written.
@@ -275,10 +275,6 @@ export default function App() {
     );
   }
 
-  if (deploymentAbout.maya_restricted) {
-    return <MayaRestrictedApp about={deploymentAbout} loginRequired={loginRequired} onLogout={handleLogout} />;
-  }
-
   return (
     <IdleDecayWindowContext.Provider value={idleDecayWindowMs}>
       <UnreadIndicatorContext.Provider value={unreadIndicatorEnabled}>
@@ -287,8 +283,9 @@ export default function App() {
             {/* PluginUiProvider must sit above AppContent: AppContent itself reads
                 the plugin UI snapshot (usePluginPanes), so the provider can't live
                 inside its own return. */}
-            <PluginUiProvider>
+            <PluginUiProvider enabled={!deploymentAbout.maya_restricted}>
               <AppContent
+                initialAbout={deploymentAbout}
                 loginRequired={loginRequired}
                 onLogout={handleLogout}
                 onSettingsRefresh={refreshAppSettings}
@@ -319,18 +316,20 @@ function isInsideEditable(target: EventTarget | null): boolean {
 }
 
 function AppContent({
+  initialAbout,
   loginRequired,
   onLogout,
   onSettingsRefresh,
 }: {
+  initialAbout: ServerAbout;
   loginRequired: boolean;
   onLogout: () => void;
   onSettingsRefresh: () => Promise<void> | void;
 }) {
-  useDashboardPresence();
-  // Ordinary upstream mode retains the configurable theme surface. The Maya
-  // restricted shell never mounts this hook or its settings/theme requests.
-  useResolvedTheme();
+  const [serverAbout, setServerAbout] = useState<ServerAbout | null>(initialAbout);
+  const caps = useMemo(() => getClientCapabilities(serverAbout), [serverAbout]);
+  useDashboardPresence(!caps.mayaRestricted);
+  useResolvedTheme(!caps.mayaRestricted);
   // Wire the localStorage write chokepoint and pull the server-side UI-state
   // blob into localStorage. AppContent only mounts past auth, so this runs as
   // the authenticated user. Background (does NOT gate render): blocking first
@@ -339,9 +338,10 @@ function AppContent({
   // for the first session; hydration writes the synced values for the next
   // mount/reload. Same-device loads (populated cache) are unaffected.
   useEffect(() => {
+    if (caps.mayaRestricted) return;
     initWebUiSync();
     void hydrateWebUiStateFromServer();
-  }, []);
+  }, [caps.mayaRestricted]);
 
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -352,7 +352,7 @@ function AppContent({
   const settingsTabMatch = useMatch("/settings/:tab");
   const profilesMatch = useMatch("/profiles");
   const activeSessionId = sessionMatch?.params.sessionId ?? null;
-  const showSettings = settingsRootMatch !== null || settingsTabMatch !== null;
+  const showSettings = caps.canManageDeployment && (settingsRootMatch !== null || settingsTabMatch !== null);
   const settingsTab = settingsTabMatch?.params.tab ?? null;
 
   const {
@@ -442,7 +442,7 @@ function AppContent({
     [setSidebarSortMode],
   );
 
-  const { projects, refresh: refreshProjects } = useProjects();
+  const { projects, refresh: refreshProjects } = useProjects(caps.canManageProjects);
   const {
     groups: repoGroups,
     savedProjects,
@@ -567,6 +567,7 @@ function AppContent({
     Record<string, { icon?: string; iconAssetUrl?: string }>
   >({});
   useEffect(() => {
+    if (!caps.canUseExtensions) return;
     void fetchPlugins().then((res) => {
       if (!res) return;
       setPluginIdentityById(
@@ -575,7 +576,7 @@ function AppContent({
         ),
       );
     });
-  }, []);
+  }, [caps.canUseExtensions]);
 
   const paneDescriptor = useCallback(
     (id: string): PaneDisplay => {
@@ -601,8 +602,13 @@ function AppContent({
   // A persisted tab is visible only if its backing pane currently exists: diff
   // and terminals always do; a plugin tab does only while its plugin is loaded.
   const tabAvailable = useCallback(
-    (id: string) => !id.startsWith("plugin:") || pluginPaneById.has(id),
-    [pluginPaneById],
+    (id: string) => {
+      if (!caps.canUseTerminal && isTerminalTabId(id)) return false;
+      if (!caps.canUseDiff && (id === "diff" || id === "files")) return false;
+      if (!caps.canUseExtensions && (id === "agents" || id.startsWith("plugin:"))) return false;
+      return !id.startsWith("plugin:") || pluginPaneById.has(id);
+    },
+    [caps.canUseDiff, caps.canUseExtensions, caps.canUseTerminal, pluginPaneById],
   );
   // A dock's groups reduced to what's actually shown: each surviving group keeps
   // its persisted index (so a drop addresses the right group) and a valid active
@@ -735,7 +741,7 @@ function AppContent({
   // All tips orchestration (open state, mark-seen, the show toggle, the auto-pop
   // decision) lives in the hook / lib so it stays out of this component and is
   // unit-tested directly.
-  const tips = useTips();
+  const tips = useTips(!caps.mayaRestricted);
   const [showPalette, setShowPalette] = useState(false);
   // Palette content-search query (#2515); declared here so the keyboard
   // handlers below can clear it on close/toggle. Consumed lower down by
@@ -750,7 +756,7 @@ function AppContent({
   // starts false, so before this is true "no consent needed" and "not resolved
   // yet" look the same; the tips auto-pop waits on this so it can't slip in
   // before a pending consent modal.
-  const [telemetryConsentKnown, setTelemetryConsentKnown] = useState(false);
+  const [telemetryConsentKnown, setTelemetryConsentKnown] = useState(caps.mayaRestricted);
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 768);
   const keyboardProxyRef = useRef<HTMLTextAreaElement>(null);
   const [keyboardProxy, setKeyboardProxy] = useState<HTMLTextAreaElement | null>(null);
@@ -758,12 +764,6 @@ function AppContent({
     keyboardProxyRef.current = element;
     setKeyboardProxy(element);
   }, []);
-
-  const [serverAbout, setServerAbout] = useState<ServerAbout | null>(null);
-  // CityHall client mode collapses the dashboard to a locked-down end-user
-  // client; the capability flags gate the terminal/diff panes, project
-  // management, the wizard, and settings from one place. See #7.
-  const caps = useMemo(() => getClientCapabilities(serverAbout), [serverAbout]);
 
   const activeWorkspace = useMemo(() => {
     if (!activeSessionId) return undefined;
@@ -778,13 +778,13 @@ function AppContent({
     ...(caps.canUseTerminal ? ["terminal"] : []),
     // The background-agents panel only applies to structured-view (ACP)
     // sessions; a plain terminal session never launches sub-agents.
-    ...(activeSession?.view === "structured" ? ["agents"] : []),
-    ...(caps.cityhall ? [] : pluginPanes.map((p) => p.id)),
+    ...(caps.canUseExtensions && activeSession?.view === "structured" ? ["agents"] : []),
+    ...(caps.canUseExtensions ? pluginPanes.map((p) => p.id) : []),
   ];
 
   // Fetch the diff when the panel is actually showing: on desktop when the
   // split is expanded, on mobile when the diff view is the active pane.
-  const diffPanelActive = isMdUp ? dockOf(paneLayout, "diff") !== null : rightPanelView === "diff";
+  const diffPanelActive = caps.canUseDiff && (isMdUp ? dockOf(paneLayout, "diff") !== null : rightPanelView === "diff");
   const {
     files: diffFiles,
     perRepoBases,
@@ -1031,7 +1031,7 @@ function AppContent({
   const [switchViewTarget, setSwitchViewTarget] = useState<{ sessionId: string; toStructured: boolean } | null>(null);
   // `serverAbout === null` conflates "not fetched yet" with "fetch failed", so
   // the tour gates auto-launch on an explicit loaded flag instead.
-  const [serverAboutLoaded, setServerAboutLoaded] = useState(false);
+  const [serverAboutLoaded, setServerAboutLoaded] = useState(true);
 
   const refreshServerAbout = useCallback(async () => {
     try {
@@ -1046,6 +1046,9 @@ function AppContent({
   // calls fetchAbout and schedules the telemetry consent check; neither runs
   // setState synchronously, so set-state-in-effect is not triggered.
   useEffect(() => {
+    if (caps.mayaRestricted) {
+      return;
+    }
     let active = true;
     void fetchAbout()
       .then((about) => {
@@ -1073,7 +1076,7 @@ function AppContent({
     return () => {
       active = false;
     };
-  }, []);
+  }, [caps.mayaRestricted]);
 
   // Telemetry: report that the acp web UI was opened, folded into the
   // daemon's next opt-in snapshot under the `usage_seen` map's `acp` key.
@@ -1084,10 +1087,10 @@ function AppContent({
   // (decremented by exactly what each snapshot reported), so re-fires on
   // session switch are harmless. See #1882.
   useEffect(() => {
-    if (!serverAboutLoaded || serverAbout?.read_only) return;
+    if (!serverAboutLoaded || serverAbout?.read_only || caps.mayaRestricted) return;
     if (activeSession?.view !== "structured") return;
     reportTelemetrySeen("structured_view");
-  }, [serverAboutLoaded, serverAbout?.read_only, activeSession?.view]);
+  }, [serverAboutLoaded, serverAbout?.read_only, caps.mayaRestricted, activeSession?.view]);
 
   const handleTelemetryConsent = useCallback((enabled: boolean) => {
     setTelemetryConsentNeeded(false);
@@ -1118,6 +1121,24 @@ function AppContent({
     // Close the dialog immediately; the loop, ordering, and toast logic live
     // in deleteWorkspaceSessions so they are unit-testable without the bundle.
     setDeletingWorkspaceId(null);
+    if (caps.mayaRestricted) {
+      let failed = false;
+      for (const session of sessions) {
+        setSessionStatus(session.id, "Deleting");
+        const result = await purgeSession(session.id);
+        if (!result.ok) {
+          failed = true;
+          setSessionStatus(session.id, "Error");
+          continue;
+        }
+        clearAcpCache(session.id);
+        clearDraft(session.id);
+        clearStoredComments(session.id);
+      }
+      if (activeSessionId && sessions.some((session) => session.id === activeSessionId)) navigate("/");
+      toastBus.handler?.[failed ? "error" : "info"](failed ? "Some sessions could not be deleted" : "Session deleted");
+      return;
+    }
     await deleteWorkspaceSessions(sessions, options, activeSessionId, {
       setStatus: setSessionStatus,
       // Drop a deleted session's local-only state (#1358 acp cache + draft,
@@ -1161,6 +1182,21 @@ function AppContent({
     // one source repo, the same sequential-await idiom trashActions.ts uses.
     try {
       for (const ws of trashedWorkspaces) {
+        if (caps.mayaRestricted) {
+          for (const session of ws.sessions) {
+            setSessionStatus(session.id, "Deleting");
+            const result = await purgeSession(session.id);
+            if (!result.ok) {
+              anyFailed = true;
+              setSessionStatus(session.id, "Error");
+            } else {
+              clearAcpCache(session.id);
+              clearDraft(session.id);
+              clearStoredComments(session.id);
+            }
+          }
+          continue;
+        }
         await deleteWorkspaceSessions(
           ws.sessions,
           {
@@ -1186,7 +1222,7 @@ function AppContent({
     toastBus.handler?.[anyFailed ? "error" : "info"](
       anyFailed ? "Some trashed sessions could not be deleted" : "Emptied trash",
     );
-  }, [trashedWorkspaces, activeSessionId, setSessionStatus, navigate]);
+  }, [caps.mayaRestricted, trashedWorkspaces, activeSessionId, setSessionStatus, navigate]);
 
   // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
   // deliberately KEEPS the per-session acp cache, draft, and stored comments
@@ -1374,17 +1410,19 @@ function AppContent({
   // The right-panel control toggles the desktop split, but on mobile there
   // is no split to collapse: it opens the view picker instead (#1452).
   const toggleDiff = useCallback(() => {
+    if (!caps.canUseDiff) return;
     if (isMdUp) {
       toggleKind("diff", "right");
     } else {
       setPickerOpen((o) => !o);
     }
-  }, [isMdUp, toggleKind]);
+  }, [caps.canUseDiff, isMdUp, toggleKind]);
 
   // Collapse or restore the whole right dock (the "toggle right panel"
   // shortcut). Collapse hides the dock without removing its tabs so expanding
   // restores the active session's previous pane set.
   const toggleRightDock = useCallback(() => {
+    if (!caps.canUseDiff && !caps.canUseTerminal && !caps.canUseExtensions) return;
     if (!isMdUp) {
       setPickerOpen((o) => !o);
       return;
@@ -1398,7 +1436,16 @@ function AppContent({
     } else {
       setDockCollapsed("right", true);
     }
-  }, [isMdUp, rightDockCollapsed, setDockCollapsed, availableRightGroups.length, openTab]);
+  }, [
+    caps.canUseDiff,
+    caps.canUseExtensions,
+    caps.canUseTerminal,
+    isMdUp,
+    rightDockCollapsed,
+    setDockCollapsed,
+    availableRightGroups.length,
+    openTab,
+  ]);
 
   const handlePickView = useCallback((view: RightPanelView) => {
     setRightPanelView(view);
@@ -1457,15 +1504,18 @@ function AppContent({
   }, [navigate]);
 
   const handleOpenSettings = useCallback(() => {
+    if (!caps.canManageDeployment) return;
     navigate("/settings");
     if (window.innerWidth < 768) setSidebarOpen(false);
-  }, [navigate]);
+  }, [caps.canManageDeployment, navigate]);
 
   // Profiles moved into Settings as a tab; redirect the retired standalone
   // route so old bookmarks and links still land somewhere valid.
   useEffect(() => {
-    if (profilesMatch) navigate(`/settings/profiles${window.location.search}`, { replace: true });
-  }, [profilesMatch, navigate]);
+    if (caps.canManageDeployment && profilesMatch) {
+      navigate(`/settings/profiles${window.location.search}`, { replace: true });
+    }
+  }, [caps.canManageDeployment, profilesMatch, navigate]);
 
   const handleCloseSettings = useCallback(() => {
     if (activeSessionId) {
@@ -1489,12 +1539,13 @@ function AppContent({
 
   const openSidebar = useCallback(() => setSidebarOpen(true), []);
   const openDiff = useCallback(() => {
+    if (!caps.canUseDiff) return;
     if (isMdUp) {
       openTab("diff", "right");
     } else {
       setPickerOpen(true);
     }
-  }, [isMdUp, openTab]);
+  }, [caps.canUseDiff, isMdUp, openTab]);
   useEdgeSwipe({
     edge: "left",
     // The swipe-right-to-open gesture only makes sense for a left-anchored
@@ -1509,7 +1560,7 @@ function AppContent({
   });
   useEdgeSwipe({
     edge: "right",
-    enabled: rightDockCollapsed && !!activeSessionId,
+    enabled: caps.canUseDiff && rightDockCollapsed && !!activeSessionId,
     onSwipe: openDiff,
   });
 
@@ -1523,10 +1574,10 @@ function AppContent({
   }, [serverAbout?.read_only]);
 
   const handleNewScratch = useCallback(() => {
-    if (serverAbout?.read_only) return;
+    if (serverAbout?.read_only || caps.mayaRestricted) return;
     setWizardPrefill({ scratch: true });
     setShowSessionWizard(true);
-  }, [serverAbout?.read_only]);
+  }, [caps.mayaRestricted, serverAbout?.read_only]);
 
   const handleCloneFromUrl = useCallback(() => {
     setWizardPrefill({ initialTab: "clone" });
@@ -1534,7 +1585,7 @@ function AppContent({
   }, []);
 
   const handleToggleTerminalFocus = useCallback(() => {
-    if (!activeSessionId) return;
+    if (!caps.canUseTerminal || !activeSessionId) return;
     // Probe by data-term attribute rather than a component ref: it is
     // robust against panel reorderings and against the paired terminal
     // living in either the desktop split or the mobile single pane.
@@ -1600,7 +1651,7 @@ function AppContent({
       return;
     }
     dispatchFocusTerminal(target);
-  }, [activeSessionId, singlePane, paneLayout, openTab, activateTab, selectedFilePath]);
+  }, [caps.canUseTerminal, activeSessionId, singlePane, paneLayout, openTab, activateTab, selectedFilePath]);
 
   // Flattened, display-ordered session ids plus the subset needing attention,
   // sourced from the same sidebar model the user sees so jump-to-next follows
@@ -1731,6 +1782,14 @@ function AppContent({
     onToggleSidebar: handleToggleSidebar,
     onLogout,
   });
+  const visibleCommandActions = caps.mayaRestricted
+    ? commandActions.filter(
+        (action) =>
+          action.id !== "action:new-scratch-session" &&
+          action.id !== "action:toggle-diff" &&
+          action.id !== "settings:open",
+      )
+    : commandActions;
 
   const openSettingsTab = useCallback((tab: string) => navigate(`/settings/${tab}`), [navigate]);
   const settingsCommands = useSettingsCommands({
@@ -1746,7 +1805,9 @@ function AppContent({
   // Conversation-content search for the palette (#2515). paletteQuery is
   // declared above (near showPalette) so the keyboard handlers can clear it
   // on close/toggle; consumed here.
-  const { results: conversationHits, loading: conversationSearching } = useConversationSearch(paletteQuery);
+  const { results: conversationHits, loading: conversationSearching } = useConversationSearch(
+    caps.mayaRestricted ? "" : paletteQuery,
+  );
   const conversationActions = useMemo(
     () =>
       buildConversationActions(conversationHits, sessions, activeSessionId).map(({ sessionId, ...rest }) => ({
@@ -1926,6 +1987,7 @@ function AppContent({
                         fileRefSession={activeSession}
                         onOpenAgentsPane={openAgentsPane}
                         isSandboxed={activeSession.is_sandboxed}
+                        restricted={caps.mayaRestricted}
                       />
                     </Suspense>
                   ) : (
@@ -2059,6 +2121,7 @@ function AppContent({
   const [tourSeenKnown, setTourSeenKnown] = useState(false);
 
   useEffect(() => {
+    if (caps.mayaRestricted) return;
     fetchSettings().then((settings) => {
       // Fetch failed: leave the seen state unknown so the tour does not
       // auto-launch over an error/recovery screen. The menu trigger still works.
@@ -2079,7 +2142,7 @@ function AppContent({
         });
       }
     });
-  }, []);
+  }, [caps.mayaRestricted]);
 
   // Persist the seen flag when the user finishes or skips the tour. Optimistic:
   // flip local state immediately so a failed POST (e.g. read-only 403) cannot
@@ -2114,7 +2177,7 @@ function AppContent({
   const tour = useTour({
     scope: tourScope,
     readOnly: !!serverAbout?.read_only,
-    cityhall: caps.cityhall,
+    cityhall: caps.cityhall || caps.mayaRestricted,
     isDesktop: !isCoarse,
     autoLaunchReady: tourAutoLaunchReady && welcome.resolved,
     seen: tourSeen,
@@ -2209,8 +2272,8 @@ function AppContent({
             for every view that cannot collapse. */}
         <CollapsibleRegion id="conversation-header" collapsed={headerCollapsible && headerCollapsed}>
           <TopBar
-            activeWorkspace={activeWorkspace}
-            activeSession={activeSession ?? null}
+            activeWorkspace={caps.mayaRestricted ? undefined : activeWorkspace}
+            activeSession={caps.mayaRestricted ? null : (activeSession ?? null)}
             onToggleSidebar={handleToggleSidebar}
             onOpenPalette={() => setShowPalette(true)}
             onToggleDiff={toggleDiff}
@@ -2233,7 +2296,7 @@ function AppContent({
         </CollapsibleRegion>
 
         <DisconnectBanner />
-        <UpdateBanner />
+        {!caps.mayaRestricted && <UpdateBanner />}
         <DashboardUpdateBanner />
 
         {/* Below the banners, not directly under the bar: the handle is
@@ -2290,6 +2353,7 @@ function AppContent({
               onSwitchView={handleSwitchView}
               readOnly={serverAbout?.read_only}
               canManageProjects={caps.canManageProjects}
+              canManageSessionAuthority={caps.canManageSessionAuthority}
               sortMode={sidebarSortMode}
               onSortModeChange={selectSidebarSortMode}
               pluginSortRef={pluginSortRef}
@@ -2319,6 +2383,7 @@ function AppContent({
             }}
             prefill={wizardPrefill}
             nameOnly={caps.nameOnlyWizard}
+            mayaRestricted={caps.mayaRestricted}
           />
         )}
 
@@ -2394,7 +2459,12 @@ function AppContent({
             setShowPalette(false);
             setPaletteQuery("");
           }}
-          actions={[...commandActions, ...conversationActions, ...settingsCommands, ...pluginCommandActions]}
+          actions={[
+            ...visibleCommandActions,
+            ...conversationActions,
+            ...(caps.mayaRestricted ? [] : settingsCommands),
+            ...(caps.canUseExtensions ? pluginCommandActions : []),
+          ]}
           onSearchChange={setPaletteQuery}
           searching={conversationSearching}
         />
@@ -2416,7 +2486,7 @@ function AppContent({
           />
         )}
 
-        {activeWorkspace && activeSession && (
+        {!caps.mayaRestricted && activeWorkspace && activeSession && (
           <MobileRightPanelPicker
             open={pickerOpen && singlePane}
             active={rightPanelView}

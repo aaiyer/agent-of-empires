@@ -18,8 +18,8 @@ const PluginUiRefreshingContext = createContext(false);
 const PluginUiRevisionsContext = createContext<Record<string, Record<string, number>>>({});
 const PluginUiPokeContext = createContext<() => void>(() => {});
 
-export function PluginUiProvider({ children }: { children: ReactNode }) {
-  const { entries, revisions, isRefreshing, poke } = usePluginUiState();
+export function PluginUiProvider({ children, enabled = true }: { children: ReactNode; enabled?: boolean }) {
+  const { entries, revisions, isRefreshing, poke } = usePluginUiState(enabled);
   return (
     <PluginUiEntriesContext.Provider value={entries}>
       <PluginUiRevisionsContext.Provider value={revisions}>

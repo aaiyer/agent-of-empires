@@ -691,30 +691,6 @@ mod tests {
     }
 
     #[test]
-    fn maya_restricted_command_reaches_tmux_create_args_unchanged() {
-        let command = crate::server::maya_restricted::SHELL_COMMAND;
-        let (_, effective) = host_pane_inputs(
-            Some("/bin/zsh"),
-            Some(command),
-            "/home/aaiyer",
-            "/usr/bin:/bin",
-        );
-        let args = super::super::session::build_create_args(
-            "aoe_test_maya_shell",
-            crate::server::maya_restricted::PROJECT_PATH,
-            &[],
-            effective.as_deref(),
-            None,
-        );
-
-        assert_eq!(args.last().map(String::as_str), Some(command));
-        assert_eq!(
-            args.last().map(String::as_str),
-            Some("/usr/bin/sudo -n -u '#1001' -- /usr/local/libexec/maya-aoe/maya-shell")
-        );
-    }
-
-    #[test]
     fn test_host_pane_inputs_drops_empty_home_path() {
         let (env, _) = host_pane_inputs(Some("/bin/bash"), None, "", "");
         assert_eq!(env, vec![("SHELL".to_string(), "/bin/bash".to_string())]);

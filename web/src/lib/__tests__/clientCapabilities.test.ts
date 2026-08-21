@@ -10,10 +10,14 @@ describe("getClientCapabilities", () => {
     const caps = getClientCapabilities({ cityhall_mode: true } as ServerAbout);
     expect(caps).toEqual({
       cityhall: true,
+      mayaRestricted: false,
       canUseTerminal: false,
       canUseDiff: false,
       canManageProjects: false,
       nameOnlyWizard: true,
+      canManageDeployment: true,
+      canManageSessionAuthority: true,
+      canUseExtensions: false,
     });
   });
 
@@ -21,10 +25,29 @@ describe("getClientCapabilities", () => {
     const caps = getClientCapabilities({ cityhall_mode: false } as ServerAbout);
     expect(caps).toEqual({
       cityhall: false,
+      mayaRestricted: false,
       canUseTerminal: true,
       canUseDiff: true,
       canManageProjects: true,
       nameOnlyWizard: false,
+      canManageDeployment: true,
+      canManageSessionAuthority: true,
+      canUseExtensions: true,
+    });
+  });
+
+  it("keeps the normal shell but hides authority-bearing Maya controls", () => {
+    const caps = getClientCapabilities({ maya_restricted: true } as ServerAbout);
+    expect(caps).toEqual({
+      cityhall: false,
+      mayaRestricted: true,
+      canUseTerminal: false,
+      canUseDiff: false,
+      canManageProjects: false,
+      nameOnlyWizard: true,
+      canManageDeployment: false,
+      canManageSessionAuthority: false,
+      canUseExtensions: false,
     });
   });
 

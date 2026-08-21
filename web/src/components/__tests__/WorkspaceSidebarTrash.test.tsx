@@ -341,3 +341,39 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
     expect(sunk.compareDocumentPosition(projects) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });
+
+describe("WorkspaceSidebar Maya capability gate", () => {
+  it("keeps safe right-click lifecycle controls and hides authority controls", () => {
+    const live = workspace("maya-ws", [
+      session({
+        id: "maya-1",
+        view: "structured",
+        acp_capable: true,
+        acp_session_id: "codex-thread",
+        acp_can_fork: true,
+        default_name: true,
+      }),
+    ]);
+    renderSidebar({
+      groups: buildSessionGroups([live], {
+        idleDecayWindowMs: 60_000,
+        sortMode: "lastActivity",
+        isCollapsed: () => false,
+      }),
+      canManageProjects: false,
+      canManageSessionAuthority: false,
+    });
+
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"), { clientX: 10, clientY: 10 });
+    expect(screen.getByTestId("sidebar-context-menu-rename")).toBeTruthy();
+    expect(screen.getByTestId("sidebar-context-menu-summarize")).toBeTruthy();
+    expect(screen.getByTestId("sidebar-context-menu-archive")).toBeTruthy();
+    expect(screen.getByTestId("sidebar-context-menu-delete")).toBeTruthy();
+    expect(screen.queryByTestId("sidebar-context-menu-edit-workdir")).toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-add-project")).toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-switch-view")).toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-switch-agent")).toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-fork")).toBeNull();
+    expect(screen.queryByLabelText("Settings")).toBeNull();
+  });
+});

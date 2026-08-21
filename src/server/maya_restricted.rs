@@ -21,8 +21,6 @@ pub const CODEX_ARGS: &[&str] = &[
     "--",
     "/usr/local/libexec/maya-aoe/maya-codex-acp",
 ];
-pub const SHELL_COMMAND: &str =
-    "/usr/bin/sudo -n -u '#1001' -- /usr/local/libexec/maya-aoe/maya-shell";
 
 pub fn codex_agent_spec() -> crate::acp::AgentSpec {
     crate::acp::AgentSpec {
@@ -44,26 +42,6 @@ pub fn is_restricted_session(instance: &crate::session::Instance) -> bool {
         && instance.agent_name.is_none()
         && instance.agent_model.is_none()
         && instance.acp_effort.is_none()
-}
-
-/// Select the paired host-shell command at the terminal mutation boundary.
-/// Ordinary AoE sessions retain their existing login-shell default. The Maya
-/// profile has exactly one server-owned shell identity and never consumes a
-/// caller command, cwd, environment, container, or terminal-index override.
-pub fn paired_shell_command(
-    maya_restricted: bool,
-    instance: &crate::session::Instance,
-    index: u32,
-) -> anyhow::Result<Option<&'static str>> {
-    if !maya_restricted {
-        return Ok(None);
-    }
-    anyhow::ensure!(index == 0, "Maya restricted shell index must be 0");
-    anyhow::ensure!(
-        is_restricted_session(instance),
-        "Maya restricted shell session identity mismatch"
-    );
-    Ok(Some(SHELL_COMMAND))
 }
 
 pub fn first_turn_title(prompt: &str) -> String {
@@ -156,21 +134,7 @@ fn restricted_session_id(path: &str) -> Option<&str> {
     (!id.is_empty()).then_some(id)
 }
 
-fn terminal_query_allowed(method: &Method, path: &str, query: Option<&str>) -> bool {
-    let is_terminal_create =
-        *method == Method::POST && session_api_suffix(path) == Some("terminal");
-    let is_terminal_ws =
-        *method == Method::GET && session_ws_suffix(path) == Some("terminal/live-ws");
-    if !is_terminal_create && !is_terminal_ws {
-        return true;
-    }
-    query.is_none() || query == Some("index=0")
-}
-
-pub fn route_allowed(method: &Method, path: &str, query: Option<&str>) -> bool {
-    if !terminal_query_allowed(method, path, query) {
-        return false;
-    }
+pub fn route_allowed(method: &Method, path: &str) -> bool {
     if path == "/api/about" && *method == Method::GET {
         return true;
     }
@@ -183,14 +147,19 @@ pub fn route_allowed(method: &Method, path: &str, query: Option<&str>) -> bool {
     if path == "/api/sessions" {
         return matches!(*method, Method::GET | Method::POST);
     }
+    if path == "/api/workspace-ordering" && *method == Method::PUT {
+        return true;
+    }
     if let Some(rest) = path.strip_prefix("/api/sessions/") {
         if !rest.contains('/') {
             return matches!(*method, Method::PATCH | Method::DELETE);
         }
         return match (method, session_api_suffix(path)) {
-            (&Method::PATCH, Some("archive")) => true,
-            (&Method::POST, Some("trash" | "restore")) => true,
-            (&Method::POST, Some("terminal")) => true,
+            (
+                &Method::PATCH,
+                Some("archive" | "group" | "notifications" | "pin" | "color" | "snooze" | "unread"),
+            ) => true,
+            (&Method::POST, Some("trash" | "restore" | "summarize" | "stop" | "start")) => true,
             (
                 &Method::POST,
                 Some(
@@ -211,7 +180,7 @@ pub fn route_allowed(method: &Method, path: &str, query: Option<&str>) -> bool {
         };
     }
     if let Some(suffix) = session_ws_suffix(path) {
-        return *method == Method::GET && matches!(suffix, "acp/ws" | "terminal/live-ws");
+        return *method == Method::GET && suffix == "acp/ws";
     }
 
     // Static assets and the SPA entry are read-only. Every API and session
@@ -229,7 +198,7 @@ pub async fn enforce_routes(
         return next.run(request).await;
     }
     let path = request.uri().path();
-    if !route_allowed(request.method(), path, request.uri().query()) {
+    if !route_allowed(request.method(), path) {
         return (
             StatusCode::FORBIDDEN,
             axum::Json(serde_json::json!({
@@ -273,10 +242,19 @@ mod tests {
             (Method::PATCH, "/api/sessions/s-1"),
             (Method::DELETE, "/api/sessions/s-1"),
             (Method::PATCH, "/api/sessions/s-1/archive"),
+            (Method::PATCH, "/api/sessions/s-1/group"),
+            (Method::PATCH, "/api/sessions/s-1/notifications"),
+            (Method::PATCH, "/api/sessions/s-1/pin"),
+            (Method::PATCH, "/api/sessions/s-1/color"),
+            (Method::PATCH, "/api/sessions/s-1/snooze"),
+            (Method::PATCH, "/api/sessions/s-1/unread"),
             (Method::POST, "/api/sessions/s-1/trash"),
             (Method::POST, "/api/sessions/s-1/restore"),
-            (Method::POST, "/api/sessions/s-1/terminal"),
             (Method::POST, "/api/sessions/s-1/smart-rename"),
+            (Method::POST, "/api/sessions/s-1/summarize"),
+            (Method::POST, "/api/sessions/s-1/stop"),
+            (Method::POST, "/api/sessions/s-1/start"),
+            (Method::PUT, "/api/workspace-ordering"),
             (Method::POST, "/api/sessions/s-1/acp/prompt"),
             (Method::POST, "/api/sessions/s-1/acp/cancel"),
             (Method::POST, "/api/sessions/s-1/acp/force_end_turn"),
@@ -285,10 +263,9 @@ mod tests {
             (Method::POST, "/api/sessions/s-1/acp/approvals/n-1"),
             (Method::POST, "/api/sessions/s-1/acp/elicitations/n-1"),
             (Method::GET, "/sessions/s-1/acp/ws"),
-            (Method::GET, "/sessions/s-1/terminal/live-ws"),
         ] {
             assert!(
-                route_allowed(&method, path, None),
+                route_allowed(&method, path),
                 "expected allowed: {method} {path}"
             );
         }
@@ -313,89 +290,27 @@ mod tests {
             (Method::GET, "/sessions/s-1/live-ws"),
         ] {
             assert!(
-                !route_allowed(&method, path, None),
+                !route_allowed(&method, path),
                 "expected denied: {method} {path}"
             );
         }
     }
 
     #[test]
-    fn restricted_terminal_routes_accept_only_the_fixed_index_zero_query() {
+    fn restricted_terminal_routes_are_denied() {
         for (method, path) in [
             (Method::POST, "/api/sessions/s-1/terminal"),
-            (Method::GET, "/sessions/s-1/terminal/live-ws"),
-        ] {
-            assert!(route_allowed(&method, path, None));
-            assert!(route_allowed(&method, path, Some("index=0")));
-            for query in [
-                "",
-                "index=1",
-                "index=-1",
-                "index=zero",
-                "index=0&index=0",
-                "index=0&extra=1",
-                "extra=1",
-                "index%3D0",
-            ] {
-                assert!(
-                    !route_allowed(&method, path, Some(query)),
-                    "expected denied query: {method} {path}?{query}"
-                );
-            }
-        }
-
-        for (method, path) in [
             (Method::DELETE, "/api/sessions/s-1/terminal"),
+            (Method::GET, "/sessions/s-1/terminal/live-ws"),
             (Method::POST, "/api/sessions/s-1/container-terminal"),
             (Method::GET, "/sessions/s-1/live-ws"),
             (Method::GET, "/sessions/s-1/container-terminal/live-ws"),
         ] {
-            assert!(!route_allowed(&method, path, None));
-            assert!(!route_allowed(&method, path, Some("index=0")));
+            assert!(
+                !route_allowed(&method, path),
+                "expected denied: {method} {path}"
+            );
         }
-    }
-
-    #[test]
-    fn restricted_shell_selection_is_fixed_and_ordinary_aoe_is_unchanged() {
-        let mut restricted = crate::session::Instance::new("Maya", PROJECT_PATH);
-        restricted.tool = "codex".to_string();
-        restricted.view = crate::session::View::Structured;
-        restricted.source_profile = PROFILE_NAME.to_string();
-
-        assert_eq!(
-            paired_shell_command(true, &restricted, 0).unwrap(),
-            Some(SHELL_COMMAND)
-        );
-        assert!(paired_shell_command(true, &restricted, 1).is_err());
-
-        let ordinary = crate::session::Instance::new("ordinary", "/tmp/project");
-        assert_eq!(paired_shell_command(false, &ordinary, 0).unwrap(), None);
-        assert_eq!(paired_shell_command(false, &ordinary, 7).unwrap(), None);
-    }
-
-    #[test]
-    fn fixed_shell_selection_is_wired_into_create_and_respawn_entrypoints() {
-        let create = include_str!("api/sessions.rs");
-        let create_start = create.find("pub async fn ensure_terminal").unwrap();
-        let create_end = create[create_start..]
-            .find("pub async fn ensure_container_terminal")
-            .map(|offset| create_start + offset)
-            .unwrap();
-        let create_entry = &create[create_start..create_end];
-        assert!(create_entry.contains("maya_restricted::paired_shell_command"));
-        assert!(create_entry.contains("start_terminal_with_size_indexed_command"));
-
-        let pane = include_str!("pane.rs");
-        let respawn_start = pane
-            .find("pub(crate) async fn respawn_paired_if_dead")
-            .unwrap();
-        let respawn_end = pane[respawn_start..]
-            .find("pub(crate) async fn respawn_container_if_dead")
-            .map(|offset| respawn_start + offset)
-            .unwrap();
-        let respawn_entry = &pane[respawn_start..respawn_end];
-        assert!(respawn_entry.contains("maya_restricted::paired_shell_command"));
-        assert!(respawn_entry.contains("start_terminal_with_size_indexed_command"));
     }
 
     #[test]
@@ -403,8 +318,17 @@ mod tests {
         for path in [
             "/api/sessions/s-1",
             "/api/sessions/s-1/archive",
+            "/api/sessions/s-1/group",
+            "/api/sessions/s-1/notifications",
+            "/api/sessions/s-1/pin",
+            "/api/sessions/s-1/color",
+            "/api/sessions/s-1/snooze",
+            "/api/sessions/s-1/unread",
             "/api/sessions/s-1/trash",
             "/api/sessions/s-1/restore",
+            "/api/sessions/s-1/summarize",
+            "/api/sessions/s-1/stop",
+            "/api/sessions/s-1/start",
         ] {
             assert_eq!(restricted_session_id(path), Some("s-1"), "path: {path}");
         }
@@ -424,58 +348,6 @@ mod tests {
                 "#1001",
                 "--",
                 "/usr/local/libexec/maya-aoe/maya-codex-acp"
-            ]
-        );
-    }
-
-    #[test]
-    fn shell_command_is_the_exact_root_owned_wrapper_command() {
-        assert_eq!(
-            SHELL_COMMAND,
-            "/usr/bin/sudo -n -u '#1001' -- /usr/local/libexec/maya-aoe/maya-shell"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn shell_command_quotes_numeric_user_through_the_real_shell_parser() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::process::Command;
-
-        let fixture = tempfile::tempdir().unwrap();
-        let capture = fixture.path().join("capture-argv.sh");
-        let output = fixture.path().join("argv.txt");
-        std::fs::write(
-            &capture,
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$MAYA_SHELL_ARGV_CAPTURE\"\n",
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&capture).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&capture, permissions).unwrap();
-
-        let fixture_command = SHELL_COMMAND.replacen(
-            "/usr/bin/sudo",
-            capture.to_str().expect("fixture path is UTF-8"),
-            1,
-        );
-        let status = Command::new("/bin/sh")
-            .args(["-c", &fixture_command])
-            .env("MAYA_SHELL_ARGV_CAPTURE", &output)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        assert_eq!(
-            std::fs::read_to_string(output)
-                .unwrap()
-                .lines()
-                .collect::<Vec<_>>(),
-            [
-                "-n",
-                "-u",
-                "#1001",
-                "--",
-                "/usr/local/libexec/maya-aoe/maya-shell"
             ]
         );
     }
