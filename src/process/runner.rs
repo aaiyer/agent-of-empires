@@ -822,6 +822,11 @@ const RUNNER_REQUEST_ID_BASE: i64 = 1 << 48;
 /// runs. Phase A of #1054.
 const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Bound runner-owned handshake requests so a silent agent cannot retain the
+/// serialization gate forever. The daemon applies the same outer handshake
+/// window; this inner bound also protects legacy relay callers.
+const HANDSHAKE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Write a control frame with a bounded deadline. Returns `true` on a
 /// successful write, `false` on a write error or timeout; callers treat
 /// `false` as a dead/stalled socket and run their drop/buffer cleanup.
@@ -886,6 +891,14 @@ impl RunnerShared {
                 if let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) {
                     let _ = tx.send(value);
                 }
+                return false;
+            }
+            // A timed-out runner request no longer has a sender, but its late
+            // response is still runner-owned and must not leak onto the relay.
+            if id >= RUNNER_REQUEST_ID_BASE
+                && id < self.next_req_id.load(Ordering::Relaxed)
+                && !self.prompt_requests.lock().await.contains(&id)
+            {
                 return false;
             }
         }
@@ -1223,12 +1236,13 @@ impl RunnerShared {
     /// Issue a runner-owned JSON-RPC request to the agent and await the
     /// full response line as JSON. Used for the handshake requests the
     /// runner now owns (`initialize`, `session/new|load|fork`). Returns
-    /// None if the write failed or the agent closed before answering.
+    /// None if the write failed, the agent closed, or the response timed out.
     async fn agent_request(
         &self,
         agent_stdin: &Mutex<tokio::process::ChildStdin>,
         method: &str,
         params: serde_json::Value,
+        response_timeout: Duration,
     ) -> Option<serde_json::Value> {
         let id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1243,7 +1257,13 @@ impl RunnerShared {
             self.pending_client_responses.lock().await.remove(&id);
             return None;
         }
-        rx.await.ok()
+        match tokio::time::timeout(response_timeout, rx).await {
+            Ok(Ok(response)) => Some(response),
+            Ok(Err(_)) | Err(_) => {
+                self.pending_client_responses.lock().await.remove(&id);
+                None
+            }
+        }
     }
 
     /// Issue a runner-owned `session/prompt` to the agent. The response is
@@ -1303,9 +1323,14 @@ impl RunnerShared {
             return Ok(cached);
         }
         let response = self
-            .agent_request(agent_stdin, "initialize", request)
+            .agent_request(
+                agent_stdin,
+                "initialize",
+                request,
+                HANDSHAKE_RESPONSE_TIMEOUT,
+            )
             .await
-            .ok_or_else(|| transport_error("agent closed before answering initialize"))?;
+            .ok_or_else(|| transport_error("agent did not answer initialize"))?;
         let result = handshake_result(&response)?;
         self.handshake.lock().await.initialized = Some(result.clone());
         Ok(result)
@@ -1333,9 +1358,14 @@ impl RunnerShared {
         }
         let key = session_request_key(method, &request)?;
         let response = self
-            .agent_request(agent_stdin, method, request.clone())
+            .agent_request(
+                agent_stdin,
+                method,
+                request.clone(),
+                HANDSHAKE_RESPONSE_TIMEOUT,
+            )
             .await
-            .ok_or_else(|| transport_error(&format!("agent closed before answering {method}")))?;
+            .ok_or_else(|| transport_error(&format!("agent did not answer {method}")))?;
         let result = handshake_result(&response)?;
         let acp_session_id = established_session_id(method, &request, &result)?;
         let cached = (key, acp_session_id.clone(), result.clone());
@@ -2410,6 +2440,34 @@ mod tests {
             output.stdout.is_empty(),
             "agent stdin must remain untouched"
         );
+    }
+
+    #[tokio::test]
+    async fn silent_agent_request_times_out_and_releases_pending_slot() {
+        let shared = RunnerShared::new();
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn silent agent fixture");
+        let stdin = Mutex::new(child.stdin.take().expect("fixture stdin"));
+
+        assert!(shared
+            .agent_request(
+                &stdin,
+                "initialize",
+                serde_json::json!({}),
+                Duration::from_millis(25),
+            )
+            .await
+            .is_none());
+        assert!(shared.pending_client_responses.lock().await.is_empty());
+        let mut late =
+            format!(r#"{{"jsonrpc":"2.0","id":{RUNNER_REQUEST_ID_BASE},"result":{{}}}}"#);
+        late.push('\n');
+        assert!(!shared.deliver_line(late.as_bytes()).await);
+        assert!(shared.pending.lock().await.is_empty());
+        child.kill().await.expect("stop silent agent fixture");
     }
 
     #[tokio::test]

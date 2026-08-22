@@ -432,26 +432,7 @@ pub(crate) fn authenticate_generation_record(
     {
         return Ok(None);
     }
-    #[cfg(target_os = "linux")]
-    {
-        if current.process_start_identity.is_none() {
-            if connected_peer_pid
-                .or_else(|| crate::process::worker::peer_pid_from_socket(socket_path))
-                != Some(current.pid)
-            {
-                return Ok(None);
-            }
-            let Some(identity) = process_start_identity_for(current.pid) else {
-                return Ok(None);
-            };
-            current.process_start_identity = Some(identity);
-            save_unlocked(&current)?;
-        }
-        if current.process_start_identity != process_start_identity_for(current.pid) {
-            return Ok(None);
-        }
-    }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         if current.process_start_identity.is_none() {
             if connected_peer_pid
@@ -1236,7 +1217,7 @@ mod tests {
         });
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     #[serial]
     fn legacy_identity_backfill_returns_metadata_authority() {
@@ -1265,7 +1246,6 @@ mod tests {
                 authenticate_generation_record(&legacy, "legacy-backfill", &socket, None)
                     .unwrap()
                     .expect("legacy runner authenticated by canonical socket peer");
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
             assert!(authenticated.process_start_identity.is_some());
 
             update_stored_acp_session_id(&authenticated, Some("session-from-legacy"));

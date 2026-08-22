@@ -1087,19 +1087,12 @@ impl<S: BroadcastSink> Supervisor<S> {
         true
     }
 
-    /// Mirror an `AcpError::IncompatibleAgent` onto the broadcast sink
-    /// and tear down the detached runner. Called from every spawn-
-    /// failure site so the structured detail reaches the reducer (the
-    /// in-process event_tx on the failed AcpClient never delivers) and
-    /// socket-mode workers don't survive a compatibility rejection. On
-    /// non-compat errors this is a no-op.
-    async fn publish_compat_rejection(
-        &self,
-        session_id: &str,
-        err: &AcpError,
-    ) -> Result<(), SupervisorError> {
+    /// Mirror an `AcpError::IncompatibleAgent` onto the broadcast sink so the
+    /// structured detail reaches the reducer after the failed client's event
+    /// channel closes. `AcpClient` owns exact-generation teardown.
+    fn publish_compat_rejection(&self, session_id: &str, err: &AcpError) {
         let AcpError::IncompatibleAgent(payload) = err else {
-            return Ok(());
+            return;
         };
         self.publish_next(
             session_id,
@@ -1116,7 +1109,6 @@ impl<S: BroadcastSink> Supervisor<S> {
         // AcpClient owns and tears down the exact runner generation on every
         // failed handshake. Do not rediscover a mutable session record here:
         // a concurrent retry may already have published its replacement.
-        Ok(())
     }
 
     /// Publish a synthetic `AgentSwitched` event after a successful
@@ -1752,7 +1744,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 if matches!(err, AcpError::IncompatibleAgent(_)) {
                     self.mark_incompatible_binary(&session_id, &config.spec.command);
                 }
-                self.publish_compat_rejection(&session_id, &err).await?;
+                self.publish_compat_rejection(&session_id, &err);
                 return Err(SupervisorError::Acp(err));
             }
         };
@@ -4136,6 +4128,7 @@ cursor-acp-bridge = "agent acp"
                 .expect("spawn stand-in runner")
         };
         let permitted_runner = spawn_runner();
+        let permitted_pid = permitted_runner.id();
 
         let result = async {
             let sup = Supervisor::new(VecSink::new());
@@ -4179,6 +4172,10 @@ cursor-acp-bridge = "agent acp"
             assert!(
                 !matches!(allowed, Err(SupervisorError::AgentNotAllowed(_))),
                 "a permitted agent must clear the policy gate, got {allowed:?}"
+            );
+            assert!(
+                !crate::process::worker_registry::is_pid_alive(permitted_pid),
+                "failed permitted attach must reap its exact runner generation"
             );
 
             // Now tighten the policy so `codex` is no longer permitted.
@@ -5195,7 +5192,7 @@ cursor-acp-bridge = "agent acp"
         let mut runner = command.spawn().expect("spawn TERM-ignoring runner group");
         let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while !ready.exists() && std::time::Instant::now() < ready_deadline {
-            std::thread::yield_now();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert!(ready.exists(), "fixture must install its TERM handler");
 
