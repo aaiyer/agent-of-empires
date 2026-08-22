@@ -39,6 +39,31 @@ pub(super) fn build_children_map() -> HashMap<u32, Vec<u32>> {
     children_map
 }
 
+#[cfg(feature = "serve")]
+pub(super) fn process_start_identity_for(pid: u32) -> Option<u64> {
+    use std::mem::{size_of, zeroed};
+
+    let pid = i32::try_from(pid).ok()?;
+    // SAFETY: proc_pidinfo initializes exactly `proc_bsdinfo` bytes when it
+    // returns the expected size; every other result is rejected.
+    let info = unsafe {
+        let mut info = zeroed::<nix::libc::proc_bsdinfo>();
+        let read = nix::libc::proc_pidinfo(
+            pid,
+            nix::libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut _,
+            size_of::<nix::libc::proc_bsdinfo>() as i32,
+        );
+        (read == size_of::<nix::libc::proc_bsdinfo>() as i32).then_some(info)?
+    };
+    combine_process_start_time(info.pbi_start_tvsec, info.pbi_start_tvusec)
+}
+
+fn combine_process_start_time(seconds: u64, microseconds: u64) -> Option<u64> {
+    seconds.checked_mul(1_000_000)?.checked_add(microseconds)
+}
+
 /// One `ps -A -ww -E -o command=` fork deciding, for each candidate `i`,
 /// whether a live process belongs to it: a whitespace-delimited token exactly
 /// equals `env_needles[i]` (anchored, matching the `KEY=VAL` env tokens `-E`
@@ -274,6 +299,12 @@ Pages inactive:                          200000.
 Pages speculative:                        10000.
 Pages wired down:                        300000.
 ";
+
+    #[test]
+    fn native_start_time_keeps_subsecond_identity() {
+        assert_eq!(combine_process_start_time(42, 7), Some(42_000_007));
+        assert_eq!(combine_process_start_time(u64::MAX, 1), None);
+    }
 
     #[test]
     fn test_parse_vm_stat_available() {

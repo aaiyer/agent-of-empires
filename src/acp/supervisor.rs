@@ -2874,13 +2874,20 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// subprocess dies. For the everyday `aoe serve --stop` flow, use
     /// `detach_all` instead so workers outlive the daemon.
     pub async fn shutdown_all(&self) -> Result<(), SupervisorError> {
-        let session_ids: HashSet<String> = crate::process::worker_registry::list_existing_strict()
-            .map_err(|error| {
-                SupervisorError::Acp(AcpError::Spawn(format!("registry list: {error}")))
-            })?
-            .into_iter()
-            .map(|record| record.session_id)
-            .collect();
+        let session_ids: HashSet<String> =
+            tokio::task::spawn_blocking(crate::process::worker_registry::list_existing_strict)
+                .await
+                .map_err(|error| {
+                    SupervisorError::Acp(AcpError::Spawn(format!(
+                        "registry list task failed: {error}"
+                    )))
+                })?
+                .map_err(|error| {
+                    SupervisorError::Acp(AcpError::Spawn(format!("registry list: {error}")))
+                })?
+                .into_iter()
+                .map(|record| record.session_id)
+                .collect();
         let mut session_ids = session_ids;
         session_ids.extend(self.workers.lock().await.keys().cloned());
         let mut session_ids: Vec<_> = session_ids.into_iter().collect();
@@ -2962,9 +2969,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         };
 
-        let record = match crate::process::worker_registry::load_existing_strict(&session_id)
-            .map_err(|e| SupervisorError::Acp(AcpError::Spawn(format!("registry load: {e}"))))?
-        {
+        let record = match load_worker_record_strict(&session_id).await? {
             Some(r) if crate::process::worker_registry::is_record_live(&r) => r,
             Some(_) | None => {
                 return Err(SupervisorError::UnknownSession(session_id));
@@ -4090,6 +4095,23 @@ cursor-acp-bridge = "agent acp"
         );
     }
 
+    // Child-process fixture whose listening Unix socket exposes its real PID.
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn authenticated_unix_listener_fixture() {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixListener;
+
+        let socket = std::env::var_os("AOE_TEST_RUNNER_SOCKET").expect("runner socket path");
+        let listener = UnixListener::bind(socket).expect("bind runner socket");
+        println!("runner-listener-ready");
+        std::io::stdout().flush().unwrap();
+        for stream in listener.incoming() {
+            drop(stream.unwrap());
+        }
+    }
+
     /// #3241: the reattach half of the enforcement. Workers are detached rather
     /// than killed on daemon shutdown, so a runner started under a permissive
     /// policy is still alive when the policy tightens. Attaching it would let it
@@ -4119,21 +4141,38 @@ cursor-acp-bridge = "agent acp"
         // terminate path signals the pid's whole process group. `process_group(0)`
         // makes the child its own group leader so the killpg lands on it alone;
         // using our own pid here would SIGTERM the test process.
+        use std::io::BufRead as _;
         use std::os::unix::process::CommandExt as _;
-        let spawn_runner = || {
-            std::process::Command::new("sleep")
-                .arg("60")
+        let spawn_runner = |socket: &std::path::Path| {
+            let mut runner = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "acp::supervisor::tests::authenticated_unix_listener_fixture",
+                    "--nocapture",
+                ])
+                .env("AOE_TEST_RUNNER_SOCKET", socket)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
                 .process_group(0)
                 .spawn()
-                .expect("spawn stand-in runner")
+                .expect("spawn authenticated runner fixture");
+            let mut output = std::io::BufReader::new(runner.stdout.take().unwrap());
+            let mut line = String::new();
+            while output.read_line(&mut line).unwrap() != 0 {
+                if line.contains("runner-listener-ready") {
+                    return runner;
+                }
+                line.clear();
+            }
+            panic!("authenticated runner fixture exited before readiness");
         };
-        let permitted_runner = spawn_runner();
-        let permitted_pid = permitted_runner.id();
 
         let result = async {
             let sup = Supervisor::new(VecSink::new());
             let socket = crate::process::worker_registry::socket_path_for("s-policy").unwrap();
-            std::fs::write(&socket, b"").unwrap();
+            let permitted_runner = spawn_runner(&socket);
+            let permitted_pid = permitted_runner.id();
             let mut record = crate::process::worker_registry::WorkerRecord::new(
                 "s-policy".into(),
                 permitted_runner.id(),
@@ -4151,9 +4190,9 @@ cursor-acp-bridge = "agent acp"
 
             // Control first, while the stand-in runner is still alive: a policy
             // that permits `codex` clears the gate and the attach proceeds to
-            // dial, failing only because the socket path is a plain file rather
-            // than a listening runner. This is what proves the denial below
-            // comes from the policy and not from the fixture.
+            // dial the real listener, then fails when the fixture closes the
+            // connection without completing the ACP resume handshake. This is
+            // what proves the denial below comes from policy, not the fixture.
             crate::session::config::update_config(|c| {
                 c.acp.restrict_agents = true;
                 c.acp.allowed_agents = vec!["claude".to_string(), "codex".to_string()];
@@ -4183,9 +4222,8 @@ cursor-acp-bridge = "agent acp"
                 c.acp.allowed_agents = vec!["claude".to_string()];
             })
             .unwrap();
-            let denied_runner = spawn_runner();
+            let denied_runner = spawn_runner(&socket);
             let denied_pid = denied_runner.id();
-            std::fs::write(&socket, b"").unwrap();
             let mut denied_record = crate::process::worker_registry::WorkerRecord::new(
                 "s-policy".into(),
                 denied_pid,
@@ -5328,11 +5366,8 @@ cursor-acp-bridge = "agent acp"
             std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
         }
         let session_id = "sw-err-2102";
-        // Force load() -> Err by writing a real record file and stripping
-        // read permission: path.exists() stays true, but std::fs::read
-        // fails with PermissionDenied. (Corrupt JSON is coerced to
-        // Ok(None) by load itself, so it can't drive the Err arm.)
-        use std::os::unix::fs::PermissionsExt;
+        // Force load() -> Err by replacing the record with a directory. This
+        // remains unreadable as a record even when tests run as root.
         let socket_path = crate::process::worker_registry::socket_path_for(session_id).unwrap();
         let record = crate::process::worker_registry::WorkerRecord::new(
             session_id.into(),
@@ -5349,7 +5384,8 @@ cursor-acp-bridge = "agent acp"
         );
         crate::process::worker_registry::save(&record).unwrap();
         let record_path = crate::process::worker_registry::record_path(session_id).unwrap();
-        std::fs::set_permissions(&record_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::remove_file(&record_path).unwrap();
+        std::fs::create_dir(&record_path).unwrap();
         assert!(
             crate::process::worker_registry::load(session_id).is_err(),
             "fixture must force load() to return Err"

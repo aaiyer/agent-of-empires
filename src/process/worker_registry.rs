@@ -34,6 +34,7 @@ use crate::util::now_secs;
 // Generic worker-subprocess plumbing now lives in `process::worker`; the
 // registry is the ACP consumer of it. Re-exported so the names referenced
 // across the ACP code (and its tests) keep resolving here.
+pub(crate) use crate::process::process_start_identity_for;
 pub use crate::process::worker::{is_pid_alive, validate_id as validate_session_id};
 
 /// Bump when the on-disk schema changes incompatibly. Older entries with
@@ -339,44 +340,6 @@ pub(crate) fn delete_dead_record_if_current(
     Ok(GenerationDeleteOutcome::Deleted)
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) fn process_start_identity_for(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_comm = stat.rsplit_once(')')?.1;
-    after_comm.split_whitespace().nth(19)?.parse().ok()
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn process_start_identity_for(pid: u32) -> Option<u64> {
-    use std::mem::{size_of, zeroed};
-
-    let pid = i32::try_from(pid).ok()?;
-    // SAFETY: proc_pidinfo initializes exactly `proc_bsdinfo` bytes when it
-    // returns the expected size; every other result is rejected.
-    let info = unsafe {
-        let mut info = zeroed::<nix::libc::proc_bsdinfo>();
-        let read = nix::libc::proc_pidinfo(
-            pid,
-            nix::libc::PROC_PIDTBSDINFO,
-            0,
-            &mut info as *mut _ as *mut _,
-            size_of::<nix::libc::proc_bsdinfo>() as i32,
-        );
-        (read == size_of::<nix::libc::proc_bsdinfo>() as i32).then_some(info)?
-    };
-    combine_process_start_time(info.pbi_start_tvsec, info.pbi_start_tvusec)
-}
-
-#[cfg(any(test, target_os = "macos"))]
-fn combine_process_start_time(seconds: u64, microseconds: u64) -> Option<u64> {
-    seconds.checked_mul(1_000_000)?.checked_add(microseconds)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn process_start_identity_for(_pid: u32) -> Option<u64> {
-    None
-}
-
 pub fn load(session_id: &str) -> Result<Option<WorkerRecord>> {
     let path = record_path(session_id)?;
     if !path.exists() {
@@ -434,13 +397,12 @@ pub(crate) fn authenticate_generation_record(
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
+        if connected_peer_pid.or_else(|| crate::process::worker::peer_pid_from_socket(socket_path))
+            != Some(current.pid)
+        {
+            return Ok(None);
+        }
         if current.process_start_identity.is_none() {
-            if connected_peer_pid
-                .or_else(|| crate::process::worker::peer_pid_from_socket(socket_path))
-                != Some(current.pid)
-            {
-                return Ok(None);
-            }
             let Some(identity) = process_start_identity_for(current.pid) else {
                 return Ok(None);
             };
@@ -735,12 +697,6 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use tempfile::TempDir;
-
-    #[test]
-    fn native_start_time_keeps_subsecond_identity() {
-        assert_eq!(combine_process_start_time(42, 7), Some(42_000_007));
-        assert_eq!(combine_process_start_time(u64::MAX, 1), None);
-    }
 
     fn with_temp_home<F: FnOnce()>(f: F) {
         // Root under /tmp instead of the default $TMPDIR (which on
@@ -1348,6 +1304,45 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     #[serial]
+    fn modern_identity_rejects_mismatched_peer_pid() {
+        with_temp_home(|| {
+            let socket = socket_path_for("modern-mismatched-peer").unwrap();
+            let current_pid = std::process::id();
+            let modern = WorkerRecord::new(
+                "modern-mismatched-peer".into(),
+                current_pid,
+                socket.clone(),
+                "aoe-agent".into(),
+                "aoe-agent".into(),
+                PathBuf::from("/repo"),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            );
+            assert!(modern.process_start_identity.is_some());
+            save(&modern).unwrap();
+            let mismatched_pid = if current_pid == u32::MAX {
+                current_pid - 1
+            } else {
+                current_pid + 1
+            };
+
+            assert!(authenticate_generation_record(
+                &modern,
+                "modern-mismatched-peer",
+                &socket,
+                Some(mismatched_pid),
+            )
+            .unwrap()
+            .is_none());
+        });
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[serial]
     fn stale_legacy_identity_cannot_bind_or_update_current_generation() {
         with_temp_home(|| {
             let socket = socket_path_for("legacy-stale").unwrap();
@@ -1524,7 +1519,6 @@ mod tests {
     #[serial]
     fn pid_source_for_falls_back_to_peer_pid_on_load_err() {
         with_temp_home(|| {
-            use std::os::unix::fs::PermissionsExt;
             let session_id = "sess-load-err";
             let rec = WorkerRecord::new(
                 session_id.into(),
@@ -1540,9 +1534,10 @@ mod tests {
                 None,
             );
             save(&rec).unwrap();
-            // Force load() -> Err via chmod 0o000.
+            // A directory is unreadable as a record even when tests run as root.
             let rec_path = record_path(session_id).unwrap();
-            std::fs::set_permissions(&rec_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            std::fs::remove_file(&rec_path).unwrap();
+            std::fs::create_dir(&rec_path).unwrap();
             assert!(
                 load(session_id).is_err(),
                 "fixture must force load() to return Err"

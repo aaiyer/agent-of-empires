@@ -61,6 +61,23 @@ pub mod runner;
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PROCESS_GROUP_TERMINATION_GRACE: Duration = Duration::from_millis(250);
 
+#[cfg(feature = "serve")]
+pub(crate) fn process_start_identity_for(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::process_start_identity_for(pid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::process_start_identity_for(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// Wait for `child` to exit, killing and reaping it if it outlives `timeout`.
 /// Returns `Ok(None)` when the timeout fired and the child was killed.
 ///

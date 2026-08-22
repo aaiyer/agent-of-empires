@@ -49,6 +49,13 @@ pub(super) fn build_children_map() -> HashMap<u32, Vec<u32>> {
     children_map
 }
 
+#[cfg(feature = "serve")]
+pub(super) fn process_start_identity_for(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
 /// One `/proc` walk deciding, for each candidate `i`, whether a live process
 /// belongs to it: an `/proc/<pid>/environ` *entry* exactly equals
 /// `env_needles[i]` (NUL-delimited, so no prefix-collision), or
