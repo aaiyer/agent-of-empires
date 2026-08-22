@@ -2114,6 +2114,27 @@ fn runner_generation_authorized_for_signal(
     }
 }
 
+fn signal_runner_generation_if_authorized(
+    generation: &RunnerGeneration,
+    allow_missing_after_term: bool,
+    force: bool,
+) -> bool {
+    let Ok(_generation_lock) =
+        crate::process::worker_registry::lock_generation(&generation.session_id)
+    else {
+        return false;
+    };
+    if !runner_generation_authorized_for_signal(generation, allow_missing_after_term) {
+        return false;
+    }
+    if force {
+        crate::process::worker::kill_process_group(generation.pid);
+    } else {
+        crate::process::worker::terminate_process_group(generation.pid);
+    }
+    true
+}
+
 /// Stop only the captured runner generation and wait for its process tree to
 /// exit before a replacement can reuse the session's sockets.
 pub(crate) async fn terminate_runner_generation(generation: &RunnerGeneration) -> bool {
@@ -2128,43 +2149,45 @@ pub(crate) async fn terminate_runner_generation_with_deadline(
         return false;
     }
     let started = std::time::Instant::now();
-    let Ok(generation_lock) =
-        crate::process::worker_registry::lock_generation(&generation.session_id)
+    let term_generation = generation.clone();
+    let Ok(true) = tokio::task::spawn_blocking(move || {
+        signal_runner_generation_if_authorized(&term_generation, false, false)
+    })
+    .await
     else {
         return false;
     };
-    if !runner_generation_authorized_for_signal(generation, false) {
-        return false;
-    }
-    crate::process::worker::terminate_process_group(generation.pid);
-    drop(generation_lock);
-    let term_wait = deadline
-        .saturating_sub(started.elapsed())
-        .min(RUNNER_TERMINATION_GRACE);
+    let remaining = deadline.saturating_sub(started.elapsed());
+    let term_wait = remaining.min(RUNNER_TERMINATION_GRACE);
     if !wait_for_runner_group_absent_without_reap(generation.pid, term_wait).await {
-        let Ok(generation_lock) =
-            crate::process::worker_registry::lock_generation(&generation.session_id)
+        let kill_generation = generation.clone();
+        let Ok(true) = tokio::task::spawn_blocking(move || {
+            signal_runner_generation_if_authorized(&kill_generation, true, true)
+        })
+        .await
         else {
             return false;
         };
-        if !runner_generation_authorized_for_signal(generation, true) {
-            return false;
-        }
-        crate::process::worker::kill_process_group(generation.pid);
-        drop(generation_lock);
     }
     let reap_deadline = deadline.saturating_sub(started.elapsed());
     if reap_deadline.is_zero() || !wait_for_runner_exit(generation.pid, reap_deadline).await {
         return false;
     }
 
-    let delete_outcome = crate::process::worker_registry::delete_generation_if_matches(
-        &generation.session_id,
-        generation.pid,
-        &generation.socket_path,
-        generation.started_at,
-        generation.process_start_identity,
-    );
+    let delete_generation = generation.clone();
+    let Ok(delete_outcome) = tokio::task::spawn_blocking(move || {
+        crate::process::worker_registry::delete_generation_if_matches(
+            &delete_generation.session_id,
+            delete_generation.pid,
+            &delete_generation.socket_path,
+            delete_generation.started_at,
+            delete_generation.process_start_identity,
+        )
+    })
+    .await
+    else {
+        return false;
+    };
     matches!(
         delete_outcome,
         Ok(crate::process::worker_registry::GenerationDeleteOutcome::Deleted)
@@ -2175,10 +2198,17 @@ pub(crate) async fn terminate_runner_generation_with_deadline(
 /// Reap a runner that has not yet published an authenticated generation.
 /// Holding its unreaped `Child` is the authority: the OS cannot reuse the PID
 /// before this owner signals the process group.
+fn defer_unbound_runner_reap(mut child: std::process::Child) {
+    tokio::task::spawn_blocking(move || {
+        let _ = child.wait();
+    });
+}
+
 async fn terminate_unbound_runner(child: std::process::Child) -> bool {
     let mut owned_child = child;
     let pid = owned_child.id();
     if !valid_runner_pid(pid) {
+        defer_unbound_runner_reap(owned_child);
         return false;
     }
     crate::process::worker::terminate_process_group(pid);
@@ -2187,7 +2217,9 @@ async fn terminate_unbound_runner(child: std::process::Child) -> bool {
         let _ = owned_child.kill();
     }
     let exited = wait_for_runner_exit(pid, RUNNER_TERMINATION_GRACE).await;
-    drop(owned_child);
+    if !exited {
+        defer_unbound_runner_reap(owned_child);
+    }
     exited
 }
 
@@ -10520,6 +10552,31 @@ mod tests {
     async fn fresh_connect_persists_session_id_for_production_reattach() {
         use std::os::unix::process::CommandExt;
 
+        struct KillOnDrop {
+            child: Option<std::process::Child>,
+            generation: Option<RunnerGeneration>,
+        }
+
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.child.take() {
+                    crate::process::worker::kill_process_group(child.id());
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                if let Some(generation) = self.generation.take() {
+                    if signal_runner_generation_if_authorized(&generation, false, true) {
+                        let deadline = std::time::Instant::now() + RUNNER_TERMINATION_GRACE;
+                        while !runner_group_exited(generation.pid)
+                            && std::time::Instant::now() < deadline
+                        {
+                            std::thread::sleep(Duration::from_millis(25));
+                        }
+                    }
+                }
+            }
+        }
+
         let scratch = tempfile::tempdir().expect("scratch dir");
         let home = scratch.path().join("home");
         let xdg = scratch.path().join("xdg");
@@ -10568,6 +10625,10 @@ mod tests {
             .process_group(0);
         let runner = runner_command.spawn().expect("spawn production runner");
         let runner_pid = runner.id();
+        let mut cleanup = KillOnDrop {
+            child: Some(runner),
+            generation: None,
+        };
 
         let record_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let record = loop {
@@ -10585,6 +10646,7 @@ mod tests {
         assert_eq!(record.pid, runner_pid);
         let generation = RunnerGeneration::spawned(session_id.into(), runner_pid, socket.clone())
             .expect("capture fresh runner generation");
+        cleanup.generation = Some(generation.clone());
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(16);
         let (event_tx, event_rx) = mpsc::channel::<Event>(64);
@@ -10592,7 +10654,7 @@ mod tests {
         let mut client = AcpClient::connect_via_socket(
             socket.clone(),
             generation,
-            Some(runner),
+            cleanup.child.take(),
             scratch.path().to_path_buf(),
             vec![],
             ConnectMode::Fresh {
@@ -10674,6 +10736,7 @@ mod tests {
             .expect("authenticate runner for cleanup");
         assert!(terminate_runner_generation(&generation).await);
         assert!(!crate::process::worker_registry::is_pid_alive(runner_pid));
+        cleanup.generation = None;
     }
 
     #[cfg(unix)]
@@ -10699,6 +10762,89 @@ mod tests {
         assert!(terminate_unbound_runner(child).await);
         assert!(!crate::process::worker_registry::is_pid_alive(pid));
         assert!(!crate::process::worker_registry::is_pid_alive(descendant));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_unbound_runner_reap_retains_child_ownership() {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("trap '' TERM; while :; do sleep 1; done")
+            .process_group(0);
+        let child = command.spawn().expect("spawn deferred-reap fixture");
+        let pid = child.id();
+
+        defer_unbound_runner_reap(child);
+        crate::process::worker::kill_process_group(pid);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while crate::process::worker_registry::is_pid_alive(pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("deferred owner must reap the killed child");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn generation_lock_wait_does_not_block_tokio_worker() {
+        use std::os::unix::process::CommandExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", scratch.path().join("home")),
+            ("XDG_CONFIG_HOME", scratch.path().join("xdg")),
+        ]);
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("trap '' TERM; while :; do sleep 1; done")
+            .process_group(0);
+        let mut process = command.spawn().expect("spawn isolated process group");
+        let session_id = "nonblocking-generation-lock";
+        let socket = crate::process::worker_registry::socket_path_for(session_id).unwrap();
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            session_id.into(),
+            process.id(),
+            socket.clone(),
+            "fake-agent".into(),
+            "fake-agent".into(),
+            scratch.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&record).unwrap();
+        let generation = RunnerGeneration::from_record(&record, session_id, &socket).unwrap();
+        let generation_lock = crate::process::worker_registry::lock_generation(session_id).unwrap();
+        let progressed = Arc::new(AtomicBool::new(false));
+        let ticker_progressed = Arc::clone(&progressed);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            ticker_progressed.store(true, Ordering::SeqCst);
+        });
+        let unlocker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            let progressed = progressed.load(Ordering::SeqCst);
+            drop(generation_lock);
+            progressed
+        });
+
+        assert!(
+            terminate_runner_generation_with_deadline(&generation, Duration::from_secs(4)).await
+        );
+        assert!(
+            unlocker.join().expect("join generation-lock holder"),
+            "Tokio timer must run while the blocking generation lock is held"
+        );
+        let _ = process.wait();
     }
 
     #[cfg(target_os = "linux")]

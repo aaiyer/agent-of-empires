@@ -2914,9 +2914,9 @@ impl<S: BroadcastSink> Supervisor<S> {
     ///
     /// Concretely: closes the unix-socket connection (via `client
     /// .shutdown()` which sends `ClientCmd::Shutdown` to the connection
-    /// task), aborts the drain task, and writes `detached_at` into each
-    /// registry entry. The runner observes EOF on its socket read,
-    /// clears its active outbound, and goes back to accepting.
+    /// task) and aborts the drain task. The runner observes EOF on its socket
+    /// read, clears its active outbound, persists `detached_at`, and goes back
+    /// to accepting.
     pub async fn detach_all(&self) {
         let drained: Vec<(String, WorkerHandle)> = {
             let mut workers = self.workers.lock().await;
@@ -5009,6 +5009,7 @@ cursor-acp-bridge = "agent acp"
     /// the dashboard clears any "thinking" state immediately instead
     /// of waiting for the next reap tick. Covers the REST stop path
     /// (issue #1095 (C)).
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial]
     async fn shutdown_publishes_stopped_event() {
@@ -5464,7 +5465,8 @@ cursor-acp-bridge = "agent acp"
         );
     }
 
-    #[cfg(target_os = "linux")]
+    // Exact process-start authentication is implemented only on Linux and macOS.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     #[serial_test::serial]
     async fn shutdown_and_wait_timeout_retains_the_replacement_fence() {

@@ -1331,13 +1331,13 @@ impl RunnerShared {
             return replay_cached_session(method, &request, cached)
                 .map(|(_, session_id, result)| (session_id, result));
         }
+        let key = session_request_key(method, &request)?;
         let response = self
             .agent_request(agent_stdin, method, request.clone())
             .await
             .ok_or_else(|| transport_error(&format!("agent closed before answering {method}")))?;
         let result = handshake_result(&response)?;
         let acp_session_id = established_session_id(method, &request, &result)?;
-        let key = session_request_key(method, &request)?;
         let cached = (key, acp_session_id.clone(), result.clone());
         self.handshake.lock().await.session = Some(cached.clone());
         Ok((acp_session_id, result))
@@ -1353,14 +1353,12 @@ impl RunnerShared {
             .map(|(_, id, _)| id.clone())
     }
 
-    /// If a daemon re-sends a handshake request over the relay after the
-    /// runner already owns the session, answer it from cache instead of
-    /// forwarding a duplicate `initialize` / `session/*` to the
-    /// already-initialized agent. This guards the downgrade case where a v1
-    /// daemon (which drives the handshake over the relay) reattaches to a
-    /// runner a v2 daemon already handshook. Returns the synthesized
-    /// response line to send back to the daemon, or None to forward the
-    /// line to the agent unchanged.
+    /// Handle a daemon handshake request received over the relay. A cache hit
+    /// is answered locally; a cache miss is sent to the agent and cached. This
+    /// accepts any JSON request id, unlike numeric-only `parse_request`.
+    /// A string-id `session/new` with an established session is the one
+    /// carveout: it returns `None` so the relay forwards the reset unchanged
+    /// and `note_relay_session_new` can correlate its response.
     async fn intercept_handshake(
         &self,
         agent_stdin: &Mutex<tokio::process::ChildStdin>,
@@ -2306,7 +2304,7 @@ mod tests {
             "sid-a".into(),
             serde_json::json!({}),
         ));
-        let mut child = Command::new("/bin/cat")
+        let mut child = Command::new("cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .spawn()
@@ -2337,7 +2335,6 @@ mod tests {
             "cached session establishment did not match request"
         );
         child.kill().await.expect("stop inert agent fixture");
-        child.wait().await.expect("reap inert agent fixture");
     }
 
     #[tokio::test]
@@ -2348,7 +2345,7 @@ mod tests {
             "child-a".into(),
             serde_json::json!({"sessionId": "child-a"}),
         ));
-        let mut child = Command::new("/bin/cat")
+        let mut child = Command::new("cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .spawn()
@@ -2383,7 +2380,36 @@ mod tests {
         }
 
         child.kill().await.expect("stop inert agent fixture");
-        child.wait().await.expect("reap inert agent fixture");
+    }
+
+    #[tokio::test]
+    async fn malformed_session_request_never_reaches_agent_stdin() {
+        let shared = RunnerShared::new();
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn inert agent fixture");
+        let stdin = Mutex::new(child.stdin.take().expect("fixture stdin"));
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            shared.run_or_replay_session(&stdin, "session/load", serde_json::json!({})),
+        )
+        .await
+        .expect("malformed request must fail before waiting on the agent")
+        .expect_err("missing session id must fail");
+        assert_eq!(error["message"], "session/load request missing sessionId");
+
+        drop(stdin);
+        let output = child
+            .wait_with_output()
+            .await
+            .expect("reap inert agent fixture");
+        assert!(
+            output.stdout.is_empty(),
+            "agent stdin must remain untouched"
+        );
     }
 
     #[tokio::test]
@@ -2410,7 +2436,7 @@ mod tests {
         }
 
         let shared = RunnerShared::new();
-        let mut child = Command::new("/bin/cat")
+        let mut child = Command::new("cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .spawn()
@@ -2454,7 +2480,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_relay_and_control_handshake_issue_once() {
         let shared = RunnerShared::new();
-        let mut child = Command::new("/bin/cat")
+        let mut child = Command::new("cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .spawn()
@@ -2502,7 +2528,6 @@ mod tests {
             "relay and control must share one initialize effect"
         );
         child.kill().await.expect("stop inert agent fixture");
-        child.wait().await.expect("reap inert agent fixture");
     }
 
     #[test]

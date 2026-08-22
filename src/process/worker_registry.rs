@@ -638,14 +638,20 @@ pub fn mark_detached(record: &WorkerRecord) {
 /// event, so a fresh `aoe serve` knows to call `session/load` instead
 /// of `session/new` on reattach.
 pub fn update_stored_acp_session_id(record: &WorkerRecord, acp_id: Option<&str>) {
-    if let Err(e) = update_generation_if_current(record, |current| {
+    match update_generation_if_current(record, |current| {
         current.stored_acp_session_id = acp_id.filter(|s| !s.is_empty()).map(|s| s.to_string());
     }) {
-        debug!(
+        Ok(true) => {}
+        Ok(false) => debug!(
+            target: "acp.registry",
+            session = %record.session_id,
+            "skipped stored_acp_session_id update because the runner generation changed"
+        ),
+        Err(e) => debug!(
             target: "acp.registry",
             session = %record.session_id,
             "failed to update stored_acp_session_id: {e}"
-        );
+        ),
     }
 }
 
@@ -1299,7 +1305,7 @@ mod tests {
         });
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     #[serial]
     fn legacy_identity_without_reachable_or_matching_peer_fails_closed() {
