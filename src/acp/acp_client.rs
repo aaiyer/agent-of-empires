@@ -1893,13 +1893,408 @@ fn runner_socket_deadline() -> std::time::Duration {
     std::time::Duration::from_secs(10)
 }
 
+const RUNNER_TERMINATION_GRACE: Duration = Duration::from_secs(2);
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RunnerGeneration {
+    session_id: String,
+    pid: u32,
+    socket_path: PathBuf,
+    started_at: Option<u64>,
+    process_start_identity: Option<u64>,
+}
+
+impl RunnerGeneration {
+    pub(crate) fn from_record(
+        record: &crate::process::worker_registry::WorkerRecord,
+        session_id: &str,
+        socket_path: &Path,
+    ) -> Option<Self> {
+        if !valid_runner_pid(record.pid) {
+            return None;
+        }
+        let record = crate::process::worker_registry::authenticate_generation_record(
+            record,
+            session_id,
+            socket_path,
+            None,
+        )
+        .ok()
+        .flatten()?;
+        let process_start_identity = record.process_start_identity;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        process_start_identity.as_ref()?;
+        Some(Self {
+            session_id: record.session_id.clone(),
+            pid: record.pid,
+            socket_path: record.socket_path.clone(),
+            started_at: Some(record.started_at),
+            process_start_identity,
+        })
+    }
+
+    fn spawned(session_id: String, pid: u32, socket_path: PathBuf) -> Option<Self> {
+        if !valid_runner_pid(pid) {
+            return None;
+        }
+        let process_start_identity =
+            crate::process::worker_registry::process_start_identity_for(pid);
+        Some(Self {
+            session_id,
+            pid,
+            socket_path,
+            started_at: None,
+            process_start_identity,
+        })
+    }
+
+    fn bind_persisted_record(
+        &mut self,
+        peer_pid: Option<u32>,
+    ) -> Option<crate::process::worker_registry::WorkerRecord> {
+        if self.started_at.is_none() {
+            let record = crate::process::worker_registry::authenticate_spawned_generation(
+                &self.session_id,
+                self.pid,
+                &self.socket_path,
+                self.process_start_identity,
+                peer_pid,
+            )
+            .ok()
+            .flatten()?;
+            self.started_at = Some(record.started_at);
+            self.process_start_identity = record.process_start_identity;
+            return Some(record);
+        }
+
+        if peer_pid != Some(self.pid) {
+            return None;
+        }
+        let current = crate::process::worker_registry::load_existing_strict(&self.session_id)
+            .ok()
+            .flatten()?;
+        let current = crate::process::worker_registry::authenticate_generation_record(
+            &current,
+            &self.session_id,
+            &self.socket_path,
+            peer_pid,
+        )
+        .ok()
+        .flatten()?;
+        let authenticated = Self::from_record(&current, &self.session_id, &self.socket_path)?;
+        if self.session_id != authenticated.session_id
+            || self.pid != authenticated.pid
+            || self.socket_path != authenticated.socket_path
+            || self.started_at != authenticated.started_at
+            || self
+                .process_start_identity
+                .is_some_and(|identity| Some(identity) != authenticated.process_start_identity)
+        {
+            return None;
+        }
+        *self = authenticated;
+        Some(current)
+    }
+
+    pub(crate) fn matches_record(
+        &self,
+        record: &crate::process::worker_registry::WorkerRecord,
+    ) -> bool {
+        Self::from_record(record, &self.session_id, &self.socket_path).as_ref() == Some(self)
+    }
+
+    pub(crate) fn identifies_record(
+        &self,
+        record: &crate::process::worker_registry::WorkerRecord,
+    ) -> bool {
+        record.session_id == self.session_id
+            && record.pid == self.pid
+            && record.socket_path == self.socket_path
+            && Some(record.started_at) == self.started_at
+            && record.process_start_identity == self.process_start_identity
+    }
+
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
+fn registered_runner_generation(session_id: &str, socket_path: &Path) -> Option<RunnerGeneration> {
+    let record = crate::process::worker_registry::load_existing_strict(session_id)
+        .ok()
+        .flatten()?;
+    if let Some(generation) = RunnerGeneration::from_record(&record, session_id, socket_path) {
+        return Some(generation);
+    }
+    #[cfg(target_os = "macos")]
+    if record.session_id == session_id
+        && record.socket_path == socket_path
+        && valid_runner_pid(record.pid)
+        && record.process_start_identity.is_none()
+    {
+        return Some(RunnerGeneration {
+            session_id: record.session_id,
+            pid: record.pid,
+            socket_path: record.socket_path,
+            started_at: Some(record.started_at),
+            process_start_identity: None,
+        });
+    }
+    None
+}
+
+fn valid_runner_pid(pid: u32) -> bool {
+    pid > 0 && i32::try_from(pid).is_ok()
+}
+
+fn runner_generation_matches_current_record(generation: &RunnerGeneration) -> bool {
+    match crate::process::worker_registry::load_existing_strict(&generation.session_id) {
+        Ok(Some(current)) => {
+            current.session_id == generation.session_id
+                && current.pid == generation.pid
+                && current.process_start_identity == generation.process_start_identity
+                && current.socket_path == generation.socket_path
+                && generation
+                    .started_at
+                    .is_none_or(|started| current.started_at == started)
+        }
+        Ok(None) => generation.started_at.is_none(),
+        Err(_) => false,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn runner_process_identity_is_current(generation: &RunnerGeneration) -> bool {
+    generation.process_start_identity.is_some()
+        && generation.process_start_identity
+            == crate::process::worker_registry::process_start_identity_for(generation.pid)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn runner_process_identity_is_current(_generation: &RunnerGeneration) -> bool {
+    false
+}
+
+pub(crate) fn runner_generation_has_drifted(generation: &RunnerGeneration) -> bool {
+    let Ok(_generation_lock) =
+        crate::process::worker_registry::lock_generation(&generation.session_id)
+    else {
+        return false;
+    };
+    match crate::process::worker_registry::load_existing_strict(&generation.session_id) {
+        Ok(Some(_)) => {
+            !runner_generation_matches_current_record(generation)
+                || !runner_process_identity_is_current(generation)
+        }
+        Ok(None) => crate::process::worker_registry::process_start_identity_for(generation.pid)
+            .is_some_and(|identity| Some(identity) != generation.process_start_identity),
+        Err(_) => false,
+    }
+}
+
+fn runner_generation_authorized_for_signal(
+    generation: &RunnerGeneration,
+    allow_missing_after_term: bool,
+) -> bool {
+    match crate::process::worker_registry::load_existing_strict(&generation.session_id) {
+        Ok(Some(_)) => {
+            runner_generation_matches_current_record(generation)
+                && runner_process_identity_is_current(generation)
+        }
+        Ok(None) if generation.started_at.is_none() => {
+            runner_process_identity_is_current(generation)
+        }
+        Ok(None) if allow_missing_after_term => {
+            match crate::process::worker_registry::process_start_identity_for(generation.pid) {
+                Some(identity) => Some(identity) == generation.process_start_identity,
+                None => false,
+            }
+        }
+        Ok(None) | Err(_) => false,
+    }
+}
+
+/// Stop only the captured runner generation and wait for its process tree to
+/// exit before a replacement can reuse the session's sockets.
+pub(crate) async fn terminate_runner_generation(generation: &RunnerGeneration) -> bool {
+    terminate_runner_generation_with_deadline(generation, RUNNER_TERMINATION_GRACE * 2).await
+}
+
+pub(crate) async fn terminate_runner_generation_with_deadline(
+    generation: &RunnerGeneration,
+    deadline: Duration,
+) -> bool {
+    if !valid_runner_pid(generation.pid) {
+        return false;
+    }
+    let started = std::time::Instant::now();
+    let Ok(generation_lock) =
+        crate::process::worker_registry::lock_generation(&generation.session_id)
+    else {
+        return false;
+    };
+    if !runner_generation_authorized_for_signal(generation, false) {
+        return false;
+    }
+    crate::process::worker::terminate_process_group(generation.pid);
+    drop(generation_lock);
+    let term_wait = deadline
+        .saturating_sub(started.elapsed())
+        .min(RUNNER_TERMINATION_GRACE);
+    if !wait_for_runner_group_absent_without_reap(generation.pid, term_wait).await {
+        let Ok(generation_lock) =
+            crate::process::worker_registry::lock_generation(&generation.session_id)
+        else {
+            return false;
+        };
+        if !runner_generation_authorized_for_signal(generation, true) {
+            return false;
+        }
+        crate::process::worker::kill_process_group(generation.pid);
+        drop(generation_lock);
+    }
+    if !wait_for_runner_exit(generation.pid, deadline.saturating_sub(started.elapsed())).await {
+        return false;
+    }
+
+    let delete_outcome = crate::process::worker_registry::delete_generation_if_matches(
+        &generation.session_id,
+        generation.pid,
+        &generation.socket_path,
+        generation.started_at,
+        generation.process_start_identity,
+    );
+    matches!(
+        delete_outcome,
+        Ok(crate::process::worker_registry::GenerationDeleteOutcome::Deleted)
+            | Ok(crate::process::worker_registry::GenerationDeleteOutcome::Missing)
+    )
+}
+
+/// Reap a runner that has not yet published an authenticated generation.
+/// Holding its unreaped `Child` is the authority: the OS cannot reuse the PID
+/// before this owner signals the process group.
+async fn terminate_unbound_runner(child: std::process::Child) -> bool {
+    let mut owned_child = child;
+    let pid = owned_child.id();
+    if !valid_runner_pid(pid) {
+        return false;
+    }
+    crate::process::worker::terminate_process_group(pid);
+    if !wait_for_runner_group_absent_without_reap(pid, RUNNER_TERMINATION_GRACE).await {
+        crate::process::worker::kill_process_group(pid);
+        let _ = owned_child.kill();
+    }
+    let exited = wait_for_runner_exit(pid, RUNNER_TERMINATION_GRACE).await;
+    drop(owned_child);
+    exited
+}
+
+async fn wait_for_runner_group_absent_without_reap(pid: u32, deadline: Duration) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        if runner_group_absent_without_reap(pid) {
+            return true;
+        }
+        if started.elapsed() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(unix)]
+fn runner_group_absent_without_reap(pid: u32) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::killpg;
+    use nix::unistd::Pid;
+
+    matches!(killpg(Pid::from_raw(pid as i32), None), Err(Errno::ESRCH))
+}
+
+#[cfg(not(unix))]
+fn runner_group_absent_without_reap(pid: u32) -> bool {
+    !crate::process::worker::is_pid_alive(pid)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn runner_peer_pid(stream: &tokio::net::UnixStream) -> Option<u32> {
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+    let credentials = getsockopt(stream, PeerCredentials).ok()?;
+    let pid = credentials.pid();
+    (pid > 0).then_some(pid as u32)
+}
+
+#[cfg(target_os = "macos")]
+fn runner_peer_pid(stream: &tokio::net::UnixStream) -> Option<u32> {
+    use nix::sys::socket::{getsockopt, sockopt::LocalPeerPid};
+    let pid = getsockopt(stream, LocalPeerPid).ok()?;
+    (pid > 0).then_some(pid as u32)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn runner_peer_pid(_stream: &tokio::net::UnixStream) -> Option<u32> {
+    None
+}
+
+async fn cleanup_existing_runner_record(
+    record: &crate::process::worker_registry::WorkerRecord,
+    session_id: &str,
+    socket_path: &Path,
+) -> bool {
+    if crate::process::worker_registry::is_pid_alive(record.pid) {
+        let Some(generation) = RunnerGeneration::from_record(record, session_id, socket_path)
+        else {
+            return false;
+        };
+        terminate_runner_generation(&generation).await
+    } else {
+        matches!(
+            crate::process::worker_registry::delete_dead_record_if_current(record),
+            Ok(crate::process::worker_registry::GenerationDeleteOutcome::Deleted)
+                | Ok(crate::process::worker_registry::GenerationDeleteOutcome::Missing)
+        )
+    }
+}
+
+async fn wait_for_runner_exit(pid: u32, deadline: Duration) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        if runner_group_exited(pid) {
+            return true;
+        }
+        if started.elapsed() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(unix)]
+fn runner_group_exited(pid: u32) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::killpg;
+    use nix::sys::wait::{waitpid, WaitPidFlag};
+    use nix::unistd::Pid;
+
+    let group = Pid::from_raw(pid as i32);
+    let _ = waitpid(group, Some(WaitPidFlag::WNOHANG));
+    match killpg(group, None) {
+        Err(Errno::ESRCH) => true,
+        Ok(()) | Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn runner_group_exited(pid: u32) -> bool {
+    !crate::process::worker::is_pid_alive(pid)
+}
+
 /// Test-only fault injection for the #1890 regression e2e. When
 /// `AOE_ACP_TEST_FAIL_FIRST_HANDSHAKES=N` is set, the first N *fresh*-spawn
 /// ACP handshakes fail right after the runner has come up, before the daemon
-/// records an in-memory worker. The runner keeps its agent alive and its
-/// on-disk registry entry, so the daemon is left with a live, registered
-/// runner it never adopted: the exact orphan state #1890 got permanently
-/// stuck in, reproduced deterministically without depending on host timing.
+/// records an in-memory worker. The failure path must terminate that exact
+/// runner generation before returning so a retry cannot overlap its writer.
 /// Each call consumes one budgeted failure; `0` (the default, var unset) is a
 /// no-op. Debug builds only, so release can never trip it. Mirrors the
 /// `AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS` debug knob above.
@@ -2180,6 +2575,7 @@ pub struct AcpClient {
     inbound: Option<mpsc::Receiver<Event>>,
     cmd_tx: Option<mpsc::Sender<ClientCmd>>,
     pending_responders: PendingResponders,
+    runner_generation: Option<RunnerGeneration>,
     /// Hold the subprocess so it gets killed when the client is dropped.
     _child: Option<Arc<Mutex<tokio::process::Child>>>,
 }
@@ -2292,6 +2688,27 @@ struct SessionResources {
 }
 
 impl AcpClient {
+    pub(crate) fn bound_worker_record(
+        &self,
+    ) -> Option<crate::process::worker_registry::WorkerRecord> {
+        let expected = self.runner_generation.as_ref()?;
+        let current = crate::process::worker_registry::load_existing_strict(&expected.session_id)
+            .ok()
+            .flatten()?;
+        let current_generation =
+            RunnerGeneration::from_record(&current, &expected.session_id, &expected.socket_path)?;
+        (current_generation == *expected).then_some(current)
+    }
+
+    pub(crate) fn bound_runner_generation(&self) -> Option<RunnerGeneration> {
+        self.bound_worker_record()?;
+        self.runner_generation.clone()
+    }
+
+    pub(crate) fn owns_runner_generation(&self, expected: &RunnerGeneration) -> bool {
+        self.runner_generation.as_ref() == Some(expected)
+    }
+
     /// Construct a client that does not actually spawn anything. Useful
     /// for unit tests of structured view state without a real agent.
     pub fn fake_for_test(session_id: AcpSessionId) -> (Self, mpsc::Sender<Event>) {
@@ -2301,8 +2718,19 @@ impl AcpClient {
             inbound: Some(event_rx),
             cmd_tx: None,
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            runner_generation: None,
             _child: None,
         };
+        (client, event_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fake_for_test_with_runner_generation(
+        session_id: AcpSessionId,
+        runner_generation: RunnerGeneration,
+    ) -> (Self, mpsc::Sender<Event>) {
+        let (mut client, event_tx) = Self::fake_for_test(session_id);
+        client.runner_generation = Some(runner_generation);
         (client, event_tx)
     }
 
@@ -2321,6 +2749,7 @@ impl AcpClient {
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            runner_generation: None,
             _child: None,
         }
     }
@@ -2358,6 +2787,7 @@ impl AcpClient {
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            runner_generation: None,
             _child: None,
         };
         (client, event_tx, saw_delete)
@@ -2409,6 +2839,7 @@ impl AcpClient {
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            runner_generation: None,
             _child: None,
         };
         (client, event_tx, cmds)
@@ -2446,6 +2877,7 @@ impl AcpClient {
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            runner_generation: None,
             _child: None,
         };
         (client, event_tx)
@@ -2516,10 +2948,39 @@ impl AcpClient {
             // runner's whole process group and clear its stale entry/socket
             // before binding the replacement. No-op when there is no live
             // prior runner. See #1689.
-            crate::process::worker_registry::terminate(&session_id.0);
-            spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)?;
+            match crate::process::worker_registry::load_existing_strict(&session_id.0) {
+                Ok(Some(record)) => {
+                    let cleaned =
+                        cleanup_existing_runner_record(&record, &session_id.0, &socket_path).await;
+                    if !cleaned {
+                        return Err(AcpError::Spawn(format!(
+                            "prior runner {} did not exit after bounded cleanup",
+                            record.pid
+                        )));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(AcpError::Spawn(format!(
+                        "cannot authenticate prior runner generation: {error}"
+                    )));
+                }
+            }
+            let runner_child =
+                spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)?;
+            let runner_pid = runner_child.id();
+            let Some(runner_generation) =
+                RunnerGeneration::spawned(session_id.0.clone(), runner_pid, socket_path.clone())
+            else {
+                terminate_unbound_runner(runner_child).await;
+                return Err(AcpError::Spawn(
+                    "cannot retain spawned runner process ownership".into(),
+                ));
+            };
             return Self::connect_via_socket(
                 socket_path,
+                runner_generation,
+                Some(runner_child),
                 config.cwd,
                 config.additional_dirs,
                 mode,
@@ -2665,6 +3126,7 @@ impl AcpClient {
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
             pending_responders,
+            runner_generation: None,
             _child: Some(child),
         })
     }
@@ -2678,6 +3140,8 @@ impl AcpClient {
     #[allow(clippy::too_many_arguments)]
     async fn connect_via_socket(
         socket_path: PathBuf,
+        mut runner_generation: RunnerGeneration,
+        mut spawned_child: Option<std::process::Child>,
         cwd: PathBuf,
         additional_dirs: Vec<PathBuf>,
         mode: ConnectMode,
@@ -2699,17 +3163,43 @@ impl AcpClient {
         // binds before it spawns the agent so this is usually fast (a
         // few ms) but bound the wait so a wedged runner returns a typed
         // error instead of parking the supervisor.
-        let stream = wait_for_socket(&socket_path, runner_socket_deadline()).await?;
+        let stream = match wait_for_socket(&socket_path, runner_socket_deadline()).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                if let Some(child) = spawned_child.take() {
+                    terminate_unbound_runner(child).await;
+                } else {
+                    terminate_runner_generation(&runner_generation).await;
+                }
+                return Err(error);
+            }
+        };
+        let peer_pid = runner_peer_pid(&stream);
+        if runner_generation.bind_persisted_record(peer_pid).is_none() {
+            drop(stream);
+            if let Some(child) = spawned_child.take() {
+                terminate_unbound_runner(child).await;
+            } else {
+                terminate_runner_generation(&runner_generation).await;
+            }
+            return Err(AcpError::Spawn(
+                "runner generation changed before socket authentication completed".into(),
+            ));
+        }
+        // `std::process::Child` does not kill on drop. The authenticated
+        // persisted generation is now the sole cleanup authority.
+        drop(spawned_child.take());
         // #1890 regression hook (debug-only): simulate a fresh-spawn whose
         // daemon-side handshake fails after the runner is already up and
         // registered. Dropping the socket closes the daemon's end cleanly; the
-        // runner keeps its agent alive and its registry entry, leaving the
-        // orphaned-but-live-runner state the readopt pass must recover from.
+        // failure path must terminate the exact registered generation before
+        // a retry can start another writer.
         // Gated on `Fresh` so the recovery reattach/respawn is never failed,
         // and budgeted by the env var so only the first spawn trips.
         #[cfg(debug_assertions)]
         if matches!(mode, ConnectMode::Fresh { .. }) && take_injected_fresh_handshake_failure() {
             drop(stream);
+            terminate_runner_generation(&runner_generation).await;
             return Err(AcpError::Spawn(
                 "injected fresh-handshake failure (AOE_ACP_TEST_FAIL_FIRST_HANDSHAKES)".into(),
             ));
@@ -2753,6 +3243,7 @@ impl AcpClient {
         let prompt_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let control_client = connect_runner_control_v2(
             &socket_path,
+            &runner_generation,
             event_tx.clone(),
             session_label.clone(),
             guard.clone(),
@@ -2794,13 +3285,18 @@ impl AcpClient {
             .instrument(conn_span),
         );
 
-        wait_for_handshake(&session_label, ready_rx, None, &install_binary).await?;
-
+        if let Err(error) =
+            wait_for_handshake(&session_label, ready_rx, None, &install_binary).await
+        {
+            terminate_runner_generation(&runner_generation).await;
+            return Err(error);
+        }
         Ok(Self {
             session_id,
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
             pending_responders,
+            runner_generation: Some(runner_generation),
             _child: None,
         })
     }
@@ -2859,8 +3355,12 @@ impl AcpClient {
             .get(&agent_key)
             .map(|spec| spec.command.clone())
             .unwrap_or_default();
+        let runner_generation = registered_runner_generation(&session_id.0, &socket_path)
+            .ok_or_else(|| AcpError::Spawn("runner generation missing before attach".into()))?;
         Self::connect_via_socket(
             socket_path,
+            runner_generation,
+            None,
             cwd,
             additional_dirs,
             mode,
@@ -3503,16 +4003,15 @@ fn push_subdirs(out: &mut Vec<std::path::PathBuf>, root: &std::path::Path, leaf:
 }
 
 /// Spawn the `aoe __acp-runner` shim as a detached process. The
-/// runner owns the agent subprocess and outlives the daemon. We retain
-/// no `Child` handle here; once the runner is up, the daemon talks to
-/// it over the unix socket and the OS keeps the runner alive across
-/// `aoe serve` restarts.
+/// runner owns the agent subprocess and outlives the daemon. The caller keeps
+/// the `Child` only until the runner's published generation is authenticated;
+/// dropping it after that does not stop the detached process.
 fn spawn_runner_detached(
     config: &SpawnConfig,
     socket_path: &std::path::Path,
     session_id: String,
     session_sandbox: Option<&SessionSandbox>,
-) -> Result<(), AcpError> {
+) -> Result<std::process::Child, AcpError> {
     use std::process::Command as StdCommand;
     let current_exe =
         std::env::current_exe().map_err(|e| AcpError::Spawn(format!("current_exe: {e}")))?;
@@ -3740,7 +4239,7 @@ fn spawn_runner_detached(
         "spawning detached structured view runner"
     );
 
-    cmd.spawn().map_err(|e| {
+    let child = cmd.spawn().map_err(|e| {
         warn!(
             target: "acp.protocol.spawn",
             session = %session_id,
@@ -3748,10 +4247,7 @@ fn spawn_runner_detached(
         );
         AcpError::Spawn(format!("spawn runner: {e}"))
     })?;
-    // Drop the std::process::Child here. std::process::Command doesn't
-    // wait on drop, so the runner stays alive. setsid + nohup-equivalent
-    // make this an actual detach.
-    Ok(())
+    Ok(child)
 }
 
 /// Result of constructing the `docker exec` argv for a sandboxed structured view
@@ -4146,6 +4642,7 @@ impl DaemonControlClient {
 /// falls back to the byte-relay handshake plus the resume-idle watchdog.
 async fn connect_runner_control_v2(
     main_socket: &std::path::Path,
+    runner_generation: &RunnerGeneration,
     event_tx: mpsc::Sender<Event>,
     session_label: String,
     terminal_claim: Arc<TerminalClaim>,
@@ -4161,12 +4658,19 @@ async fn connect_runner_control_v2(
     let bound = std::time::Duration::from_secs(2);
     let dial = async {
         let stream = tokio::net::UnixStream::connect(&control_path).await.ok()?;
+        if runner_peer_pid(&stream) != Some(runner_generation.pid)
+            || !runner_process_identity_is_current(runner_generation)
+        {
+            return None;
+        }
         let (mut read_half, mut write_half) = stream.into_split();
         match control_protocol::read_frame(&mut read_half).await {
             Ok(Some(ControlBody::Hello {
                 control_protocol_version,
-                ..
-            })) if control_protocol_version == control_protocol::CONTROL_PROTOCOL_VERSION => {}
+                session_id,
+            })) if control_protocol_version == control_protocol::CONTROL_PROTOCOL_VERSION
+                && session_id == session_label
+                && runner_process_identity_is_current(runner_generation) => {}
             _ => return None,
         }
         control_protocol::write_frame(
@@ -9257,7 +9761,7 @@ async fn wait_for_handshake(
     child: Option<&Arc<Mutex<tokio::process::Child>>>,
     install_binary: &str,
 ) -> Result<(), AcpError> {
-    let timeout = std::time::Duration::from_secs(30);
+    let timeout = handshake_timeout();
     match tokio::time::timeout(timeout, ready_rx).await {
         Ok(Ok(Ok(()))) => Ok(()),
         Ok(Ok(Err(e))) => {
@@ -9291,6 +9795,16 @@ async fn wait_for_handshake(
             )))
         }
     }
+}
+
+fn handshake_timeout() -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(raw) = std::env::var("AOE_ACP_HANDSHAKE_TIMEOUT_MS") {
+        if let Ok(ms) = raw.parse::<u64>() {
+            return std::time::Duration::from_millis(ms.max(50));
+        }
+    }
+    std::time::Duration::from_secs(30)
 }
 
 async fn collect_child_failure(child: Option<&Arc<Mutex<tokio::process::Child>>>) {
@@ -9904,6 +10418,552 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
     use tracing_test::traced_test;
+
+    #[test]
+    fn runner_generation_rejects_process_group_sentinels() {
+        assert!(!valid_runner_pid(0));
+        assert!(!valid_runner_pid((i32::MAX as u32) + 1));
+        assert!(valid_runner_pid(1));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spawn_supersede_cleanup_deletes_dead_record_with_persisted_identity() {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let home = scratch.path().join("home");
+        let xdg = scratch.path().join("xdg");
+        std::fs::create_dir_all(&home).expect("home dir");
+        std::fs::create_dir_all(&xdg).expect("xdg dir");
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", home),
+            ("XDG_CONFIG_HOME", xdg),
+        ]);
+        let session_id = "dead-supersede";
+        let socket =
+            crate::process::worker_registry::socket_path_for(session_id).expect("socket path");
+        let mut record = crate::process::worker_registry::WorkerRecord::new(
+            session_id.into(),
+            2_000_000_000,
+            socket.clone(),
+            "fake-agent".into(),
+            "fake-agent".into(),
+            scratch.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        record.process_start_identity = Some(1234);
+        crate::process::worker_registry::save(&record).expect("save dead record");
+
+        assert!(cleanup_existing_runner_record(&record, session_id, &socket).await);
+        assert!(crate::process::worker_registry::load(session_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bound_worker_record_never_adopts_replacement_generation() {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let home = scratch.path().join("home");
+        let xdg = scratch.path().join("xdg");
+        std::fs::create_dir_all(&home).expect("home dir");
+        std::fs::create_dir_all(&xdg).expect("xdg dir");
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", home),
+            ("XDG_CONFIG_HOME", xdg),
+        ]);
+        let session_id = "metadata-owner";
+        let socket =
+            crate::process::worker_registry::socket_path_for(session_id).expect("socket path");
+        let old = crate::process::worker_registry::WorkerRecord::new(
+            session_id.into(),
+            std::process::id(),
+            socket.clone(),
+            "fake-agent".into(),
+            "fake-agent".into(),
+            scratch.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&old).unwrap();
+        let generation = RunnerGeneration::from_record(&old, session_id, &socket).unwrap();
+        let (mut client, _) = AcpClient::fake_for_test(AcpSessionId(session_id.into()));
+        client.runner_generation = Some(generation);
+        let replacement = crate::process::worker_registry::WorkerRecord {
+            pid: old.pid.saturating_add(1),
+            process_start_identity: Some(4242),
+            started_at: old.started_at.saturating_add(1),
+            ..old
+        };
+        crate::process::worker_registry::save(&replacement).unwrap();
+
+        assert!(client.bound_worker_record().is_none());
+        assert_eq!(
+            crate::process::worker_registry::load(session_id)
+                .unwrap()
+                .unwrap()
+                .pid,
+            replacement.pid
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn fresh_connect_persists_session_id_for_production_reattach() {
+        use std::os::unix::process::CommandExt;
+
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let home = scratch.path().join("home");
+        let xdg = scratch.path().join("xdg");
+        std::fs::create_dir_all(&home).expect("home dir");
+        std::fs::create_dir_all(&xdg).expect("xdg dir");
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", home),
+            ("XDG_CONFIG_HOME", xdg),
+        ]);
+        let (agent_script, capture) = write_reset_fake_agent(scratch.path(), 0, 0, 0);
+        let session_id = "fresh-production-owner";
+        let socket =
+            crate::process::worker_registry::socket_path_for(session_id).expect("socket path");
+        let mut aoe_binary = std::env::current_exe().expect("current test executable");
+        aoe_binary.pop();
+        if aoe_binary.ends_with("deps") {
+            aoe_binary.pop();
+        }
+        aoe_binary.push("aoe");
+        assert!(
+            aoe_binary.is_file(),
+            "aoe test binary at {}",
+            aoe_binary.display()
+        );
+
+        let mut runner_command = std::process::Command::new(&aoe_binary);
+        runner_command
+            .args([
+                "__acp-runner",
+                "--socket",
+                socket.to_str().unwrap(),
+                "--session-id",
+                session_id,
+                "--agent-name",
+                agent_script.to_str().unwrap(),
+                "--agent-key",
+                "codex",
+                "--cwd",
+                scratch.path().to_str().unwrap(),
+                "--",
+                agent_script.to_str().unwrap(),
+            ])
+            .env("HOME", scratch.path().join("home"))
+            .env("XDG_CONFIG_HOME", scratch.path().join("xdg"))
+            .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
+            .process_group(0);
+        let runner = runner_command.spawn().expect("spawn production runner");
+        let runner_pid = runner.id();
+
+        let record_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let record = loop {
+            if let Some(record) = crate::process::worker_registry::load_existing_strict(session_id)
+                .expect("load runner record")
+            {
+                break record;
+            }
+            assert!(
+                tokio::time::Instant::now() < record_deadline,
+                "runner record did not appear"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(record.pid, runner_pid);
+        let generation = RunnerGeneration::spawned(session_id.into(), runner_pid, socket.clone())
+            .expect("capture fresh runner generation");
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(16);
+        let (event_tx, event_rx) = mpsc::channel::<Event>(64);
+        let pending_responders: PendingResponders = Arc::new(Mutex::new(HashMap::new()));
+        let mut client = AcpClient::connect_via_socket(
+            socket.clone(),
+            generation,
+            Some(runner),
+            scratch.path().to_path_buf(),
+            vec![],
+            ConnectMode::Fresh {
+                stored_acp_session_id: None,
+                seed_history_replay: false,
+                fork_from: None,
+            },
+            AcpSessionId(session_id.into()),
+            pending_responders,
+            cmd_tx,
+            cmd_rx,
+            event_tx,
+            event_rx,
+            None,
+            agent_profiles::resolve("codex"),
+            agent_script.to_string_lossy().into_owned(),
+            None,
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("fresh production connect");
+        let assigned = loop {
+            match tokio::time::timeout(Duration::from_secs(10), client.next_event())
+                .await
+                .expect("assigned event timeout")
+                .expect("fresh event stream open")
+            {
+                Event::AcpSessionAssigned { acp_session_id } => break acp_session_id,
+                _ => continue,
+            }
+        };
+        let bound = client
+            .bound_worker_record()
+            .expect("fresh client exposes fully bound runner record");
+        crate::process::worker_registry::update_stored_acp_session_id(&bound, Some(&assigned));
+        let persisted = crate::process::worker_registry::load(session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted.stored_acp_session_id.as_deref(),
+            Some(assigned.as_str())
+        );
+        drop(client);
+
+        let attached = AcpClient::attach(
+            socket.clone(),
+            scratch.path().to_path_buf(),
+            vec![],
+            assigned,
+            false,
+            AcpSessionId(session_id.into()),
+            None,
+            "codex".into(),
+            None,
+        )
+        .await
+        .expect("production reattach with persisted session id");
+        let attached_record = attached
+            .bound_worker_record()
+            .expect("reattach retains exact persisted generation");
+        assert_eq!(attached_record.started_at, persisted.started_at);
+        assert_eq!(
+            attached_record.process_start_identity,
+            persisted.process_start_identity
+        );
+        assert_eq!(
+            std::fs::read_to_string(capture)
+                .expect("read fake agent capture")
+                .matches("\"method\":\"session/new\"")
+                .count(),
+            1,
+            "reattach must not create a replacement ACP session"
+        );
+        drop(attached);
+
+        let generation = RunnerGeneration::from_record(&attached_record, session_id, &socket)
+            .expect("authenticate runner for cleanup");
+        assert!(terminate_runner_generation(&generation).await);
+        assert!(!crate::process::worker_registry::is_pid_alive(runner_pid));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unbound_runner_cleanup_uses_retained_child_ownership() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 30 & echo $!; wait")
+            .stdout(Stdio::piped())
+            .process_group(0);
+        let mut child = command.spawn().expect("spawn unbound runner fixture");
+        let pid = child.id();
+        let mut descendant = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("fixture stdout"))
+            .read_line(&mut descendant)
+            .expect("read descendant pid");
+        let descendant: u32 = descendant.trim().parse().expect("descendant pid");
+
+        assert!(terminate_unbound_runner(child).await);
+        assert!(!crate::process::worker_registry::is_pid_alive(pid));
+        assert!(!crate::process::worker_registry::is_pid_alive(descendant));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn exact_generation_teardown_honors_its_deadline() {
+        use std::os::unix::process::CommandExt;
+
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", scratch.path().join("home")),
+            ("XDG_CONFIG_HOME", scratch.path().join("xdg")),
+        ]);
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("trap '' TERM; while :; do sleep 1; done")
+            .process_group(0);
+        let mut process = command.spawn().expect("spawn TERM-ignoring group");
+        let pid = process.id();
+        let session_id = "bounded-generation-teardown";
+        let socket = crate::process::worker_registry::socket_path_for(session_id).unwrap();
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            session_id.into(),
+            pid,
+            socket.clone(),
+            "fake-agent".into(),
+            "fake-agent".into(),
+            scratch.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&record).unwrap();
+        let generation = RunnerGeneration::from_record(&record, session_id, &socket).unwrap();
+
+        let started = std::time::Instant::now();
+        assert!(
+            !terminate_runner_generation_with_deadline(&generation, Duration::from_millis(100))
+                .await,
+            "a hard deadline must report NotProvenDead until the child is reaped"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let retained = crate::process::worker_registry::load_existing_strict(session_id)
+            .unwrap()
+            .expect("uncertain teardown retains the exact generation fence");
+        assert_eq!(retained.pid, record.pid);
+        assert_eq!(retained.socket_path, record.socket_path);
+        assert_eq!(
+            retained.process_start_identity,
+            record.process_start_identity
+        );
+        assert_eq!(retained.started_at, record.started_at);
+        let _ = process.wait();
+        assert!(!crate::process::worker_registry::is_pid_alive(pid));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bound_macos_generation_never_signals_replacement_record() {
+        use std::os::unix::process::CommandExt;
+
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let home = scratch.path().join("home");
+        let xdg = scratch.path().join("xdg");
+        std::fs::create_dir_all(&home).expect("home dir");
+        std::fs::create_dir_all(&xdg).expect("xdg dir");
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", home.clone()),
+            ("XDG_CONFIG_HOME", xdg),
+        ]);
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30").process_group(0);
+        let mut process = command.spawn().expect("spawn isolated process group");
+        let session_id = "macos-generation-drift";
+        let socket =
+            crate::process::worker_registry::socket_path_for(session_id).expect("socket path");
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            session_id.into(),
+            process.id(),
+            socket.clone(),
+            "fake-agent".into(),
+            "fake-agent".into(),
+            home,
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&record).expect("save original generation");
+        let wrong_identity = crate::process::worker_registry::WorkerRecord {
+            process_start_identity: record.process_start_identity.map(|identity| identity + 1),
+            ..record.clone()
+        };
+        crate::process::worker_registry::save(&wrong_identity)
+            .expect("publish same-pid wrong-start replacement");
+        assert!(RunnerGeneration::from_record(&wrong_identity, session_id, &socket).is_none());
+        assert!(crate::process::worker_registry::is_pid_alive(process.id()));
+        crate::process::worker_registry::save(&record).expect("restore original generation");
+        let generation = RunnerGeneration::from_record(&record, session_id, &socket)
+            .expect("bind original generation");
+        crate::process::worker_registry::save(&crate::process::worker_registry::WorkerRecord {
+            started_at: record.started_at.saturating_add(1),
+            ..record
+        })
+        .expect("publish replacement generation");
+
+        assert!(!terminate_runner_generation(&generation).await);
+        assert!(crate::process::worker_registry::is_pid_alive(process.id()));
+
+        crate::process::worker::kill_process_group(process.id());
+        let _ = process.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn runner_generation_drift_never_signals_either_process_group() {
+        use std::os::unix::process::CommandExt;
+
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let home = scratch.path().join("home");
+        let xdg = scratch.path().join("xdg");
+        std::fs::create_dir_all(&home).expect("home dir");
+        std::fs::create_dir_all(&xdg).expect("xdg dir");
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", home.clone()),
+            ("XDG_CONFIG_HOME", xdg),
+        ]);
+
+        let spawn_group = || {
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30").process_group(0);
+            command.spawn().expect("spawn isolated process group")
+        };
+        let mut old = spawn_group();
+        let mut replacement = spawn_group();
+        let session_id = "generation-drift";
+        let socket =
+            crate::process::worker_registry::socket_path_for(session_id).expect("canonical socket");
+        let old_record = crate::process::worker_registry::WorkerRecord::new(
+            session_id.into(),
+            old.id(),
+            socket.clone(),
+            "fake-agent".into(),
+            "fake-agent".into(),
+            home,
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&old_record).expect("save old generation");
+        let stale_identity_record = crate::process::worker_registry::WorkerRecord {
+            process_start_identity: old_record
+                .process_start_identity
+                .map(|identity| identity + 1),
+            ..old_record.clone()
+        };
+        crate::process::worker_registry::save(&stale_identity_record)
+            .expect("save stale process identity");
+        assert!(
+            RunnerGeneration::from_record(&stale_identity_record, session_id, &socket).is_none()
+        );
+        assert!(crate::process::worker_registry::is_pid_alive(old.id()));
+        crate::process::worker_registry::save(&old_record).expect("restore old generation");
+        let stale_legacy_record = crate::process::worker_registry::WorkerRecord {
+            process_start_identity: None,
+            ..old_record.clone()
+        };
+        if let Some(stale_legacy_generation) =
+            RunnerGeneration::from_record(&stale_legacy_record, session_id, &socket)
+        {
+            let _ = terminate_runner_generation(&stale_legacy_generation).await;
+        }
+        assert!(crate::process::worker_registry::is_pid_alive(old.id()));
+        let generation = RunnerGeneration::from_record(&old_record, session_id, &socket)
+            .expect("capture old generation");
+        let mut wrong_process = generation.clone();
+        wrong_process.process_start_identity =
+            wrong_process.process_start_identity.map(|id| id + 1);
+        assert!(!terminate_runner_generation(&wrong_process).await);
+        assert!(crate::process::worker_registry::is_pid_alive(old.id()));
+        let replacement_record = crate::process::worker_registry::WorkerRecord {
+            pid: replacement.id(),
+            process_start_identity: crate::process::worker_registry::process_start_identity_for(
+                replacement.id(),
+            ),
+            started_at: old_record.started_at.saturating_add(1),
+            ..old_record
+        };
+        crate::process::worker_registry::save(&replacement_record)
+            .expect("publish replacement generation");
+
+        assert!(!terminate_runner_generation(&generation).await);
+        assert!(crate::process::worker_registry::is_pid_alive(old.id()));
+        assert!(crate::process::worker_registry::is_pid_alive(
+            replacement.id()
+        ));
+
+        crate::process::worker::kill_process_group(old.id());
+        crate::process::worker::kill_process_group(replacement.id());
+        let _ = old.wait();
+        let _ = replacement.wait();
+
+        let term_seen = scratch.path().join("term-seen");
+        let mut stubborn_command = std::process::Command::new("sh");
+        stubborn_command
+            .arg("-c")
+            .arg("trap 'touch \"$TERM_SEEN\"' TERM; while :; do sleep 1; done")
+            .env("TERM_SEEN", &term_seen)
+            .process_group(0);
+        let mut stubborn = stubborn_command.spawn().expect("spawn TERM-ignoring group");
+        let mut successor = spawn_group();
+        let stubborn_record = crate::process::worker_registry::WorkerRecord::new(
+            session_id.into(),
+            stubborn.id(),
+            socket.clone(),
+            "fake-agent".into(),
+            "fake-agent".into(),
+            scratch.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&stubborn_record).expect("save stubborn generation");
+        let stubborn_generation =
+            RunnerGeneration::from_record(&stubborn_record, session_id, &socket)
+                .expect("capture stubborn generation");
+        let teardown =
+            tokio::spawn(async move { terminate_runner_generation(&stubborn_generation).await });
+        for _ in 0..300 {
+            if term_seen.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(term_seen.exists(), "fixture must observe initial SIGTERM");
+        let successor_record = crate::process::worker_registry::WorkerRecord {
+            pid: successor.id(),
+            process_start_identity: crate::process::worker_registry::process_start_identity_for(
+                successor.id(),
+            ),
+            started_at: stubborn_record.started_at.saturating_add(1),
+            ..stubborn_record
+        };
+        crate::process::worker_registry::save(&successor_record)
+            .expect("publish successor before SIGKILL escalation");
+        assert!(!teardown.await.expect("teardown task"));
+        assert!(crate::process::worker_registry::is_pid_alive(stubborn.id()));
+        assert!(crate::process::worker_registry::is_pid_alive(
+            successor.id()
+        ));
+
+        crate::process::worker::kill_process_group(stubborn.id());
+        crate::process::worker::kill_process_group(successor.id());
+        let _ = stubborn.wait();
+        let _ = successor.wait();
+    }
 
     /// `ModelConfig` is a category upstream already names, so it must map
     /// through the explicit arm: the catch-all's "bump claude-agent-acp"
@@ -15678,6 +16738,11 @@ done
         }
     }
 
+    fn control_test_generation(main_socket: &Path) -> RunnerGeneration {
+        RunnerGeneration::spawned("s".into(), std::process::id(), main_socket.to_path_buf())
+            .expect("test process has a valid generation")
+    }
+
     /// Daemon-side control consumer (#2976 Phase B): a v2 runner that greets
     /// with a matching `Hello` and then reports `PromptCompleted` for an
     /// adopted turn (no prompt awaiting on this daemon) drives an
@@ -15729,6 +16794,7 @@ done
         let prompt_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let client = connect_runner_control_v2(
             &main_socket,
+            &control_test_generation(&main_socket),
             event_tx,
             "s".into(),
             guard.clone(),
@@ -15781,6 +16847,7 @@ done
         let guard = Arc::new(TerminalClaim::new());
         let client = connect_runner_control_v2(
             &main_socket,
+            &control_test_generation(&main_socket),
             event_tx,
             "s".into(),
             guard.clone(),
@@ -15801,6 +16868,59 @@ done
             "no Stopped emitted on version mismatch"
         );
         let _ = fake.await;
+    }
+
+    #[tokio::test]
+    async fn runner_control_rejects_wrong_peer_or_session_identity() {
+        use crate::acp::control_protocol::{self, ControlBody};
+        use tokio::net::UnixListener;
+
+        for (wrong_pid, wrong_start, hello_session) in [
+            (true, false, "s"),
+            (false, true, "s"),
+            (false, false, "replacement-session"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let main_socket = tmp.path().join("s.sock");
+            let control = crate::process::worker::control_socket_sibling(&main_socket);
+            let listener = UnixListener::bind(&control).unwrap();
+            let fake = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (_r, mut w) = stream.into_split();
+                let _ = control_protocol::write_frame(
+                    &mut w,
+                    &ControlBody::Hello {
+                        control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+                        session_id: hello_session.into(),
+                    },
+                )
+                .await;
+            });
+            let (event_tx, _) = mpsc::channel::<Event>(1);
+            let mut generation = control_test_generation(&main_socket);
+            if wrong_pid {
+                generation.pid = generation.pid.saturating_add(1);
+            }
+            if wrong_start {
+                generation.process_start_identity = generation
+                    .process_start_identity
+                    .map(|identity| identity + 1);
+            }
+            assert!(
+                connect_runner_control_v2(
+                    &main_socket,
+                    &generation,
+                    event_tx,
+                    "s".into(),
+                    Arc::new(TerminalClaim::new()),
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                )
+                .await
+                .is_none(),
+                "a replacement peer or session identity must not control the runner"
+            );
+            fake.await.expect("fake control server");
+        }
     }
 
     /// The one-shot guard this replaced could be claimed once per CONNECTION,
@@ -15850,6 +16970,7 @@ done
         let guard = Arc::new(TerminalClaim::new());
         let client = connect_runner_control_v2(
             &main_socket,
+            &control_test_generation(&main_socket),
             event_tx,
             "s".into(),
             guard.clone(),

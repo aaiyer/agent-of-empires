@@ -421,7 +421,8 @@ pub struct Supervisor<S: BroadcastSink> {
     /// hard-killing the turn. The reconciler's per-tick drain check
     /// respawns these on the current binary once the turn finishes. See
     /// #1754.
-    build_respawn_pending: Arc<std::sync::Mutex<HashSet<String>>>,
+    build_respawn_pending:
+        Arc<std::sync::Mutex<HashMap<String, super::acp_client::RunnerGeneration>>>,
     /// Sessions currently parked on a per-adapter compatibility rejection,
     /// mapped to the binary that failed the check. Populated at every
     /// `IncompatibleAgent` publish site, cleared on a successful (re)spawn.
@@ -672,7 +673,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             warmed_up_agents: Arc::new(std::sync::Mutex::new(HashSet::new())),
             agent_warmup_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             worker_notify: Arc::new(tokio::sync::Notify::new()),
-            build_respawn_pending: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            build_respawn_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
             incompatible_binaries: Arc::new(std::sync::Mutex::new(HashMap::new())),
             force_respawn: Arc::new(std::sync::Mutex::new(HashSet::new())),
             max_concurrent_workers,
@@ -682,23 +683,40 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Flag a session whose build-stale worker was adopted to drain an
     /// in-flight turn; the reconciler respawns it on the current binary
     /// at the next idle boundary. Idempotent. See #1754.
-    pub fn mark_build_respawn_pending(&self, session_id: &str) {
-        lock_recover(&self.build_respawn_pending).insert(session_id.to_string());
+    pub(crate) fn mark_build_respawn_pending(
+        &self,
+        session_id: &str,
+        generation: super::acp_client::RunnerGeneration,
+    ) {
+        insert_build_respawn_pending(&self.build_respawn_pending, session_id, generation);
     }
 
-    /// Snapshot the sessions awaiting a post-drain respawn. The reconciler
-    /// polls this each tick and respawns those that have gone idle.
-    pub fn build_respawn_pending_ids(&self) -> Vec<String> {
+    /// Snapshot the exact runner generations awaiting a post-drain respawn.
+    /// The reconciler polls this each tick and respawns those that have gone
+    /// idle without rediscovering process authority from the session id.
+    pub(crate) fn build_respawn_pending_generations(
+        &self,
+    ) -> Vec<(String, super::acp_client::RunnerGeneration)> {
         lock_recover(&self.build_respawn_pending)
             .iter()
-            .cloned()
+            .map(|(session_id, generation)| (session_id.clone(), generation.clone()))
             .collect()
     }
 
-    /// Drop a session from the pending set once it has been respawned (or
-    /// is gone). Idempotent.
-    pub fn clear_build_respawn_pending(&self, session_id: &str) {
-        lock_recover(&self.build_respawn_pending).remove(session_id);
+    /// Drop only the captured generation once it has been reaped or
+    /// superseded. A newer generation parked under the same session id is
+    /// left untouched.
+    pub(crate) fn clear_build_respawn_pending(
+        &self,
+        session_id: &str,
+        generation: &super::acp_client::RunnerGeneration,
+    ) -> bool {
+        let mut pending = lock_recover(&self.build_respawn_pending);
+        if pending.get(session_id) != Some(generation) {
+            return false;
+        }
+        pending.remove(session_id);
+        true
     }
 
     /// Record that a session is parked on a compatibility rejection for
@@ -1067,9 +1085,13 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// in-process event_tx on the failed AcpClient never delivers) and
     /// socket-mode workers don't survive a compatibility rejection. On
     /// non-compat errors this is a no-op.
-    fn publish_compat_rejection(&self, session_id: &str, err: &AcpError) {
+    async fn publish_compat_rejection(
+        &self,
+        session_id: &str,
+        err: &AcpError,
+    ) -> Result<(), SupervisorError> {
         let AcpError::IncompatibleAgent(payload) = err else {
-            return;
+            return Ok(());
         };
         self.publish_next(
             session_id,
@@ -1083,12 +1105,10 @@ impl<S: BroadcastSink> Supervisor<S> {
                 message: payload.message.clone(),
             },
         );
-        // SIGTERM the detached runner so a stale claude-agent-acp@0.32.0
-        // child doesn't keep the worker socket alive. `terminate_runner_for_session`
-        // also deletes the registry entry so a retry via the API doesn't
-        // hit AlreadyRunning. Idempotent: it's a no-op if the registry
-        // entry is missing or the PID is dead. No-op on non-unix.
-        terminate_runner_for_session(session_id);
+        // AcpClient owns and tears down the exact runner generation on every
+        // failed handshake. Do not rediscover a mutable session record here:
+        // a concurrent retry may already have published its replacement.
+        Ok(())
     }
 
     /// Publish a synthetic `AgentSwitched` event after a successful
@@ -1160,59 +1180,16 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         deadline: std::time::Duration,
     ) -> Result<(), SupervisorError> {
-        // Snapshot the runner's PID BEFORE shutdown removes the registry
-        // entry AND unlinks the socket, so we can poll for the process
-        // to actually die. `pid_source_for` reads the on-disk record and
-        // falls back to `SO_PEERCRED` on the socket when the record is
-        // unreadable at the I/O layer, so an unreadable record no longer
-        // collapses into a silent-skip. See #2102.
-        let pid_before = crate::process::worker_registry::pid_source_for(session_id);
-        match self.shutdown(session_id).await {
+        match self
+            .shutdown_with_reason(session_id, "user_stopped", false, true, Some(deadline))
+            .await
+        {
             Ok(()) => {}
             Err(SupervisorError::UnknownSession(_)) => {
                 // Nothing to wait on; the caller can move on to spawn.
                 return Ok(());
             }
             Err(e) => return Err(e),
-        }
-        // Poll for the runner subprocess to exit so its socket file
-        // releases. ~deadline/100ms tick; usually claude-agent-acp dies
-        // in <500ms once SIGTERM lands.
-        #[cfg(unix)]
-        if let Some(pid) = pid_before {
-            let start = std::time::Instant::now();
-            while start.elapsed() < deadline {
-                if !crate::process::worker_registry::is_pid_alive(pid) {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            // Best-effort socket file removal: the new spawn will bind
-            // <workers_dir>/<session_id>.sock, so a stale inode from
-            // the old runner would collide. terminate_runner_for_session
-            // already removed the registry entry; this cleans up the
-            // socket. Failures (already gone, no perms) are non-fatal.
-            if let Ok(socket_path) = crate::process::worker_registry::socket_path_for(session_id) {
-                if socket_path.exists() {
-                    let _ = std::fs::remove_file(&socket_path);
-                }
-            }
-        }
-        // Acp currently runs over Unix sockets only; reaching this
-        // function on a non-Unix host means somebody added a non-Unix
-        // backend without porting the PID-wait + socket-cleanup above.
-        // Warn loudly so the gap is visible in the log rather than
-        // silently returning Ok and leaking a stale socket. Mirrors the
-        // precedent at the agent_unresponsive escalation site below.
-        #[cfg(not(unix))]
-        {
-            let _ = pid_before;
-            tracing::warn!(
-                target: "acp.supervisor",
-                session = %session_id,
-                "shutdown_and_wait called on non-Unix host; PID-wait and \
-                 socket cleanup are unimplemented for this platform"
-            );
         }
         Ok(())
     }
@@ -1768,7 +1745,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 if matches!(err, AcpError::IncompatibleAgent(_)) {
                     self.mark_incompatible_binary(&session_id, &config.spec.command);
                 }
-                self.publish_compat_rejection(&session_id, &err);
+                self.publish_compat_rejection(&session_id, &err).await?;
                 return Err(SupervisorError::Acp(err));
             }
         };
@@ -1793,6 +1770,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         let inbound = client
             .take_inbound()
             .expect("freshly spawned AcpClient always has inbound receiver");
+        let registry_record = client.bound_worker_record();
+        let runner_generation = client.bound_runner_generation();
         let client = Arc::new(client);
 
         let mut workers = self.workers.lock().await;
@@ -1822,7 +1801,13 @@ impl<S: BroadcastSink> Supervisor<S> {
             drop(client);
             return Err(SupervisorError::SpawnCancelled(session_id));
         }
-        let drain_task = self.start_drain_task(session_id.clone(), inbound);
+        let drain_task = self.start_drain_task(
+            session_id.clone(),
+            inbound,
+            registry_record,
+            runner_generation,
+            None,
+        );
         let client_for_mode = (acp_mode_id.is_some() || yolo_mode).then(|| Arc::clone(&client));
         workers.insert(
             session_id.clone(),
@@ -1885,11 +1870,15 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         session_id: String,
         initial_inbound: mpsc::Receiver<Event>,
+        mut registry_record: Option<crate::process::worker_registry::WorkerRecord>,
+        mut runner_generation: Option<super::acp_client::RunnerGeneration>,
+        runner_termination_deadline: Option<Duration>,
     ) -> JoinHandle<()> {
         let sink = Arc::clone(&self.sink);
         let workers = Arc::clone(&self.workers);
         let next_seqs = Arc::clone(&self.next_seqs);
         let incompatible_binaries = Arc::clone(&self.incompatible_binaries);
+        let build_respawn_pending = Arc::clone(&self.build_respawn_pending);
         crate::task_util::spawn_supervised(
             "supervisor.drain",
             crate::task_util::PanicPolicy::Log,
@@ -1969,10 +1958,12 @@ impl<S: BroadcastSink> Supervisor<S> {
                                 // Mirror into the on-disk registry so a fresh
                                 // `aoe serve` after a daemon restart issues
                                 // `session/load` instead of `session/new`.
-                                crate::process::worker_registry::update_stored_acp_session_id(
-                                    &session_id,
-                                    Some(acp_session_id),
-                                );
+                                if let Some(record) = registry_record.as_ref() {
+                                    crate::process::worker_registry::update_stored_acp_session_id(
+                                        record,
+                                        Some(acp_session_id),
+                                    );
+                                }
                             }
                             Event::SessionContextReset { reason } => {
                                 let mut guard = workers.lock().await;
@@ -1999,10 +1990,11 @@ impl<S: BroadcastSink> Supervisor<S> {
                                         spawn_config.fork_from = None;
                                     }
                                 }
-                                crate::process::worker_registry::update_stored_acp_session_id(
-                                    &session_id,
-                                    None,
-                                );
+                                if let Some(record) = registry_record.as_ref() {
+                                    crate::process::worker_registry::update_stored_acp_session_id(
+                                        record, None,
+                                    );
+                                }
                             }
                             _ => {}
                         }
@@ -2043,78 +2035,43 @@ impl<S: BroadcastSink> Supervisor<S> {
                     // makes `restart_decision` interpret it as a
                     // user-initiated stop and skip the respawn. See #1196.
                     if agent_unresponsive {
-                        #[cfg(unix)]
-                        {
-                            use nix::sys::signal::{killpg, Signal};
-                            use nix::unistd::Pid;
-                            let old_pid = crate::process::worker_registry::load(&session_id)
-                                .ok()
-                                .flatten()
-                                .map(|r| r.pid);
-                            if let Some(pid) = old_pid {
-                                // The runner is spawned via `setsid`, so it
-                                // leads its own process group (PGID == PID).
-                                // Signal the whole GROUP, not just the runner
-                                // PID, so a tool the agent ran internally (a
-                                // monitor/until loop spawned as a grandchild
-                                // of claude-agent-acp) dies too instead of
-                                // surviving the restart orphaned. See #1727.
-                                if crate::process::worker_registry::is_pid_alive(pid) {
-                                    info!(
-                                        target: "acp.supervisor",
-                                        session = %session_id,
-                                        pid,
-                                        "SIGTERM wedged runner process group before respawn (agent_unresponsive)"
-                                    );
-                                    let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGTERM);
-                                }
-                                // Poll for the runner to exit before
-                                // proceeding to respawn. ~3s budget, 100ms
-                                // tick. claude-agent-acp's shutdown path
-                                // is fast in practice; if it's truly
-                                // unkillable by SIGTERM we escalate to
-                                // SIGKILL below.
-                                for _ in 0..30 {
-                                    if !crate::process::worker_registry::is_pid_alive(pid) {
-                                        break;
-                                    }
-                                    tokio::time::sleep(Duration::from_millis(100)).await;
-                                }
-                                if crate::process::worker_registry::is_pid_alive(pid) {
-                                    warn!(
-                                        target: "acp.supervisor",
-                                        session = %session_id,
-                                        pid,
-                                        "wedged runner survived SIGTERM grace; escalating to SIGKILL"
-                                    );
-                                    let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
-                                    // One more brief tick for the kernel
-                                    // to reap and the socket inode to
-                                    // drop. We don't loop forever; spawn
-                                    // will surface its own error if the
-                                    // process is somehow still around.
-                                    tokio::time::sleep(Duration::from_millis(200)).await;
-                                }
+                        crate::process::worker_registry::mark_restart_pending(&session_id);
+                        let Some(generation) = runner_generation.as_ref() else {
+                            warn!(target: "acp.supervisor", session = %session_id,
+                                "agent_unresponsive runner has no authenticated generation; retaining worker fence");
+                            return;
+                        };
+                        let terminated = match runner_termination_deadline {
+                            Some(deadline) => {
+                                crate::acp::acp_client::terminate_runner_generation_with_deadline(
+                                    generation, deadline,
+                                )
+                                .await
                             }
-                            if let Ok(socket_path) =
-                                crate::process::worker_registry::socket_path_for(&session_id)
-                            {
-                                if socket_path.exists() {
-                                    let _ = std::fs::remove_file(&socket_path);
-                                }
+                            None => {
+                                crate::acp::acp_client::terminate_runner_generation(generation)
+                                    .await
                             }
-                        }
-                        // Acp's runner transport is UNIX-socket-only today
-                        // (see `worker_registry::socket_path_for`), so a
-                        // non-unix daemon cannot reach this branch in practice.
-                        // Warn if it ever does so the assumption is loud.
-                        #[cfg(not(unix))]
-                        {
-                            warn!(
-                                target: "acp.supervisor",
-                                session = %session_id,
-                                "agent_unresponsive escalation on non-unix: wedged runner kill not implemented; respawn may collide on the runner socket"
+                        };
+                        if !terminated {
+                            if crate::acp::acp_client::runner_generation_has_drifted(generation) {
+                                crate::process::worker_registry::take_restart_marker(&session_id);
+                                let mut guard = workers.lock().await;
+                                if guard.get(&session_id).is_some_and(|handle| {
+                                    handle.client.owns_runner_generation(generation)
+                                }) {
+                                    guard.remove(&session_id);
+                                }
+                                return;
+                            }
+                            insert_build_respawn_pending(
+                                &build_respawn_pending,
+                                &session_id,
+                                generation.clone(),
                             );
+                            warn!(target: "acp.supervisor", session = %session_id,
+                                "agent_unresponsive runner could not be reaped; retaining worker fence");
+                            return;
                         }
                     }
                     // Rate-limit park: the connection task already emitted
@@ -2135,7 +2092,9 @@ impl<S: BroadcastSink> Supervisor<S> {
                         return;
                     }
                     let mut respawn_config: SpawnConfig =
-                        match restart_decision(&workers, &session_id).await {
+                        match restart_decision(&workers, &session_id, runner_generation.as_ref())
+                            .await
+                        {
                             RestartDecision::Respawn(cfg) => {
                                 info!(
                                     target: "acp.supervisor",
@@ -2183,6 +2142,18 @@ impl<S: BroadcastSink> Supervisor<S> {
                                 // Exit quietly.
                                 return;
                             }
+                            RestartDecision::Superseded => {
+                                crate::process::worker_registry::take_restart_marker(&session_id);
+                                let mut guard = workers.lock().await;
+                                if let Some(expected) = runner_generation.as_ref() {
+                                    if guard.get(&session_id).is_some_and(|handle| {
+                                        handle.client.owns_runner_generation(expected)
+                                    }) {
+                                        guard.remove(&session_id);
+                                    }
+                                }
+                                return;
+                            }
                             RestartDecision::UserStopped => {
                                 info!(
                                     target: "acp.supervisor",
@@ -2206,6 +2177,11 @@ impl<S: BroadcastSink> Supervisor<S> {
                                 );
                                 let mut guard = workers.lock().await;
                                 guard.remove(&session_id);
+                                return;
+                            }
+                            RestartDecision::RetryTeardown => {
+                                warn!(target: "acp.supervisor", session = %session_id,
+                                    "runner authority unavailable; retaining worker fence");
                                 return;
                             }
                         };
@@ -2349,7 +2325,10 @@ impl<S: BroadcastSink> Supervisor<S> {
                                             message: payload.message.clone(),
                                         },
                                     );
-                                    terminate_runner_for_session(&session_id);
+                                    // The failed AcpClient spawn owns and tears
+                                    // down its exact generation. Rediscovering
+                                    // by session here could kill a concurrent
+                                    // replacement.
                                 } else {
                                     let seq = next_seq(&next_seqs, &session_id);
                                     sink.publish(
@@ -2398,6 +2377,8 @@ impl<S: BroadcastSink> Supervisor<S> {
                             return;
                         }
                     };
+                    let new_registry_record = new_client.bound_worker_record();
+                    let new_runner_generation = new_client.bound_runner_generation();
 
                     {
                         let mut guard = workers.lock().await;
@@ -2406,6 +2387,8 @@ impl<S: BroadcastSink> Supervisor<S> {
                         };
                         handle.client = Arc::new(new_client);
                     }
+                    registry_record = new_registry_record;
+                    runner_generation = new_runner_generation;
 
                     info!(
                         target: "acp.supervisor",
@@ -2686,7 +2669,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// next prompt (#1710). For permanent removal use
     /// [`Self::shutdown_and_delete`].
     pub async fn shutdown(&self, session_id: &str) -> Result<(), SupervisorError> {
-        self.shutdown_with_reason(session_id, "user_stopped", false)
+        self.shutdown_with_reason(session_id, "user_stopped", false, false, None)
             .await
     }
 
@@ -2697,7 +2680,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// banner, the next prompt respawns the worker. Preserves the
     /// agent transcript so that respawn resumes instead of resetting.
     pub async fn shutdown_idle(&self, session_id: &str) -> Result<(), SupervisorError> {
-        self.shutdown_with_reason(session_id, "idle_auto_stop", false)
+        self.shutdown_with_reason(session_id, "idle_auto_stop", false, false, None)
             .await
     }
 
@@ -2707,7 +2690,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// structured view mode), never for reversible teardown, which must keep the
     /// transcript resumable. See #1710 and `shutdown`.
     pub async fn shutdown_and_delete(&self, session_id: &str) -> Result<(), SupervisorError> {
-        self.shutdown_with_reason(session_id, "user_stopped", true)
+        self.shutdown_with_reason(session_id, "user_stopped", true, false, None)
             .await
     }
 
@@ -2716,15 +2699,36 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         stop_reason: &str,
         delete_adapter_state: bool,
+        best_effort_registry: bool,
+        teardown_deadline: Option<Duration>,
     ) -> Result<(), SupervisorError> {
         // Hold workers + pending_resumes simultaneously so the spawn
         // can't observe an empty workers map, finish the handshake,
         // and insert a WorkerHandle while we're walking through this
         // function. Lock order matches `spawn`: workers, then pending.
-        let mut workers = self.workers.lock().await;
+        let workers = self.workers.lock().await;
         let pending_has_it = lock_recover(&self.pending_resumes).contains_key(session_id);
-        if let Some(handle) = workers.remove(session_id) {
-            // Worker is alive — tear it down.
+        if let Some(handle) = workers.get(session_id) {
+            // Keep the handle installed until exact teardown is confirmed so
+            // concurrent spawn/attach observes AlreadyRunning rather than
+            // overlapping a runner whose process group may still be alive.
+            let client = Arc::clone(&handle.client);
+            let runner_generation = client.bound_runner_generation();
+            let runner_managed = matches!(
+                handle.kind,
+                WorkerKind::Runner { .. } | WorkerKind::Attached
+            );
+            if runner_managed && runner_generation.is_none() {
+                return Err(SupervisorError::Acp(AcpError::Spawn(
+                    "worker has no authenticated runner generation; retaining replacement fence"
+                        .into(),
+                )));
+            }
+            let should_publish = match &handle.kind {
+                WorkerKind::Runner { .. } | WorkerKind::Attached => true,
+                #[cfg(test)]
+                WorkerKind::Stdio => false,
+            };
             drop(workers);
             // Best-effort experimental `session/delete` RPC before
             // SIGTERM. Adapters that advertise
@@ -2743,25 +2747,53 @@ impl<S: BroadcastSink> Supervisor<S> {
             // respawn resumes via `session/load` instead of resetting
             // the conversation. See #1710.
             if delete_adapter_state {
-                try_session_delete(&handle.client, session_id).await;
+                try_session_delete(&client, session_id).await;
             }
-            let _ = handle.client.shutdown().await;
-            handle.drain_task.abort();
             // SIGTERM the runner (if there is one) so the agent
             // subprocess dies; the runner cleans up its own files but
             // we also delete the registry entry here to handle the
             // case where the runner is wedged.
-            terminate_runner_for_session(session_id);
+            let teardown = if runner_managed {
+                terminate_runner_for_session_with_deadline(
+                    runner_generation
+                        .as_ref()
+                        .expect("runner generation checked"),
+                    teardown_deadline,
+                )
+                .await
+            } else {
+                Ok(())
+            };
+            if let Err(error) = teardown {
+                if best_effort_registry {
+                    warn!(target: "acp.supervisor", session = %session_id, %error,
+                        "best-effort shutdown could not confirm exact runner exit; retaining worker handle to block replacement");
+                    return Ok(());
+                } else {
+                    return Err(error);
+                }
+            }
+            let removed = {
+                let mut workers = self.workers.lock().await;
+                match workers.get(session_id) {
+                    Some(current) if Arc::ptr_eq(&current.client, &client) => {
+                        workers.remove(session_id)
+                    }
+                    _ => None,
+                }
+            };
+            let Some(handle) = removed else {
+                return Err(SupervisorError::Acp(AcpError::Spawn(
+                    "worker generation changed while shutdown completed".into(),
+                )));
+            };
+            let _ = client.shutdown().await;
+            handle.drain_task.abort();
             // Publish `Stopped` so the UI clears any "thinking" state
             // and renders the reconnect banner immediately, instead of
             // waiting for the next reap tick. Skipped for stdio test
             // fixtures since they have no UI to update and the seq
             // counter is shared with respawn-budget tests.
-            let should_publish = match &handle.kind {
-                WorkerKind::Runner { .. } | WorkerKind::Attached => true,
-                #[cfg(test)]
-                WorkerKind::Stdio => false,
-            };
             if should_publish {
                 self.publish_next(
                     session_id,
@@ -2775,11 +2807,11 @@ impl<S: BroadcastSink> Supervisor<S> {
         // No in-memory worker, but there may still be a detached
         // runner in the registry (e.g. a previous daemon detached and
         // shutdown is called against the disk-only entry).
-        if crate::process::worker_registry::load(session_id)
-            .ok()
-            .flatten()
-            .is_some()
-        {
+        let disk_record = crate::process::worker_registry::load_existing_strict(session_id)
+            .map_err(|error| {
+                SupervisorError::Acp(AcpError::Spawn(format!("registry load: {error}")))
+            })?;
+        if let Some(record) = disk_record {
             // If a resume is mid-handshake against this same runner,
             // the SIGTERM below races the handshake; mark the session
             // so attach's (or spawn's) pre-insert check bails instead
@@ -2792,7 +2824,30 @@ impl<S: BroadcastSink> Supervisor<S> {
                 lock_recover(&self.cancelled_resumes).insert(session_id.to_string());
             }
             drop(workers);
-            terminate_runner_for_session(session_id);
+            if !crate::process::worker_registry::is_pid_alive(record.pid) {
+                return match crate::process::worker_registry::delete_dead_record_if_current(&record)
+                {
+                    Ok(crate::process::worker_registry::GenerationDeleteOutcome::Deleted)
+                    | Ok(crate::process::worker_registry::GenerationDeleteOutcome::Missing) => {
+                        Ok(())
+                    }
+                    Ok(crate::process::worker_registry::GenerationDeleteOutcome::Changed)
+                    | Err(_) => Err(SupervisorError::Acp(AcpError::Spawn(
+                        "runner generation changed during dead-record cleanup".into(),
+                    ))),
+                };
+            }
+            let generation = crate::acp::acp_client::RunnerGeneration::from_record(
+                &record,
+                session_id,
+                &record.socket_path,
+            )
+            .ok_or_else(|| {
+                SupervisorError::Acp(AcpError::Spawn(
+                    "runner generation could not be authenticated for teardown".into(),
+                ))
+            })?;
+            terminate_runner_for_session_with_deadline(&generation, teardown_deadline).await?;
             return Ok(());
         }
         if pending_has_it {
@@ -2823,33 +2878,22 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// signals every per-session `aoe __acp-runner` so the agent
     /// subprocess dies. For the everyday `aoe serve --stop` flow, use
     /// `detach_all` instead so workers outlive the daemon.
-    pub async fn shutdown_all(&self) {
-        let registry_pids: Vec<(String, u32)> = crate::process::worker_registry::list()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| (r.session_id, r.pid))
-            .collect();
-
-        let drained: Vec<(String, WorkerHandle)> = {
-            let mut workers = self.workers.lock().await;
-            workers.drain().collect()
-        };
-        for (id, handle) in drained {
-            debug!(target: "acp.supervisor", session = %id, "shutting down");
-            let _ = handle.client.shutdown().await;
-            handle.drain_task.abort();
+    pub async fn shutdown_all(&self) -> Result<(), SupervisorError> {
+        let mut session_ids: HashSet<String> =
+            crate::process::worker_registry::list_existing_strict()
+                .map_err(|error| {
+                    SupervisorError::Acp(AcpError::Spawn(format!("registry list: {error}")))
+                })?
+                .into_iter()
+                .map(|record| record.session_id)
+                .collect();
+        session_ids.extend(self.workers.lock().await.keys().cloned());
+        for session_id in session_ids {
+            debug!(target: "acp.supervisor", session = %session_id, "shutting down");
+            self.shutdown_with_reason(&session_id, "user_stopped", false, false, None)
+                .await?;
         }
-
-        // Group-SIGTERM every runner we knew about, so detached agents that
-        // outlived a previous daemon (and their node/SDK grandchildren) are
-        // also taken down by an explicit "kill them all" request, not left
-        // orphaned under PID 1. See #1689.
-        for (session_id, pid) in registry_pids {
-            crate::process::worker::terminate_process_group(pid);
-            crate::process::worker_registry::delete(&session_id).ok();
-        }
-        #[cfg(not(unix))]
-        let _ = registry_pids;
+        Ok(())
     }
 
     /// Drop the daemon-side handle to every worker without killing the
@@ -2877,7 +2921,6 @@ impl<S: BroadcastSink> Supervisor<S> {
             debug!(target: "acp.supervisor", session = %id, "detaching");
             let _ = handle.client.shutdown().await;
             handle.drain_task.abort();
-            crate::process::worker_registry::mark_detached(&id);
         }
     }
 
@@ -2915,7 +2958,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         };
 
-        let record = match crate::process::worker_registry::load(&session_id)
+        let record = match crate::process::worker_registry::load_existing_strict(&session_id)
             .map_err(|e| SupervisorError::Acp(AcpError::Spawn(format!("registry load: {e}"))))?
         {
             Some(r) if crate::process::worker_registry::is_record_live(&r) => r,
@@ -2944,10 +2987,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         // Refusing to attach is not enough on its own: the disallowed runner
         // would keep running, still holding whatever credentials it was spawned
         // with, and the next reconciler tick would attach it again. So terminate
-        // it. `worker_registry::terminate` is the canonical teardown already
-        // used by the shutdown paths: it SIGTERMs the whole process group and
-        // clears the record plus socket generation-aware, so it will not strand a
-        // replacement runner that rebound the socket meanwhile.
+        // it. The canonical teardown authenticates the persisted runner
+        // generation, waits for its whole process group, and compare-deletes
+        // only that generation.
         //
         // The legacy fallback above yields a binary name (`claude-agent-acp`),
         // which matches no registry key, so an old record fails closed under a
@@ -2972,12 +3014,18 @@ impl<S: BroadcastSink> Supervisor<S> {
                 "detached structured view worker runs an agent that [acp] allowed_agents no longer \
                  permits; terminating it instead of reattaching"
             );
-            let id_for_terminate = session_id.clone();
-            if let Err(e) = tokio::task::spawn_blocking(move || {
-                crate::process::worker_registry::terminate(&id_for_terminate)
-            })
-            .await
-            {
+            let generation = super::acp_client::RunnerGeneration::from_record(
+                &record,
+                &session_id,
+                &record.socket_path,
+            );
+            let teardown = match generation.as_ref() {
+                Some(generation) => terminate_runner_for_session(generation).await,
+                None => Err(SupervisorError::Acp(AcpError::Spawn(
+                    "disallowed runner generation could not be authenticated for teardown".into(),
+                ))),
+            };
+            if let Err(e) = teardown {
                 // The runner and its record can both survive a panicked or
                 // runtime-shutdown terminate task while we still refuse the
                 // attach. The next reconciler tick retries this path, so it
@@ -3043,7 +3091,12 @@ impl<S: BroadcastSink> Supervisor<S> {
             record.source_profile.clone(),
         )
         .await?;
-        crate::process::worker_registry::mark_attached(&session_id);
+        let registry_record = client.bound_worker_record().ok_or_else(|| {
+            SupervisorError::Acp(AcpError::Spawn(
+                "runner generation changed while attach completed".into(),
+            ))
+        })?;
+        crate::process::worker_registry::mark_attached(&registry_record);
 
         let inbound = client
             .take_inbound()
@@ -3070,7 +3123,14 @@ impl<S: BroadcastSink> Supervisor<S> {
             drop(client);
             return Err(SupervisorError::SpawnCancelled(session_id));
         }
-        let drain_task = self.start_drain_task(session_id.clone(), inbound);
+        let runner_generation = client.bound_runner_generation();
+        let drain_task = self.start_drain_task(
+            session_id.clone(),
+            inbound,
+            Some(registry_record.clone()),
+            runner_generation,
+            None,
+        );
         workers.insert(
             session_id.clone(),
             WorkerHandle {
@@ -3088,8 +3148,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         info!(
             target: "acp.supervisor",
             session = %session_id,
-            socket = %record.socket_path.display(),
-            pid = record.pid,
+            socket = %registry_record.socket_path.display(),
+            pid = registry_record.pid,
             "reattached to existing structured view worker"
         );
         drop(workers);
@@ -3311,14 +3371,30 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 }
 
-/// SIGTERM the per-session runner if its registry entry has a live PID,
-/// then delete the entry. Used by `shutdown` and `shutdown_all` to take
-/// down detached workers explicitly.
-fn terminate_runner_for_session(session_id: &str) {
-    // Group-kill (runner + agent + grandchildren) then delete the entry.
-    // Single-pid SIGTERM here used to orphan the agent's node/SDK children
-    // under PID 1; see worker_registry::terminate and #1689.
-    crate::process::worker_registry::terminate(session_id);
+/// Authenticate and tear down exactly the persisted runner generation.
+async fn terminate_runner_for_session(
+    captured: &super::acp_client::RunnerGeneration,
+) -> Result<(), SupervisorError> {
+    terminate_runner_for_session_with_deadline(captured, None).await
+}
+
+async fn terminate_runner_for_session_with_deadline(
+    generation: &super::acp_client::RunnerGeneration,
+    deadline: Option<Duration>,
+) -> Result<(), SupervisorError> {
+    let terminated = match deadline {
+        Some(deadline) => {
+            crate::acp::acp_client::terminate_runner_generation_with_deadline(generation, deadline)
+                .await
+        }
+        None => crate::acp::acp_client::terminate_runner_generation(generation).await,
+    };
+    if !terminated {
+        return Err(SupervisorError::Acp(AcpError::Spawn(
+            "runner generation changed or did not exit after bounded teardown".into(),
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -3331,6 +3407,10 @@ enum RestartDecision {
     BudgetBurned,
     /// The worker entry was removed (e.g. shutdown).
     Gone,
+    /// The drain belongs to an older runner than the current registry/handle.
+    /// Drop only that stale in-memory owner; never schedule a session-wide
+    /// retry that could tear down the replacement.
+    Superseded,
     /// The on-disk worker registry entry for this session was deleted
     /// while the in-memory WorkerHandle still exists. Signals that the
     /// user (or a peer process) explicitly stopped this worker via
@@ -3338,11 +3418,15 @@ enum RestartDecision {
     /// and emits a soft `Stopped` event instead of burning the restart
     /// budget with respawns of an agent the user just terminated.
     UserStopped,
+    /// Registry authority could not be read. Park this exact stale handle for
+    /// reconciler teardown instead of treating malformed state as a stop.
+    RetryTeardown,
 }
 
 async fn restart_decision(
     workers: &Arc<Mutex<HashMap<String, WorkerHandle>>>,
     session_id: &str,
+    captured_generation: Option<&super::acp_client::RunnerGeneration>,
 ) -> RestartDecision {
     let mut guard = workers.lock().await;
     let Some(handle) = guard.get_mut(session_id) else {
@@ -3372,14 +3456,36 @@ async fn restart_decision(
         WorkerKind::Runner { .. } | WorkerKind::Attached
     );
     if runner_managed {
-        let registry_gone = matches!(crate::process::worker_registry::load(session_id), Ok(None));
-        if registry_gone {
-            debug!(
-                target: "acp.supervisor",
-                session = %session_id,
-                "restart_decision: registry entry gone, treating as user-initiated stop"
-            );
-            return RestartDecision::UserStopped;
+        match crate::process::worker_registry::load_existing_strict(session_id) {
+            Err(error) => {
+                warn!(target: "acp.supervisor", session = %session_id, %error,
+                    "restart_decision: registry authority unreadable; parking exact teardown");
+                return RestartDecision::RetryTeardown;
+            }
+            Ok(Some(record)) => {
+                let Some(captured_generation) = captured_generation else {
+                    return RestartDecision::RetryTeardown;
+                };
+                if !captured_generation.matches_record(&record) {
+                    return RestartDecision::Superseded;
+                }
+            }
+            Ok(None) => {
+                if crate::process::worker_registry::take_restart_marker(session_id) {
+                    debug!(
+                        target: "acp.supervisor",
+                        session = %session_id,
+                        "restart_decision: authenticated reap completed; respawn remains authorized"
+                    );
+                } else {
+                    debug!(
+                        target: "acp.supervisor",
+                        session = %session_id,
+                        "restart_decision: registry entry gone, treating as user-initiated stop"
+                    );
+                    return RestartDecision::UserStopped;
+                }
+            }
         }
     }
     let now = Instant::now();
@@ -3443,6 +3549,14 @@ fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         );
         e.into_inner()
     })
+}
+
+fn insert_build_respawn_pending(
+    pending: &std::sync::Mutex<HashMap<String, super::acp_client::RunnerGeneration>>,
+    session_id: &str,
+    generation: super::acp_client::RunnerGeneration,
+) {
+    lock_recover(pending).insert(session_id.to_string(), generation);
 }
 
 /// A `BroadcastSink` impl backed by a tokio broadcast channel. The
@@ -3948,6 +4062,8 @@ cursor-acp-bridge = "agent acp"
     ///
     /// `#[serial]` because it mutates `HOME` / `XDG_CONFIG_HOME` to point the
     /// app dir (config + worker registry) at a temp dir.
+    // The production exact-generation teardown owns waitpid for both fixtures.
+    #[allow(clippy::zombie_processes)]
     #[tokio::test]
     #[serial_test::serial]
     async fn attach_terminates_a_worker_whose_agent_is_no_longer_allowed() {
@@ -3967,11 +4083,14 @@ cursor-acp-bridge = "agent acp"
         // makes the child its own group leader so the killpg lands on it alone;
         // using our own pid here would SIGTERM the test process.
         use std::os::unix::process::CommandExt as _;
-        let mut fake_runner = std::process::Command::new("sleep")
-            .arg("60")
-            .process_group(0)
-            .spawn()
-            .expect("spawn stand-in runner");
+        let spawn_runner = || {
+            std::process::Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .expect("spawn stand-in runner")
+        };
+        let permitted_runner = spawn_runner();
 
         let result = async {
             let sup = Supervisor::new(VecSink::new());
@@ -3979,8 +4098,8 @@ cursor-acp-bridge = "agent acp"
             std::fs::write(&socket, b"").unwrap();
             let mut record = crate::process::worker_registry::WorkerRecord::new(
                 "s-policy".into(),
-                fake_runner.id(),
-                socket,
+                permitted_runner.id(),
+                socket.clone(),
                 "codex-acp".into(),
                 "codex".into(),
                 tmp.path().to_path_buf(),
@@ -4022,7 +4141,24 @@ cursor-acp-bridge = "agent acp"
                 c.acp.allowed_agents = vec!["claude".to_string()];
             })
             .unwrap();
-            crate::process::worker_registry::save(&record).unwrap();
+            let denied_runner = spawn_runner();
+            let denied_pid = denied_runner.id();
+            std::fs::write(&socket, b"").unwrap();
+            let mut denied_record = crate::process::worker_registry::WorkerRecord::new(
+                "s-policy".into(),
+                denied_pid,
+                socket,
+                "codex-acp".into(),
+                "codex".into(),
+                tmp.path().to_path_buf(),
+                None,
+                vec![],
+                vec![],
+                Some("acp-session".into()),
+                None,
+            );
+            denied_record.detached_at = Some(1);
+            crate::process::worker_registry::save(&denied_record).unwrap();
 
             let got = sup
                 .attach(
@@ -4047,21 +4183,9 @@ cursor-acp-bridge = "agent acp"
                     .is_none(),
                 "the disallowed worker's registry record must be cleared"
             );
-            // Poll rather than `wait()`: the child is a `sleep 60`, so a
-            // terminate path that stops signalling would block this test for a
-            // full minute before reporting.
-            let exit = (0..50)
-                .find_map(|_| {
-                    let got = fake_runner.try_wait().unwrap();
-                    if got.is_none() {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                    got
-                })
-                .expect("the disallowed runner must be signalled, not left running");
             assert!(
-                exit.code().is_none(),
-                "the runner must exit from a signal, not a normal exit: {exit:?}"
+                !crate::process::worker_registry::is_pid_alive(denied_pid),
+                "the disallowed runner must be reaped before attach returns"
             );
         }
         .await;
@@ -4080,6 +4204,7 @@ cursor-acp-bridge = "agent acp"
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn spawn_unknown_agent_errors_cleanly() {
         let sink = VecSink::new();
         let sup = Supervisor::new(sink);
@@ -4382,6 +4507,12 @@ cursor-acp-bridge = "agent acp"
             None,
         );
         crate::process::worker_registry::save(&record).unwrap();
+        let generation = crate::acp::acp_client::RunnerGeneration::from_record(
+            &record,
+            "s-1",
+            &record.socket_path,
+        )
+        .unwrap();
         {
             let mut workers = sup.workers.lock().await;
             let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("s-1".into()));
@@ -4400,14 +4531,14 @@ cursor-acp-bridge = "agent acp"
         }
 
         for i in 0..MAX_RESPAWNS_IN_WINDOW {
-            let decision = restart_decision(&sup.workers, "s-1").await;
+            let decision = restart_decision(&sup.workers, "s-1", Some(&generation)).await;
             assert!(
                 matches!(decision, RestartDecision::Respawn(_)),
                 "decision #{i} should be Respawn",
             );
         }
         // One more push past the threshold should burn the budget.
-        let decision = restart_decision(&sup.workers, "s-1").await;
+        let decision = restart_decision(&sup.workers, "s-1", Some(&generation)).await;
         assert!(matches!(decision, RestartDecision::BudgetBurned));
     }
 
@@ -4455,7 +4586,7 @@ cursor-acp-bridge = "agent acp"
             default_effort: None,
             default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
-            stored_acp_session_id: None,
+            stored_acp_session_id: Some("resume-after-reap".into()),
             fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
@@ -4481,10 +4612,84 @@ cursor-acp-bridge = "agent acp"
         }
         // No registry entry for "s-stop" — production code reads this
         // as a user-initiated stop signal.
-        let decision = restart_decision(&sup.workers, "s-stop").await;
+        let decision = restart_decision(&sup.workers, "s-stop", None).await;
         assert!(
             matches!(decision, RestartDecision::UserStopped),
             "expected UserStopped when registry entry is absent, got {decision:?}"
+        );
+
+        crate::process::worker_registry::mark_restart_pending("s-stop");
+        let decision = restart_decision(&sup.workers, "s-stop", None).await;
+        let RestartDecision::Respawn(config) = decision else {
+            panic!("an exact reap-for-respawn marker must preserve automatic recovery");
+        };
+        assert_eq!(
+            config.stored_acp_session_id.as_deref(),
+            Some("resume-after-reap"),
+            "automatic replacement must retain session/load continuity"
+        );
+        assert!(!crate::process::worker_registry::take_restart_marker(
+            "s-stop"
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restart_decision_treats_replacement_generation_as_superseded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+        let session_id = "restart-generation-drift";
+        let socket = crate::process::worker_registry::socket_path_for(session_id).unwrap();
+        let original = crate::process::worker_registry::WorkerRecord::new(
+            session_id.into(),
+            std::process::id(),
+            socket.clone(),
+            "original-agent".into(),
+            "original-agent".into(),
+            tmp.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&original).unwrap();
+        let original_generation =
+            crate::acp::acp_client::RunnerGeneration::from_record(&original, session_id, &socket)
+                .unwrap();
+        let replacement = crate::process::worker_registry::WorkerRecord {
+            started_at: original.started_at.saturating_add(1),
+            agent_name: "replacement-agent".into(),
+            ..original
+        };
+        crate::process::worker_registry::save(&replacement).unwrap();
+
+        let sup = Supervisor::new(VecSink::new());
+        let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(session_id.into()));
+        sup.workers.lock().await.insert(
+            session_id.into(),
+            WorkerHandle {
+                client: Arc::new(client),
+                drain_task: tokio::spawn(async {}),
+                restart_history: Vec::new(),
+                kind: WorkerKind::Attached,
+            },
+        );
+        crate::process::worker_registry::mark_restart_pending(session_id);
+
+        assert!(matches!(
+            restart_decision(&sup.workers, session_id, Some(&original_generation)).await,
+            RestartDecision::Superseded
+        ));
+        assert_eq!(
+            crate::process::worker_registry::load_existing_strict(session_id)
+                .unwrap()
+                .unwrap()
+                .agent_name,
+            "replacement-agent"
         );
     }
 
@@ -4762,6 +4967,8 @@ cursor-acp-bridge = "agent acp"
     #[tokio::test]
     #[serial_test::serial]
     async fn shutdown_publishes_stopped_event() {
+        use std::os::unix::process::CommandExt as _;
+
         let tmp = tempfile::TempDir::new().unwrap();
         unsafe {
             std::env::set_var("HOME", tmp.path());
@@ -4769,6 +4976,29 @@ cursor-acp-bridge = "agent acp"
         }
         let sink = VecSink::new();
         let sup = Supervisor::new(sink.clone());
+        let mut runner = std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .expect("spawn stand-in runner");
+        let socket_path = crate::process::worker_registry::socket_path_for("s-stop").unwrap();
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            "s-stop".into(),
+            runner.id(),
+            socket_path.clone(),
+            "claude".into(),
+            "claude".into(),
+            std::env::temp_dir(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&record).unwrap();
+        let generation =
+            crate::acp::acp_client::RunnerGeneration::from_record(&record, "s-stop", &socket_path)
+                .unwrap();
         let dummy_spec = AgentSpec {
             command: "/bin/true".into(),
             args: vec![],
@@ -4785,7 +5015,7 @@ cursor-acp-bridge = "agent acp"
             host_environment: vec![],
             default_effort: None,
             default_mode: None,
-            socket_path: Some(tmp.path().join("dummy.sock")),
+            socket_path: Some(socket_path),
             stored_acp_session_id: None,
             fork_from: None,
             seed_history_replay: false,
@@ -4796,7 +5026,10 @@ cursor-acp-bridge = "agent acp"
         };
         {
             let mut workers = sup.workers.lock().await;
-            let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("s-stop".into()));
+            let (client, _tx) = AcpClient::fake_for_test_with_runner_generation(
+                AcpSessionId("s-stop".into()),
+                generation,
+            );
             let drain = tokio::spawn(async {});
             workers.insert(
                 "s-stop".into(),
@@ -4814,6 +5047,8 @@ cursor-acp-bridge = "agent acp"
         sup.shutdown("s-stop")
             .await
             .expect("shutdown should succeed");
+        let _ = runner.wait();
+        assert!(!crate::process::worker_registry::is_pid_alive(runner.id()));
 
         let frames = sink.frames.lock().unwrap();
         let stopped = frames
@@ -4841,7 +5076,7 @@ cursor-acp-bridge = "agent acp"
         let sup = Supervisor::new(sink.clone());
 
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Event>(16);
-        let drain = sup.start_drain_task("s-rl".into(), inbound_rx);
+        let drain = sup.start_drain_task("s-rl".into(), inbound_rx, None, None, None);
         {
             let mut workers = sup.workers.lock().await;
             let (client, _client_tx) = AcpClient::fake_for_test(AcpSessionId("s-rl".into()));
@@ -4895,6 +5130,100 @@ cursor-acp-bridge = "agent acp"
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unresponsive_failed_reap_parks_exact_generation_for_reconciler_retry() {
+        use std::os::unix::process::CommandExt;
+
+        let home = tempfile::TempDir::new().unwrap();
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(home.path());
+        let id = "s-unresponsive-reap-retry";
+        let ready = home.path().join("term-handler-ready");
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("trap '' TERM; touch \"$READY\"; while :; do sleep 1; done")
+            .env("READY", &ready)
+            .process_group(0);
+        let mut runner = command.spawn().expect("spawn TERM-ignoring runner group");
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !ready.exists() && std::time::Instant::now() < ready_deadline {
+            std::thread::yield_now();
+        }
+        assert!(ready.exists(), "fixture must install its TERM handler");
+
+        let socket = crate::process::worker_registry::socket_path_for(id).unwrap();
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            id.into(),
+            runner.id(),
+            socket.clone(),
+            "fake-agent".into(),
+            "fake-agent".into(),
+            home.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&record).unwrap();
+        let generation =
+            crate::acp::acp_client::RunnerGeneration::from_record(&record, id, &socket)
+                .expect("capture runner generation");
+        let sup = Supervisor::new(VecSink::new());
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Event>(4);
+        let drain = sup.start_drain_task(
+            id.into(),
+            inbound_rx,
+            Some(record),
+            Some(generation.clone()),
+            Some(std::time::Duration::from_millis(100)),
+        );
+        {
+            let mut workers = sup.workers.lock().await;
+            let (client, _tx) = AcpClient::fake_for_test_with_runner_generation(
+                AcpSessionId(id.into()),
+                generation.clone(),
+            );
+            workers.insert(
+                id.into(),
+                WorkerHandle {
+                    client: Arc::new(client),
+                    drain_task: tokio::spawn(async {}),
+                    restart_history: vec![],
+                    kind: WorkerKind::Attached,
+                },
+            );
+        }
+
+        inbound_tx
+            .send(Event::Stopped {
+                reason: "agent_unresponsive".into(),
+            })
+            .await
+            .unwrap();
+        drop(inbound_tx);
+        drain.await.expect("drain task");
+
+        assert!(sup
+            .workers
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|handle| handle.client.owns_runner_generation(&generation)));
+        assert!(sup.build_respawn_pending_generations().iter().any(
+            |(pending_id, pending_generation)| {
+                pending_id == id && pending_generation == &generation
+            }
+        ));
+        assert!(crate::process::worker_registry::restart_marker_path(id)
+            .unwrap()
+            .exists());
+        assert!(sup.take_respawn_requests().is_empty());
+        let _ = runner.wait();
+    }
+
     /// `Supervisor::shutdown` against an `Stdio` test fixture must NOT
     /// publish a `Stopped` event (the seq counter is shared with
     /// budget-tally tests; spurious publishes corrupt their assertions).
@@ -4942,16 +5271,13 @@ cursor-acp-bridge = "agent acp"
         );
     }
 
-    /// #2102: when the on-disk record is unreadable AND no live socket
-    /// peer is around, `pid_source_for` returns `None` and
-    /// `shutdown_and_wait` degrades to a fast no-poll return without
-    /// panicking or looping. The peer-PID recovery path itself is
-    /// covered by unit tests on `worker_registry::pid_source_for`,
-    /// which don't traverse `terminate` (avoiding a self-killpg risk).
+    /// An unreadable detached registry has no authenticated generation to
+    /// signal. Even the outward best-effort API must fail closed and preserve
+    /// that durable fence so a replacement cannot overlap it.
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial]
-    async fn shutdown_and_wait_degrades_when_load_errs_without_peer() {
+    async fn shutdown_and_wait_fails_closed_when_registry_is_unreadable() {
         let tmp = tempfile::TempDir::with_prefix_in("aoe-supervisor-", "/tmp").unwrap();
         // SAFETY: serialised by `#[serial]`.
         unsafe {
@@ -4987,15 +5313,73 @@ cursor-acp-bridge = "agent acp"
         );
         let sink = VecSink::new();
         let sup = Supervisor::new(sink);
-        insert_stdio_worker(&sup, session_id).await;
         let start = Instant::now();
-        sup.shutdown_and_wait(session_id, Duration::from_secs(2))
-            .await
-            .expect("shutdown_and_wait returns Ok on best-effort fallback");
+        assert!(
+            sup.shutdown_and_wait(session_id, Duration::from_secs(2))
+                .await
+                .is_err(),
+            "unreadable detached authority must not be reported as safely stopped"
+        );
         assert!(
             start.elapsed() < Duration::from_millis(100),
-            "no peer socket means pid_source_for returns None; no poll should run, elapsed={:?}",
+            "unreadable authority should fail before polling, elapsed={:?}",
             start.elapsed()
+        );
+        assert!(
+            record_path.exists(),
+            "failed authentication must preserve the durable replacement fence"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stale_unbound_handle_does_not_fall_back_to_replacement_record() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+        let session_id = "shutdown-stale-handle";
+        let replacement = crate::process::worker_registry::WorkerRecord::new(
+            session_id.into(),
+            std::process::id(),
+            crate::process::worker_registry::socket_path_for(session_id).unwrap(),
+            "replacement-agent".into(),
+            "replacement-agent".into(),
+            tmp.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&replacement).unwrap();
+        let before =
+            std::fs::read(crate::process::worker_registry::record_path(session_id).unwrap())
+                .unwrap();
+
+        let sup = Supervisor::new(VecSink::new());
+        let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(session_id.into()));
+        sup.workers.lock().await.insert(
+            session_id.into(),
+            WorkerHandle {
+                client: Arc::new(client),
+                drain_task: tokio::spawn(async {}),
+                restart_history: Vec::new(),
+                kind: WorkerKind::Attached,
+            },
+        );
+
+        assert!(sup
+            .shutdown_and_wait(session_id, Duration::from_millis(100))
+            .await
+            .is_err());
+        assert!(sup.workers.lock().await.contains_key(session_id));
+        assert_eq!(
+            std::fs::read(crate::process::worker_registry::record_path(session_id).unwrap())
+                .unwrap(),
+            before,
+            "a stale handle must neither signal nor rewrite the replacement generation"
         );
     }
 
@@ -6018,7 +6402,7 @@ cursor-acp-bridge = "agent acp"
         // pid_max (4_194_304), so signal_runner_group's killpg+kill both
         // ESRCH and the test never signals an unrelated process.
         let socket_path = tmp.path().join("registry-race.sock");
-        let record = crate::process::worker_registry::WorkerRecord::new(
+        let mut record = crate::process::worker_registry::WorkerRecord::new(
             "s-registry-race".into(),
             999_999_999,
             socket_path,
@@ -6031,6 +6415,7 @@ cursor-acp-bridge = "agent acp"
             None,
             None,
         );
+        record.process_start_identity = Some(1234);
         crate::process::worker_registry::save(&record).unwrap();
 
         // The registry-terminate branch only seeds the breadcrumb when
@@ -6075,6 +6460,12 @@ cursor-acp-bridge = "agent acp"
                 .contains("s-registry-race"),
             "shutdown must seed cancelled_resumes for the in-flight \
              resume on the registry-terminate path"
+        );
+        assert!(
+            crate::process::worker_registry::load("s-registry-race")
+                .unwrap()
+                .is_none(),
+            "shutdown must delete a dead record with persisted process identity"
         );
     }
 

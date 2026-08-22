@@ -16,11 +16,16 @@
 
 #![cfg(feature = "serve")]
 
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
+
+use agent_of_empires::acp::acp_client::AcpClient;
+use agent_of_empires::acp::state::AcpSessionId;
+use serial_test::serial;
 
 /// App data dir for the debug binary under this test's env, mirroring the
 /// XDG resolution the runner uses.
@@ -64,6 +69,37 @@ impl Drop for KillOnDrop {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
+
+impl EnvGuard {
+    fn set(entries: &[(&'static str, &std::ffi::OsStr)]) -> Self {
+        let previous = entries
+            .iter()
+            .map(|(key, value)| {
+                let old = std::env::var_os(key);
+                // SAFETY: this test is serial and restores every value on drop.
+                unsafe { std::env::set_var(key, value) };
+                (*key, old)
+            })
+            .collect();
+        Self(previous)
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in self.0.drain(..).rev() {
+            // SAFETY: this test is serial and restores its process-global env.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
     }
 }
 
@@ -198,6 +234,197 @@ fn find_python3() -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[tokio::test]
+#[serial]
+async fn timed_out_attach_terminates_runner_before_exact_session_reload() {
+    if cfg!(not(unix)) {
+        return;
+    }
+    let Some(python3) = find_python3() else {
+        eprintln!("skipping: python3 not found for fake ACP agent");
+        return;
+    };
+
+    let scratch = Scratch::new("latehs");
+    let home = scratch.0.join("home");
+    let xdg = scratch.0.join("xdg");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg).unwrap();
+    let timeout = OsString::from("100");
+    let _env = EnvGuard::set(&[
+        ("HOME", home.as_os_str()),
+        ("XDG_CONFIG_HOME", xdg.as_os_str()),
+        ("AOE_ACP_HANDSHAKE_TIMEOUT_MS", timeout.as_os_str()),
+    ]);
+
+    let agent_log = scratch.0.join("agent-methods.log");
+    let agent_pid_file = scratch.0.join("agent.pid");
+    let agent_py = scratch.0.join("delayed_agent.py");
+    std::fs::write(
+        &agent_py,
+        r#"
+import json, os, signal, sys, time
+log = os.environ["AOE_FAKE_AGENT_LOG"]
+delay_ms = int(os.environ.get("AOE_FAKE_INIT_DELAY_MS", "0"))
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+with open(os.environ["AOE_FAKE_AGENT_PID"], "w") as f:
+    f.write(str(os.getpid()))
+for line in sys.stdin:
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    method = msg.get("method")
+    mid = msg.get("id")
+    if method is None or mid is None:
+        continue
+    with open(log, "a") as f:
+        f.write(method + "\n")
+    if method == "initialize":
+        if delay_ms:
+            time.sleep(delay_ms / 1000)
+        result = {"protocolVersion": 1, "agentCapabilities": {"loadSession": True, "promptCapabilities": {}}}
+    elif method == "session/load":
+        result = {}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
+    sys.stdout.flush()
+"#,
+    )
+    .unwrap();
+
+    let session_id = "slate001";
+    let workers = app_dir(&home, &xdg).join("acp-workers");
+    let socket = workers.join(format!("{session_id}.sock"));
+    let control = workers.join(format!("{session_id}.control.sock"));
+    let record = workers.join(format!("{session_id}.json"));
+    let bin = env!("CARGO_BIN_EXE_aoe");
+    let spawn_runner = |delay: &str| {
+        let mut command = Command::new(bin);
+        command
+            .args([
+                "__acp-runner",
+                "--socket",
+                socket.to_str().unwrap(),
+                "--session-id",
+                session_id,
+                "--agent-name",
+                "fake-agent",
+                "--cwd",
+                home.to_str().unwrap(),
+                "--",
+                python3.to_str().unwrap(),
+                agent_py.to_str().unwrap(),
+            ])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("AOE_FAKE_AGENT_LOG", &agent_log)
+            .env("AOE_FAKE_AGENT_PID", &agent_pid_file)
+            .env("AOE_FAKE_INIT_DELAY_MS", delay)
+            .env("AOE_ACP_WATCHDOG_POLL_MS", "150");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        command.spawn().expect("spawn acp runner")
+    };
+
+    let old = KillOnDrop(spawn_runner("500"));
+    let old_pid = old.0.id();
+    wait_for(&record, "old registry record");
+    wait_for(&control, "old control socket");
+    wait_for(&socket, "old relay socket");
+    wait_for(&agent_pid_file, "old agent pid");
+    let old_agent_pid = std::fs::read_to_string(&agent_pid_file)
+        .expect("read old agent pid")
+        .parse::<u32>()
+        .expect("parse old agent pid");
+
+    let attach = AcpClient::attach(
+        socket.clone(),
+        home.clone(),
+        vec![],
+        "stored-codex-thread".into(),
+        false,
+        AcpSessionId(session_id.into()),
+        None,
+        "fake-agent".into(),
+        None,
+    )
+    .await;
+    assert!(
+        attach.is_err(),
+        "delayed initialize must hit the bounded timeout"
+    );
+
+    assert!(
+        !agent_of_empires::process::worker_registry::is_pid_alive(old_pid),
+        "attach failure returned before timed-out runner {old_pid} exited"
+    );
+    assert!(
+        !agent_of_empires::process::worker_registry::is_pid_alive(old_agent_pid),
+        "attach failure returned before timed-out agent {old_agent_pid} exited"
+    );
+    assert!(
+        !record.exists(),
+        "timed-out runner registry must be revoked"
+    );
+    assert!(!socket.exists(), "timed-out runner socket must be removed");
+
+    let mut replacement = KillOnDrop(spawn_runner("300"));
+    let replacement_pid = replacement.0.id();
+    assert_ne!(old_pid, replacement_pid);
+    wait_for(&record, "replacement registry record");
+    wait_for(&control, "replacement control socket");
+    wait_for(&socket, "replacement relay socket");
+
+    let mut ctl = UnixStream::connect(&control).expect("connect replacement control");
+    ctl.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert_eq!(read_frame(&mut ctl)["kind"], "hello");
+    write_frame(
+        &mut ctl,
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 2}),
+    );
+    write_frame(
+        &mut ctl,
+        &serde_json::json!({"kind": "initialize", "request": {"protocolVersion": 1}}),
+    );
+    let init_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let methods = std::fs::read_to_string(&agent_log).unwrap_or_default();
+        if methods.lines().filter(|m| *m == "initialize").count() == 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < init_deadline,
+            "replacement initialize never reached the agent"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(read_frame(&mut ctl)["kind"], "initialized");
+    write_frame(
+        &mut ctl,
+        &serde_json::json!({
+            "kind": "establish_session",
+            "method": "session/load",
+            "request": {"sessionId": "stored-codex-thread", "cwd": home.to_str().unwrap()}
+        }),
+    );
+    let ready = read_frame(&mut ctl);
+    assert_eq!(ready["kind"], "session_ready");
+    assert_eq!(ready["acp_session_id"], "stored-codex-thread");
+
+    let methods = std::fs::read_to_string(&agent_log).unwrap_or_default();
+    assert_eq!(methods.lines().filter(|m| *m == "initialize").count(), 2);
+    assert_eq!(methods.lines().filter(|m| *m == "session/load").count(), 1);
+    assert_eq!(methods.lines().filter(|m| *m == "session/new").count(), 0);
+
+    let _ = replacement.0.kill();
+    let _ = replacement.0.wait();
 }
 
 /// #2976 Phase B: the runner owns the ACP handshake. Drive it as a v2
@@ -486,6 +713,32 @@ fn runner_load_uses_requested_id_and_caches_response() {
         assert_eq!(ready["kind"], "session_ready");
         assert_eq!(ready["acp_session_id"], "existing-session");
         assert!(ready["result"].get("sessionId").is_none());
+    }
+
+    // The cache is committed to the exact loaded identity. A later daemon
+    // must not adopt a different requested id from the cached response.
+    {
+        let mut ctl = UnixStream::connect(&control).expect("reconnect control socket");
+        ctl.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        assert_eq!(read_frame(&mut ctl)["kind"], "hello");
+        write_frame(
+            &mut ctl,
+            &serde_json::json!({"kind": "attach", "control_protocol_version": 2}),
+        );
+        write_frame(
+            &mut ctl,
+            &serde_json::json!({
+                "kind": "establish_session",
+                "method": "session/load",
+                "request": {"sessionId": "different-session", "cwd": home.to_str().unwrap()}
+            }),
+        );
+        let failed = read_frame(&mut ctl);
+        assert_eq!(failed["kind"], "handshake_failed");
+        assert_eq!(
+            failed["error"]["message"],
+            "cached session establishment did not match request"
+        );
     }
 
     let deadline = Instant::now() + Duration::from_secs(5);

@@ -271,6 +271,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     // process (nor any node/`claude` descendants the adapter might spawn) to
     // leak, only the socket to remove.
     let our_pid = std::process::id();
+    let process_start_identity = worker_registry::process_start_identity_for(our_pid);
     let record = WorkerRecord::new(
         args.session_id.clone(),
         our_pid,
@@ -298,7 +299,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         Err(e) => {
             // Roll back the record and socket we just wrote so a failed spawn
             // leaves nothing for the daemon to dial or later sweep.
-            worker_registry::delete(&args.session_id).ok();
+            worker_registry::delete_record_if_current(&record, process_start_identity).ok();
             return Err(e).with_context(|| format!("spawning agent {:?}", args.agent_argv));
         }
     };
@@ -422,6 +423,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     let (watchdog_handle, mut watchdog_rx) = watchdog_task;
 
     let accept_session_id = session_id.clone();
+    let accept_record = record.clone();
     let accept_shared = Arc::clone(&shared);
     let accept_detached = Arc::clone(&detached_since);
     let accept_loop = async move {
@@ -433,7 +435,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
                         session = %accept_session_id,
                         "daemon connected"
                     );
-                    worker_registry::mark_attached(&accept_session_id);
+                    worker_registry::mark_attached(&accept_record);
                     accept_detached.store(ATTACHED, Ordering::Relaxed);
                     handle_connection(
                         stream,
@@ -447,7 +449,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
                         session = %accept_session_id,
                         "daemon disconnected; runner stays alive"
                     );
-                    worker_registry::mark_detached(&accept_session_id);
+                    worker_registry::mark_detached(&accept_record);
                     accept_detached.store(now_secs(), Ordering::Relaxed);
                 }
                 Err(e) => {
@@ -512,7 +514,14 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
                 if matches!(reason, WatchdogShutdown::Superseded) {
                     preserve_registry = true;
                 }
-                self_terminate_agent_tree(reason, &session_id, our_pid, &mut agent_child).await;
+                self_terminate_agent_tree(
+                    reason,
+                    &record,
+                    process_start_identity,
+                    our_pid,
+                    &mut agent_child,
+                )
+                .await;
             }
         }
         _ = accept_loop => {
@@ -524,7 +533,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     agent_stdout_task.abort();
     control_accept_task.abort();
     if !preserve_registry {
-        worker_registry::delete(&session_id).ok();
+        worker_registry::delete_record_if_current(&record, process_start_identity).ok();
     }
     Ok(())
 }
@@ -612,10 +621,12 @@ async fn run_watchdog(
 /// is left orphaned under PID 1.
 async fn self_terminate_agent_tree(
     reason: WatchdogShutdown,
-    session_id: &str,
+    record: &WorkerRecord,
+    process_start_identity: Option<u64>,
     own_pid: u32,
     agent_child: &mut Child,
 ) {
+    let session_id = &record.session_id;
     info!(
         target: "acp.runner",
         session = %session_id,
@@ -630,7 +641,7 @@ async fn self_terminate_agent_tree(
     // so cleanup is safe and clears a stale socket that would confuse
     // attach.
     if !matches!(reason, WatchdogShutdown::Superseded) {
-        worker_registry::delete(session_id).ok();
+        worker_registry::delete_record_if_current(record, process_start_identity).ok();
     }
 
     // Polite SIGTERM to the agent (node) so a cooperative adapter can
@@ -699,6 +710,10 @@ struct RunnerShared {
     /// through the control channel; replayed verbatim on every later
     /// attach so the agent is handshaken exactly once.
     handshake: Mutex<RunnerHandshake>,
+    /// Serialize current-v2 control handshakes through the agent response and
+    /// cache publication so overlapping control attaches cannot initialize or
+    /// load the same writer twice.
+    handshake_gate: Mutex<()>,
     /// Monotonic JSON-RPC id allocator for the requests the runner issues
     /// to the agent on its own (`initialize`, `session/*`, `session/prompt`)
     /// now that it owns the client side of the protocol. On the v2 path the
@@ -735,7 +750,14 @@ struct RunnerHandshake {
     initialized: Option<serde_json::Value>,
     /// Cached `(acp_session_id, raw session response result)` once the
     /// session is established.
-    session: Option<(String, serde_json::Value)>,
+    session: Option<(SessionRequestKey, String, serde_json::Value)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SessionRequestKey {
+    New,
+    Load(String),
+    Fork(String),
 }
 
 /// Control-channel state for the sibling `<id>.control.sock`. A single
@@ -842,6 +864,7 @@ impl RunnerShared {
             control: Mutex::new(ControlChannel::default()),
             main_attached: std::sync::atomic::AtomicBool::new(false),
             handshake: Mutex::new(RunnerHandshake::default()),
+            handshake_gate: Mutex::new(()),
             next_req_id: AtomicI64::new(RUNNER_REQUEST_ID_BASE),
             pending_client_responses: Mutex::new(HashMap::new()),
             relay_session_news: Mutex::new(HashSet::new()),
@@ -1275,6 +1298,10 @@ impl RunnerShared {
         if let Some(cached) = self.handshake.lock().await.initialized.clone() {
             return Ok(cached);
         }
+        let _gate = self.handshake_gate.lock().await;
+        if let Some(cached) = self.handshake.lock().await.initialized.clone() {
+            return Ok(cached);
+        }
         let response = self
             .agent_request(agent_stdin, "initialize", request)
             .await
@@ -1296,7 +1323,13 @@ impl RunnerShared {
         request: serde_json::Value,
     ) -> Result<(String, serde_json::Value), serde_json::Value> {
         if let Some(cached) = self.handshake.lock().await.session.clone() {
-            return Ok(cached);
+            return replay_cached_session(method, &request, cached)
+                .map(|(_, session_id, result)| (session_id, result));
+        }
+        let _gate = self.handshake_gate.lock().await;
+        if let Some(cached) = self.handshake.lock().await.session.clone() {
+            return replay_cached_session(method, &request, cached)
+                .map(|(_, session_id, result)| (session_id, result));
         }
         let response = self
             .agent_request(agent_stdin, method, request.clone())
@@ -1304,9 +1337,10 @@ impl RunnerShared {
             .ok_or_else(|| transport_error(&format!("agent closed before answering {method}")))?;
         let result = handshake_result(&response)?;
         let acp_session_id = established_session_id(method, &request, &result)?;
-        let cached = (acp_session_id, result);
+        let key = session_request_key(method, &request)?;
+        let cached = (key, acp_session_id.clone(), result.clone());
         self.handshake.lock().await.session = Some(cached.clone());
-        Ok(cached)
+        Ok((acp_session_id, result))
     }
 
     /// The ACP session id the runner established, if any.
@@ -1316,7 +1350,7 @@ impl RunnerShared {
             .await
             .session
             .as_ref()
-            .map(|(id, _)| id.clone())
+            .map(|(_, id, _)| id.clone())
     }
 
     /// If a daemon re-sends a handshake request over the relay after the
@@ -1327,19 +1361,35 @@ impl RunnerShared {
     /// runner a v2 daemon already handshook. Returns the synthesized
     /// response line to send back to the daemon, or None to forward the
     /// line to the agent unchanged.
-    async fn intercept_handshake(&self, line: &[u8]) -> Option<Vec<u8>> {
-        let (id, method) = parse_request(line)?;
-        let result = {
-            let hs = self.handshake.lock().await;
-            match method.as_str() {
-                "initialize" => hs.initialized.clone()?,
-                "session/new" | "session/load" | "session/fork" => {
-                    hs.session.as_ref().map(|(_, r)| r.clone())?
-                }
-                _ => return None,
-            }
+    async fn intercept_handshake(
+        &self,
+        agent_stdin: &Mutex<tokio::process::ChildStdin>,
+        line: &[u8],
+    ) -> Option<Vec<u8>> {
+        let request: serde_json::Value = serde_json::from_slice(line).ok()?;
+        let id = request.get("id")?.clone();
+        let method = request.get("method")?.as_str()?;
+        let params = request.get("params").cloned().unwrap_or_default();
+        // A daemon-driven reset intentionally stays on the raw relay so its
+        // response refreshes the established-session cache below.
+        if method == "session/new"
+            && id.is_string()
+            && self.handshake.lock().await.session.is_some()
+        {
+            return None;
+        }
+        let outcome = match method {
+            "initialize" => self.run_or_replay_initialize(agent_stdin, params).await,
+            "session/new" | "session/load" | "session/fork" => self
+                .run_or_replay_session(agent_stdin, method, params)
+                .await
+                .map(|(_, result)| result),
+            _ => return None,
         };
-        let resp = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
+        let resp = match outcome {
+            Ok(result) => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+            Err(error) => serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": error }),
+        };
         let mut bytes = serde_json::to_vec(&resp).ok()?;
         bytes.push(b'\n');
         Some(bytes)
@@ -1393,7 +1443,8 @@ impl RunnerShared {
             new_acp_session_id = %sid,
             "daemon-driven session/new observed on the relay; refreshing handshake cache"
         );
-        self.handshake.lock().await.session = Some((sid.to_string(), result));
+        self.handshake.lock().await.session =
+            Some((SessionRequestKey::New, sid.to_string(), result));
     }
 }
 
@@ -1409,6 +1460,41 @@ fn handshake_result(response: &serde_json::Value) -> Result<serde_json::Value, s
         .get("result")
         .cloned()
         .ok_or_else(|| transport_error("response had neither result nor error"))
+}
+
+fn replay_cached_session(
+    method: &str,
+    request: &serde_json::Value,
+    cached: (SessionRequestKey, String, serde_json::Value),
+) -> Result<(SessionRequestKey, String, serde_json::Value), serde_json::Value> {
+    if session_request_key(method, request)? != cached.0 {
+        return Err(transport_error(
+            "cached session establishment did not match request",
+        ));
+    }
+    Ok(cached)
+}
+
+fn session_request_key(
+    method: &str,
+    request: &serde_json::Value,
+) -> Result<SessionRequestKey, serde_json::Value> {
+    match method {
+        "session/new" => Ok(SessionRequestKey::New),
+        "session/load" => request
+            .get("sessionId")
+            .and_then(serde_json::Value::as_str)
+            .map(|id| SessionRequestKey::Load(id.to_string()))
+            .ok_or_else(|| transport_error("session/load request missing sessionId")),
+        "session/fork" => request
+            .get("sessionId")
+            .and_then(serde_json::Value::as_str)
+            .map(|id| SessionRequestKey::Fork(id.to_string()))
+            .ok_or_else(|| transport_error("session/fork request missing sessionId")),
+        _ => Err(transport_error(&format!(
+            "unsupported session establishment method {method}"
+        ))),
+    }
 }
 
 /// Resolve the session identity established by a successful session request.
@@ -1666,7 +1752,7 @@ async fn handle_connection(
                 // #2976: once the runner owns the session, answer a relay
                 // handshake re-send from cache rather than double-initialize
                 // the agent (v1-daemon downgrade reattach).
-                if let Some(synth) = shared.intercept_handshake(&line).await {
+                if let Some(synth) = shared.intercept_handshake(&agent_stdin, &line).await {
                     shared.deliver_line(&synth).await;
                     continue;
                 }
@@ -2163,8 +2249,11 @@ mod tests {
     #[tokio::test]
     async fn relay_session_new_response_refreshes_handshake_cache() {
         let shared = RunnerShared::new();
-        shared.handshake.lock().await.session =
-            Some(("sid-1".into(), serde_json::json!({ "sessionId": "sid-1" })));
+        shared.handshake.lock().await.session = Some((
+            SessionRequestKey::New,
+            "sid-1".into(),
+            serde_json::json!({ "sessionId": "sid-1" }),
+        ));
 
         shared
             .note_relay_session_new(
@@ -2207,6 +2296,213 @@ mod tests {
             )
             .await;
         assert_eq!(shared.acp_session_id().await.as_deref(), Some("sid-2"));
+    }
+
+    #[tokio::test]
+    async fn relay_cached_load_rejects_a_different_session_id() {
+        let shared = RunnerShared::new();
+        shared.handshake.lock().await.session = Some((
+            SessionRequestKey::Load("sid-a".into()),
+            "sid-a".into(),
+            serde_json::json!({}),
+        ));
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn inert agent fixture");
+        let stdin = Mutex::new(child.stdin.take().expect("fixture stdin"));
+
+        let same = shared
+            .intercept_handshake(
+                &stdin,
+                br#"{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"sid-a"}}"#,
+            )
+            .await
+            .expect("same-id cache replay");
+        let same: serde_json::Value = serde_json::from_slice(&same).expect("same-id response");
+        assert_eq!(same["result"], serde_json::json!({}));
+
+        let mismatched = shared
+            .intercept_handshake(
+                &stdin,
+                br#"{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"sid-b"}}"#,
+            )
+            .await
+            .expect("mismatched cache rejection");
+        let mismatched: serde_json::Value =
+            serde_json::from_slice(&mismatched).expect("mismatch response");
+        assert_eq!(
+            mismatched["error"]["message"],
+            "cached session establishment did not match request"
+        );
+        child.kill().await.expect("stop inert agent fixture");
+        child.wait().await.expect("reap inert agent fixture");
+    }
+
+    #[tokio::test]
+    async fn relay_cache_binds_string_id_method_and_fork_parent() {
+        let shared = RunnerShared::new();
+        shared.handshake.lock().await.session = Some((
+            SessionRequestKey::Fork("parent-a".into()),
+            "child-a".into(),
+            serde_json::json!({"sessionId": "child-a"}),
+        ));
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn inert agent fixture");
+        let stdin = Mutex::new(child.stdin.take().expect("fixture stdin"));
+
+        let same = shared
+            .intercept_handshake(
+                &stdin,
+                br#"{"jsonrpc":"2.0","id":"uuid-1","method":"session/fork","params":{"sessionId":"parent-a"}}"#,
+            )
+            .await
+            .expect("same-parent replay");
+        let same: serde_json::Value = serde_json::from_slice(&same).expect("response");
+        assert_eq!(same["id"], "uuid-1");
+        assert_eq!(same["result"]["sessionId"], "child-a");
+
+        for request in [
+            br#"{"jsonrpc":"2.0","id":"uuid-2","method":"session/fork","params":{"sessionId":"parent-b"}}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":"uuid-3","method":"session/load","params":{"sessionId":"child-a"}}"#.as_slice(),
+        ] {
+            let rejected = shared
+                .intercept_handshake(&stdin, request)
+                .await
+                .expect("semantic mismatch response");
+            let rejected: serde_json::Value =
+                serde_json::from_slice(&rejected).expect("response");
+            assert_eq!(
+                rejected["error"]["message"],
+                "cached session establishment did not match request"
+            );
+        }
+
+        child.kill().await.expect("stop inert agent fixture");
+        child.wait().await.expect("reap inert agent fixture");
+    }
+
+    #[tokio::test]
+    async fn concurrent_control_handshakes_issue_once() {
+        async fn answer_one(shared: &RunnerShared, result: serde_json::Value) {
+            loop {
+                let response = {
+                    let mut pending = shared.pending_client_responses.lock().await;
+                    if pending.is_empty() {
+                        None
+                    } else {
+                        assert_eq!(pending.len(), 1, "only one ACP request may be in flight");
+                        let id = *pending.keys().next().expect("pending request id");
+                        pending.remove(&id).map(|tx| (id, tx))
+                    }
+                };
+                if let Some((id, tx)) = response {
+                    tx.send(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}))
+                        .expect("answer runner request");
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let shared = RunnerShared::new();
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn inert agent fixture");
+        let stdin = Mutex::new(child.stdin.take().expect("fixture stdin"));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let first = shared.run_or_replay_initialize(&stdin, serde_json::json!({}));
+            let second = shared.run_or_replay_initialize(&stdin, serde_json::json!({}));
+            let answer = answer_one(&shared, serde_json::json!({"protocolVersion": 1}));
+            let (first, second, ()) = tokio::join!(first, second, answer);
+            assert!(first.is_ok());
+            assert!(second.is_ok());
+
+            let first = shared.run_or_replay_session(
+                &stdin,
+                "session/load",
+                serde_json::json!({"sessionId": "stored"}),
+            );
+            let second = shared.run_or_replay_session(
+                &stdin,
+                "session/load",
+                serde_json::json!({"sessionId": "stored"}),
+            );
+            let answer = answer_one(&shared, serde_json::json!({}));
+            let (first, second, ()) = tokio::join!(first, second, answer);
+            assert_eq!(first.expect("first load").0, "stored");
+            assert_eq!(second.expect("cached load").0, "stored");
+        })
+        .await
+        .expect("concurrent handshakes must settle");
+
+        assert_eq!(
+            shared.next_req_id.load(Ordering::Relaxed),
+            RUNNER_REQUEST_ID_BASE + 2,
+            "two control callers must issue one initialize and one load"
+        );
+        child.kill().await.expect("stop inert agent fixture");
+    }
+
+    #[tokio::test]
+    async fn concurrent_relay_and_control_handshake_issue_once() {
+        let shared = RunnerShared::new();
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn inert agent fixture");
+        let stdin = Mutex::new(child.stdin.take().expect("fixture stdin"));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let relay = shared.intercept_handshake(
+                &stdin,
+                br#"{"jsonrpc":"2.0","id":"uuid-init","method":"initialize","params":{}}"#,
+            );
+            let control = shared.run_or_replay_initialize(&stdin, serde_json::json!({}));
+            let answer = async {
+                loop {
+                    let response = {
+                        let mut pending = shared.pending_client_responses.lock().await;
+                        let id = pending.keys().next().copied();
+                        id.and_then(|id| pending.remove(&id).map(|tx| (id, tx)))
+                    };
+                    if let Some((id, tx)) = response {
+                        tx.send(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {"protocolVersion": 1}
+                        }))
+                        .expect("answer runner request");
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            };
+            let (relay, control, ()) = tokio::join!(relay, control, answer);
+            let relay: serde_json::Value =
+                serde_json::from_slice(&relay.expect("relay handshake response"))
+                    .expect("relay response json");
+            assert_eq!(relay["id"], "uuid-init");
+            assert!(control.is_ok());
+        })
+        .await
+        .expect("relay/control handshake must settle");
+
+        assert_eq!(
+            shared.next_req_id.load(Ordering::Relaxed),
+            RUNNER_REQUEST_ID_BASE + 1,
+            "relay and control must share one initialize effect"
+        );
+        child.kill().await.expect("stop inert agent fixture");
+        child.wait().await.expect("reap inert agent fixture");
     }
 
     #[test]

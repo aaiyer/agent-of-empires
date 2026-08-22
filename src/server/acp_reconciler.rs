@@ -1013,7 +1013,7 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
 /// after, which tears down the attached handle and clears `attempted`, so
 /// the resume pass fresh-spawns on the current binary. See #1754.
 async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
-    for id in state.acp_supervisor.build_respawn_pending_ids() {
+    for (id, runner_generation) in state.acp_supervisor.build_respawn_pending_generations() {
         let store = Arc::clone(&state.acp_event_store);
         let id_probe = id.clone();
         let in_flight =
@@ -1039,9 +1039,127 @@ async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
             session = %id,
             "build-stale structured view worker drained; respawning on current binary"
         );
-        crate::process::worker_registry::mark_restart_pending(&id);
-        crate::process::worker_registry::terminate(&id);
-        state.acp_supervisor.clear_build_respawn_pending(&id);
+        let runner_generation = match crate::process::worker_registry::load_existing_strict(&id) {
+            Ok(Some(record)) => {
+                if !runner_generation.identifies_record(&record) {
+                    if state
+                        .acp_supervisor
+                        .clear_build_respawn_pending(&id, &runner_generation)
+                    {
+                        crate::process::worker_registry::take_restart_marker(&id);
+                    }
+                    continue;
+                }
+                if !crate::process::worker_registry::is_pid_alive(record.pid) {
+                    match crate::process::worker_registry::delete_dead_record_if_current(&record) {
+                        Ok(crate::process::worker_registry::GenerationDeleteOutcome::Deleted)
+                        | Ok(crate::process::worker_registry::GenerationDeleteOutcome::Missing) => {
+                            let cleared = state
+                                .acp_supervisor
+                                .clear_build_respawn_pending(&id, &runner_generation);
+                            if cleared
+                                && !state.acp_supervisor.is_running(&id).await
+                                && crate::process::worker_registry::take_restart_marker(&id)
+                            {
+                                state.acp_supervisor.request_respawn(&id);
+                            }
+                        }
+                        Ok(crate::process::worker_registry::GenerationDeleteOutcome::Changed)
+                        | Err(_) => {}
+                    }
+                    continue;
+                }
+                runner_generation
+                    .matches_record(&record)
+                    .then_some(runner_generation)
+            }
+            Ok(None) => {
+                if crate::acp::acp_client::runner_generation_has_drifted(&runner_generation) {
+                    if state
+                        .acp_supervisor
+                        .clear_build_respawn_pending(&id, &runner_generation)
+                    {
+                        crate::process::worker_registry::take_restart_marker(&id);
+                    }
+                } else if !crate::process::worker_registry::is_pid_alive(runner_generation.pid()) {
+                    let cleared = state
+                        .acp_supervisor
+                        .clear_build_respawn_pending(&id, &runner_generation);
+                    if cleared
+                        && !state.acp_supervisor.is_running(&id).await
+                        && crate::process::worker_registry::take_restart_marker(&id)
+                    {
+                        state.acp_supervisor.request_respawn(&id);
+                    }
+                }
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    "cannot authenticate drained stale runner generation: {error}"
+                );
+                continue;
+            }
+        };
+        let Some(runner_generation) = runner_generation else {
+            tracing::warn!(
+                target: "acp.supervisor",
+                session = %id,
+                "drained stale runner generation did not match its canonical identity"
+            );
+            continue;
+        };
+        terminate_drained_runner_generation(state, &id, &runner_generation, None).await;
+    }
+}
+
+async fn terminate_drained_runner_generation(
+    state: &Arc<AppState>,
+    id: &str,
+    runner_generation: &crate::acp::acp_client::RunnerGeneration,
+    deadline: Option<Duration>,
+) {
+    crate::process::worker_registry::mark_restart_pending(id);
+    let terminated = match deadline {
+        Some(deadline) => {
+            crate::acp::acp_client::terminate_runner_generation_with_deadline(
+                runner_generation,
+                deadline,
+            )
+            .await
+        }
+        None => crate::acp::acp_client::terminate_runner_generation(runner_generation).await,
+    };
+    if !terminated {
+        if crate::acp::acp_client::runner_generation_has_drifted(runner_generation) {
+            if state
+                .acp_supervisor
+                .clear_build_respawn_pending(id, runner_generation)
+            {
+                crate::process::worker_registry::take_restart_marker(id);
+            }
+            return;
+        }
+        state
+            .acp_supervisor
+            .mark_build_respawn_pending(id, runner_generation.clone());
+        tracing::warn!(
+            target: "acp.supervisor",
+            session = %id,
+            "drained stale runner did not exit after bounded cleanup"
+        );
+        return;
+    }
+    let cleared = state
+        .acp_supervisor
+        .clear_build_respawn_pending(id, runner_generation);
+    if cleared
+        && !state.acp_supervisor.is_running(id).await
+        && crate::process::worker_registry::take_restart_marker(id)
+    {
+        state.acp_supervisor.request_respawn(id);
     }
 }
 
@@ -1319,17 +1437,63 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
     // session and the runner is still alive, dial its socket instead
     // of spawning a fresh agent. Bounded by the registry probe — no
     // network IO unless we have a live PID + socket on disk.
-    if let Ok(Some(record)) = crate::process::worker_registry::load(&id) {
+    let registry_record = match crate::process::worker_registry::load_existing_strict(&id) {
+        Ok(Some(record)) => Some(record),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(
+                target: "acp.supervisor",
+                session = %id,
+                "runner registry read failed; deferring recovery: {error}"
+            );
+            return ResumeOutcome::RetryAfterAttachTimeout;
+        }
+    };
+    if let Some(record) = registry_record {
+        let pid_alive = crate::process::worker_registry::is_pid_alive(record.pid);
         let decision = adopt_decision(
             crate::process::worker_registry::is_record_live(&record),
             crate::process::worker_registry::is_build_current(&record),
             in_flight_turn,
         );
+        let runner_generation = if pid_alive {
+            crate::process::worker_registry::socket_path_for(&id)
+                .ok()
+                .and_then(|socket| {
+                    crate::acp::acp_client::RunnerGeneration::from_record(&record, &id, &socket)
+                })
+        } else {
+            None
+        };
+        #[cfg(target_os = "macos")]
+        let legacy_macos_generation = pid_alive && record.process_start_identity.is_none();
+        #[cfg(not(target_os = "macos"))]
+        let legacy_macos_generation = false;
+        if pid_alive && runner_generation.is_none() && !legacy_macos_generation {
+            tracing::warn!(
+                target: "acp.supervisor",
+                session = %id,
+                "runner generation did not match its canonical identity; deferring recovery"
+            );
+            return ResumeOutcome::RetryAfterAttachTimeout;
+        }
         if decision == AdoptDecision::FreshSpawn {
-            // Dead PID or missing socket: sweep the orphan registry entry
-            // so the fall-through below is a clean fresh spawn.
-            crate::process::worker_registry::delete(&id).ok();
+            if let Some(runner_generation) = runner_generation.as_ref() {
+                if !crate::acp::acp_client::terminate_runner_generation(runner_generation).await {
+                    return ResumeOutcome::RetryAfterAttachTimeout;
+                }
+            } else {
+                match crate::process::worker_registry::delete_dead_record_if_current(&record) {
+                    Ok(crate::process::worker_registry::GenerationDeleteOutcome::Deleted)
+                    | Ok(crate::process::worker_registry::GenerationDeleteOutcome::Missing) => {}
+                    Ok(crate::process::worker_registry::GenerationDeleteOutcome::Changed)
+                    | Err(_) => return ResumeOutcome::RetryAfterAttachTimeout,
+                }
+            }
         } else if decision == AdoptDecision::RespawnStaleIdle {
+            let Some(runner_generation) = runner_generation.as_ref() else {
+                return ResumeOutcome::RetryAfterAttachTimeout;
+            };
             // The runner survived a daemon restart but is executing an
             // older binary (e.g. after `aoe update`) and has no in-flight
             // turn. Replace it now: SIGTERM the stale runner group (which
@@ -1342,7 +1506,15 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                 new_build = crate::build_info::BUILD_VERSION,
                 "respawning idle build-stale structured view worker on current binary"
             );
-            crate::process::worker_registry::terminate(&id);
+            if !crate::acp::acp_client::terminate_runner_generation(runner_generation).await {
+                tracing::warn!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    pid = record.pid,
+                    "build-stale runner did not exit after bounded cleanup"
+                );
+                return ResumeOutcome::RetryAfterAttachTimeout;
+            }
         } else {
             // Attach or AdoptStaleForDrain: dial the live runner.
             if decision == AdoptDecision::AdoptStaleForDrain {
@@ -1358,7 +1530,12 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                     new_build = crate::build_info::BUILD_VERSION,
                     "adopting build-stale structured view worker to drain in-flight turn before respawn"
                 );
-                state.acp_supervisor.mark_build_respawn_pending(&id);
+                let Some(runner_generation) = runner_generation.as_ref() else {
+                    return ResumeOutcome::RetryAfterAttachTimeout;
+                };
+                state
+                    .acp_supervisor
+                    .mark_build_respawn_pending(&id, runner_generation.clone());
             }
             let supervisor = Arc::clone(&state.acp_supervisor);
             let cwd = PathBuf::from(&project_path);
@@ -1416,7 +1593,19 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                         session = %id,
                         "attach failed; falling back to fresh spawn: {e}"
                     );
-                    crate::process::worker_registry::delete(&id).ok();
+                    let Some(runner_generation) = runner_generation.as_ref() else {
+                        return ResumeOutcome::RetryAfterAttachTimeout;
+                    };
+                    if !crate::acp::acp_client::terminate_runner_generation(runner_generation).await
+                    {
+                        tracing::warn!(
+                            target: "acp.supervisor",
+                            session = %id,
+                            pid = record.pid,
+                            "runner generation did not exit after bounded cleanup"
+                        );
+                        return ResumeOutcome::RetryAfterAttachTimeout;
+                    }
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -1424,7 +1613,18 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                         session = %id,
                         "attach timed out after 3s; falling back to fresh spawn"
                     );
-                    crate::process::worker_registry::delete(&id).ok();
+                    let Some(runner_generation) = runner_generation.as_ref() else {
+                        return ResumeOutcome::RetryAfterAttachTimeout;
+                    };
+                    if !crate::acp::acp_client::terminate_runner_generation(runner_generation).await
+                    {
+                        tracing::warn!(
+                            target: "acp.supervisor",
+                            session = %id,
+                            pid = record.pid,
+                            "timed-out runner generation did not exit after bounded cleanup"
+                        );
+                    }
                     return ResumeOutcome::RetryAfterAttachTimeout;
                 }
             }
@@ -1880,15 +2080,10 @@ pub(crate) async fn trigger_resume_background(
     Ok(ResumeTrigger::Started)
 }
 
-/// Re-adopt live orphan runners. A fresh spawn whose in-memory handshake
-/// fails or times out can leave its DETACHED runner alive and registered on
-/// disk: the runner binds its socket and writes its registry entry BEFORE the
-/// handshake completes, and `connect_via_socket`'s error/timeout path does not
-/// kill it (the runner owns the agent and survives daemon death by design).
-/// Such a session is left in `attempted` with no in-memory worker, so the
-/// reconciler's work-list loop skips it forever and the live runner is never
-/// reattached, so every prompt 404s even though `aoe acp ps` shows the worker
-/// alive.
+/// Re-adopt live orphan runners left behind when the daemon exits after the
+/// runner registers but before it records the in-memory worker. Such a session
+/// is left in `attempted` with no in-memory worker, so the reconciler's
+/// work-list loop skips it forever and the live runner is never reattached.
 ///
 /// This is the live-session mirror of `sweep_orphan_workers`, which only reaps
 /// runners whose session is GONE; here the session IS live, so clear it from
@@ -1941,22 +2136,38 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
             pid = record.pid,
             "sweeping orphan worker (no matching session on disk)"
         );
-        // Group-kill with SIGKILL escalation, not a single-pid SIGTERM: the
-        // orphan's node wrapper and `claude` grandchild share the runner's
-        // process group, and a bare SIGTERM to just the leader pid can
-        // leave them alive under PID 1 (part of the leak this fixes). The
-        // escalation runs detached so one stubborn orphan can't stall the
-        // sweep for the grace window. If the daemon exits within the 2s
-        // grace the spawned task is dropped before its SIGKILL fires, so a
-        // grandchild that ignored the SIGTERM survives with only that
-        // signal; the next daemon boot re-sweeps it, so this is acceptable.
-        // See #1921.
-        #[cfg(unix)]
-        tokio::spawn(crate::process::worker::reap_group_escalating(
-            record.pid,
-            std::time::Duration::from_secs(2),
-        ));
-        crate::process::worker_registry::delete(&record.session_id).ok();
+        if !crate::process::worker_registry::is_pid_alive(record.pid) {
+            if !matches!(
+                crate::process::worker_registry::delete_dead_record_if_current(&record),
+                Ok(crate::process::worker_registry::GenerationDeleteOutcome::Deleted)
+                    | Ok(crate::process::worker_registry::GenerationDeleteOutcome::Missing)
+            ) {
+                tracing::warn!(
+                    target: "acp.supervisor",
+                    session = %record.session_id,
+                    "orphan dead-record cleanup deferred because its generation changed"
+                );
+            }
+            continue;
+        }
+        let generation = crate::process::worker_registry::socket_path_for(&record.session_id)
+            .ok()
+            .and_then(|socket| {
+                crate::acp::acp_client::RunnerGeneration::from_record(
+                    &record,
+                    &record.session_id,
+                    &socket,
+                )
+            });
+        if let Some(generation) = generation {
+            if !crate::acp::acp_client::terminate_runner_generation(&generation).await {
+                tracing::warn!(
+                    target: "acp.supervisor",
+                    session = %record.session_id,
+                    "orphan runner teardown deferred because its generation changed or did not exit"
+                );
+            }
+        }
     }
 }
 
@@ -1964,8 +2175,8 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
 mod tests {
     use super::{
         adopt_decision, rate_limit_resume_at, rate_limit_unknown_reset_retry_at, should_auto_stop,
-        should_readopt_orphan_runner, AdoptDecision, RATE_LIMIT_MIN_PARK_SECS,
-        RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS,
+        should_readopt_orphan_runner, terminate_drained_runner_generation, AdoptDecision,
+        RATE_LIMIT_MIN_PARK_SECS, RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS,
     };
     use chrono::{Duration, TimeZone, Utc};
 
@@ -2647,6 +2858,263 @@ mod tests {
             !crate::process::worker_registry::take_restart_marker("s-late-marker"),
             "the marker must be consumed by the tick, not left to poison a later stop"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn drained_stale_generation_drift_consumes_restart_intent_without_killing_replacement() {
+        use std::os::unix::process::CommandExt;
+
+        let id = "s-drained-generation-drift";
+        let (state, _home, project) = capacity_test_state(id).await;
+        let spawn_group = || {
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30").process_group(0);
+            command.spawn().expect("spawn isolated process group")
+        };
+        let mut stale = spawn_group();
+        let mut replacement = spawn_group();
+        let socket =
+            crate::process::worker_registry::socket_path_for(id).expect("canonical worker socket");
+        let stale_record = crate::process::worker_registry::WorkerRecord::new(
+            id.into(),
+            stale.id(),
+            socket.clone(),
+            "fake-agent".into(),
+            "fake-agent".into(),
+            project.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&stale_record).expect("save stale generation");
+        let stale_generation =
+            crate::acp::acp_client::RunnerGeneration::from_record(&stale_record, id, &socket)
+                .expect("capture stale generation");
+        let replacement_record = crate::process::worker_registry::WorkerRecord {
+            pid: replacement.id(),
+            process_start_identity: crate::process::worker_registry::process_start_identity_for(
+                replacement.id(),
+            ),
+            started_at: stale_record.started_at.saturating_add(1),
+            ..stale_record
+        };
+        crate::process::worker_registry::save(&replacement_record)
+            .expect("publish replacement generation");
+        state
+            .acp_supervisor
+            .mark_build_respawn_pending(id, stale_generation.clone());
+
+        terminate_drained_runner_generation(&state, id, &stale_generation, None).await;
+
+        assert!(!state
+            .acp_supervisor
+            .build_respawn_pending_generations()
+            .iter()
+            .any(|(pending, _)| pending == id));
+        assert!(!crate::process::worker_registry::take_restart_marker(id));
+        assert!(crate::process::worker_registry::is_pid_alive(stale.id()));
+        assert!(crate::process::worker_registry::is_pid_alive(
+            replacement.id()
+        ));
+
+        // The production pass must not treat a live PID with a missing
+        // socket as dead registry debris. It tears down that exact process
+        // generation before permitting a fresh spawn.
+        let replacement_generation =
+            crate::acp::acp_client::RunnerGeneration::from_record(&replacement_record, id, &socket)
+                .expect("capture replacement generation");
+        state
+            .acp_supervisor
+            .mark_build_respawn_pending(id, replacement_generation.clone());
+        super::respawn_drained_stale_workers(&state).await;
+        assert!(!crate::process::worker_registry::is_pid_alive(
+            replacement.id()
+        ));
+        assert!(crate::process::worker_registry::load(id)
+            .expect("load torn-down generation")
+            .is_none());
+        assert!(!state
+            .acp_supervisor
+            .build_respawn_pending_generations()
+            .iter()
+            .any(|(pending, _)| pending == id));
+        assert_eq!(
+            state.acp_supervisor.take_respawn_requests(),
+            vec![id.to_string()],
+            "a fully reaped parked generation must re-arm one replacement attempt"
+        );
+
+        crate::process::worker::kill_process_group(stale.id());
+        let _ = stale.wait();
+        let _ = replacement.wait();
+
+        let mut dead = spawn_group();
+        let dead_record = crate::process::worker_registry::WorkerRecord {
+            pid: dead.id(),
+            process_start_identity: crate::process::worker_registry::process_start_identity_for(
+                dead.id(),
+            ),
+            started_at: replacement_record.started_at.saturating_add(1),
+            ..replacement_record
+        };
+        crate::process::worker_registry::save(&dead_record).expect("save dead exact generation");
+        let dead_generation =
+            crate::acp::acp_client::RunnerGeneration::from_record(&dead_record, id, &socket)
+                .expect("capture generation before it dies");
+        crate::process::worker::kill_process_group(dead.id());
+        let _ = dead.wait();
+        crate::process::worker_registry::mark_restart_pending(id);
+        state
+            .acp_supervisor
+            .mark_build_respawn_pending(id, dead_generation.clone());
+        super::respawn_drained_stale_workers(&state).await;
+        assert!(crate::process::worker_registry::load(id)
+            .expect("load dead generation")
+            .is_none());
+        assert!(!crate::process::worker_registry::take_restart_marker(id));
+        assert!(!state
+            .acp_supervisor
+            .build_respawn_pending_generations()
+            .iter()
+            .any(|(pending, _)| pending == id));
+
+        crate::process::worker_registry::mark_restart_pending(id);
+        state
+            .acp_supervisor
+            .mark_build_respawn_pending(id, dead_generation);
+        super::respawn_drained_stale_workers(&state).await;
+        assert!(!crate::process::worker_registry::take_restart_marker(id));
+        assert!(!state
+            .acp_supervisor
+            .build_respawn_pending_generations()
+            .iter()
+            .any(|(pending, _)| pending == id));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_drain_reap_retries_the_same_generation_then_respawns_once() {
+        use std::os::unix::process::CommandExt;
+
+        let id = "s-drained-reap-retry";
+        let (state, _home, project) = capacity_test_state(id).await;
+        let ready = project.path().join("term-handler-ready");
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("trap '' TERM; touch \"$READY\"; while :; do sleep 1; done")
+            .env("READY", &ready)
+            .process_group(0);
+        let mut runner = command.spawn().expect("spawn TERM-ignoring runner group");
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !ready.exists() && std::time::Instant::now() < ready_deadline {
+            std::thread::yield_now();
+        }
+        assert!(ready.exists(), "fixture must install its TERM handler");
+
+        let socket =
+            crate::process::worker_registry::socket_path_for(id).expect("canonical worker socket");
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            id.into(),
+            runner.id(),
+            socket.clone(),
+            "fake-agent".into(),
+            "fake-agent".into(),
+            project.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&record).expect("save draining generation");
+        let generation =
+            crate::acp::acp_client::RunnerGeneration::from_record(&record, id, &socket)
+                .expect("capture draining generation");
+        state
+            .acp_supervisor
+            .mark_build_respawn_pending(id, generation.clone());
+
+        terminate_drained_runner_generation(
+            &state,
+            id,
+            &generation,
+            Some(std::time::Duration::from_millis(100)),
+        )
+        .await;
+
+        assert!(state
+            .acp_supervisor
+            .build_respawn_pending_generations()
+            .iter()
+            .any(|(pending_id, pending_generation)| {
+                pending_id == id && pending_generation == &generation
+            }));
+        assert!(crate::process::worker_registry::restart_marker_path(id)
+            .expect("restart marker path")
+            .exists());
+        assert!(state.acp_supervisor.take_respawn_requests().is_empty());
+
+        super::respawn_drained_stale_workers(&state).await;
+
+        assert!(!state
+            .acp_supervisor
+            .build_respawn_pending_generations()
+            .iter()
+            .any(|(pending_id, _)| pending_id == id));
+        assert!(!crate::process::worker_registry::take_restart_marker(id));
+        assert_eq!(
+            state.acp_supervisor.take_respawn_requests(),
+            vec![id.to_string()]
+        );
+        let _ = runner.wait();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resume_fresh_spawn_deletes_dead_record_with_persisted_identity() {
+        let id = "s-resume-dead-record";
+        let (state, _home, project) = capacity_test_state(id).await;
+        let mut record = crate::process::worker_registry::WorkerRecord::new(
+            id.into(),
+            2_000_000_000,
+            crate::process::worker_registry::socket_path_for(id).unwrap(),
+            "fake-agent".into(),
+            "fake-agent".into(),
+            project.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        record.process_start_identity = Some(1234);
+        crate::process::worker_registry::save(&record).unwrap();
+
+        let outcome = super::resume_one(
+            state,
+            super::ResumeTarget {
+                id: id.into(),
+                tool: "codex".into(),
+                agent_override: Some("aoe-no-such-agent-1027".into()),
+                model: None,
+                project_path: project.path().to_string_lossy().into_owned(),
+                stored_acp_session_id: None,
+                source_profile: String::new(),
+                in_flight_turn: false,
+                yolo_mode: false,
+                command: String::new(),
+            },
+        )
+        .await;
+
+        assert!(matches!(outcome, super::ResumeOutcome::SpawnFinished));
+        assert!(crate::process::worker_registry::load(id).unwrap().is_none());
     }
 
     /// The other half: with no marker, an id in `attempted` stays skipped.

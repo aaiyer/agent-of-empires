@@ -16,14 +16,16 @@
 //!
 //! Layout note: the runner *and* the daemon both write to entries
 //! (runner: `pid`/`started_at` on boot; daemon:
-//! `last_attached_at`/`detached_at` on attach/detach). We accept the
-//! single-writer-per-field convention rather than locking: contention
-//! windows are narrow and tearing a single field across an unclean
-//! restart at worst causes a re-attach instead of a clean attach.
+//! `last_attached_at`/`detached_at` on attach/detach). A per-session
+//! generation lock serializes record replacement, authenticated deletion,
+//! and the initial termination signal so stale cleanup cannot remove or
+//! signal a concurrently published replacement.
 
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -55,6 +57,10 @@ pub struct WorkerRecord {
     /// PID of the `aoe __acp-runner` process. Used by the stale-sweep
     /// to decide whether the registry entry corresponds to a live owner.
     pub pid: u32,
+    /// Native process start time captured by the runner that owns this
+    /// record. Binds a reused PID to the original process generation.
+    #[serde(default)]
+    pub process_start_identity: Option<u64>,
     pub socket_path: PathBuf,
     /// Binary command name that the runner was invoked with
     /// (e.g. `"claude-agent-acp"`, `"codex-acp"`). Surfaced in
@@ -113,6 +119,7 @@ impl WorkerRecord {
             build_version: crate::build_info::BUILD_VERSION.to_string(),
             session_id,
             pid,
+            process_start_identity: process_start_identity_for(pid),
             socket_path,
             agent_name,
             agent_key,
@@ -140,6 +147,37 @@ pub fn workers_dir() -> Result<PathBuf> {
 /// `<workers_dir>/<session_id>.json`.
 pub fn record_path(session_id: &str) -> Result<PathBuf> {
     crate::process::worker::record_path(&workers_dir()?, session_id)
+}
+
+/// Cross-process fence for one session's runner-generation record.
+pub(crate) struct GenerationLock {
+    file: File,
+}
+
+impl Drop for GenerationLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+pub(crate) fn lock_generation(session_id: &str) -> Result<GenerationLock> {
+    validate_session_id(session_id)?;
+    let path = workers_dir()?.join(format!(".{session_id}.generation.lock"));
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("opening generation lock at {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    file.lock_exclusive()
+        .with_context(|| format!("locking generation at {}", path.display()))?;
+    Ok(GenerationLock { file })
 }
 
 /// `<workers_dir>/<session_id>.sock`. Caller computes this once and threads
@@ -201,6 +239,11 @@ pub fn take_restart_marker(session_id: &str) -> bool {
 /// mid-write — the dial path would then fail to parse and the entry
 /// would be swept.
 pub fn save(record: &WorkerRecord) -> Result<()> {
+    let _generation_lock = lock_generation(&record.session_id)?;
+    save_unlocked(record)
+}
+
+fn save_unlocked(record: &WorkerRecord) -> Result<()> {
     let dir = workers_dir()?;
     let final_path = dir.join(format!("{}.json", record.session_id));
     let tmp_path = dir.join(format!("{}.json.tmp", record.session_id));
@@ -215,6 +258,123 @@ pub fn save(record: &WorkerRecord) -> Result<()> {
     std::fs::rename(&tmp_path, &final_path)
         .with_context(|| format!("renaming tmp record to {}", final_path.display()))?;
     Ok(())
+}
+
+/// Delete only the exact generation still named by the current record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GenerationDeleteOutcome {
+    Deleted,
+    Missing,
+    Changed,
+}
+
+fn same_generation(current: &WorkerRecord, expected: &WorkerRecord) -> bool {
+    current.session_id == expected.session_id
+        && current.pid == expected.pid
+        && current.process_start_identity == expected.process_start_identity
+        && current.socket_path == expected.socket_path
+        && current.started_at == expected.started_at
+}
+
+pub(crate) fn delete_generation_if_matches(
+    session_id: &str,
+    pid: u32,
+    socket_path: &Path,
+    started_at: Option<u64>,
+    process_start_identity: Option<u64>,
+) -> Result<GenerationDeleteOutcome> {
+    let _generation_lock = lock_generation(session_id)?;
+    let Some(current) = load_existing_strict(session_id)? else {
+        return Ok(GenerationDeleteOutcome::Missing);
+    };
+    if current.session_id != session_id
+        || current.pid != pid
+        || current.process_start_identity != process_start_identity
+        || current.socket_path != socket_path
+        || started_at.is_some_and(|started| current.started_at != started)
+    {
+        return Ok(GenerationDeleteOutcome::Changed);
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(current_identity) = process_start_identity_for(pid) {
+        if Some(current_identity) != process_start_identity {
+            return Ok(GenerationDeleteOutcome::Changed);
+        }
+    }
+    delete_unlocked(session_id)?;
+    Ok(GenerationDeleteOutcome::Deleted)
+}
+
+pub(crate) fn delete_record_if_current(
+    record: &WorkerRecord,
+    process_start_identity: Option<u64>,
+) -> Result<GenerationDeleteOutcome> {
+    delete_generation_if_matches(
+        &record.session_id,
+        record.pid,
+        &record.socket_path,
+        Some(record.started_at),
+        process_start_identity,
+    )
+}
+
+/// Delete an exact persisted generation only after proving its process is
+/// absent. Unlike `delete_record_if_current`, this intentionally compares the
+/// record's persisted process-start identity instead of a fresh `/proc` value:
+/// a dead process has no current value to pass to that helper.
+pub(crate) fn delete_dead_record_if_current(
+    record: &WorkerRecord,
+) -> Result<GenerationDeleteOutcome> {
+    let _generation_lock = lock_generation(&record.session_id)?;
+    let Some(current) = load_existing_strict(&record.session_id)? else {
+        return Ok(GenerationDeleteOutcome::Missing);
+    };
+    if !same_generation(&current, record) {
+        return Ok(GenerationDeleteOutcome::Changed);
+    }
+    if is_pid_alive(record.pid) || process_start_identity_for(record.pid).is_some() {
+        return Ok(GenerationDeleteOutcome::Changed);
+    }
+    delete_unlocked(&record.session_id)?;
+    Ok(GenerationDeleteOutcome::Deleted)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn process_start_identity_for(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn process_start_identity_for(pid: u32) -> Option<u64> {
+    use std::mem::{size_of, zeroed};
+
+    let pid = i32::try_from(pid).ok()?;
+    // SAFETY: proc_pidinfo initializes exactly `proc_bsdinfo` bytes when it
+    // returns the expected size; every other result is rejected.
+    let info = unsafe {
+        let mut info = zeroed::<nix::libc::proc_bsdinfo>();
+        let read = nix::libc::proc_pidinfo(
+            pid,
+            nix::libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut _,
+            size_of::<nix::libc::proc_bsdinfo>() as i32,
+        );
+        (read == size_of::<nix::libc::proc_bsdinfo>() as i32).then_some(info)?
+    };
+    combine_process_start_time(info.pbi_start_tvsec, info.pbi_start_tvusec)
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn combine_process_start_time(seconds: u64, microseconds: u64) -> Option<u64> {
+    seconds.checked_mul(1_000_000)?.checked_add(microseconds)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn process_start_identity_for(_pid: u32) -> Option<u64> {
+    None
 }
 
 pub fn load(session_id: &str) -> Result<Option<WorkerRecord>> {
@@ -234,6 +394,116 @@ pub fn load(session_id: &str) -> Result<Option<WorkerRecord>> {
             Ok(None)
         }
     }
+}
+
+/// Load a generation record without converting malformed JSON into absence.
+/// Authority-sensitive spawn and teardown paths must fail closed when an
+/// existing record cannot be authenticated.
+pub(crate) fn load_existing_strict(session_id: &str) -> Result<Option<WorkerRecord>> {
+    let path = record_path(session_id)?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let record = serde_json::from_slice::<WorkerRecord>(&bytes)
+        .with_context(|| format!("parsing worker record at {}", path.display()))?;
+    Ok(Some(record))
+}
+
+/// Re-read and authenticate a runner record under its cross-process fence.
+/// Legacy live records without a persisted Linux start identity are upgraded
+/// only when the canonical socket proves the same peer PID.
+pub(crate) fn authenticate_generation_record(
+    record: &WorkerRecord,
+    session_id: &str,
+    socket_path: &Path,
+    connected_peer_pid: Option<u32>,
+) -> Result<Option<WorkerRecord>> {
+    let _generation_lock = lock_generation(session_id)?;
+    let Some(mut current) = load_existing_strict(session_id)? else {
+        return Ok(None);
+    };
+    if current.session_id != session_id
+        || current.pid != record.pid
+        || current.socket_path != socket_path
+        || current.started_at != record.started_at
+        || current.process_start_identity != record.process_start_identity
+    {
+        return Ok(None);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if current.process_start_identity.is_none() {
+            if connected_peer_pid
+                .or_else(|| crate::process::worker::peer_pid_from_socket(socket_path))
+                != Some(current.pid)
+            {
+                return Ok(None);
+            }
+            let Some(identity) = process_start_identity_for(current.pid) else {
+                return Ok(None);
+            };
+            current.process_start_identity = Some(identity);
+            save_unlocked(&current)?;
+        }
+        if current.process_start_identity != process_start_identity_for(current.pid) {
+            return Ok(None);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if current.process_start_identity.is_none() {
+            if connected_peer_pid
+                .or_else(|| crate::process::worker::peer_pid_from_socket(socket_path))
+                != Some(current.pid)
+            {
+                return Ok(None);
+            }
+            let Some(identity) = process_start_identity_for(current.pid) else {
+                return Ok(None);
+            };
+            current.process_start_identity = Some(identity);
+            save_unlocked(&current)?;
+        }
+        if current.process_start_identity != process_start_identity_for(current.pid) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(current))
+}
+
+/// Bind a just-spawned runner to the record it published after the daemon
+/// captured its PID. This is the only path that may acquire `started_at`
+/// rather than requiring it up front; every other generation operation uses
+/// the fully persisted token returned here.
+pub(crate) fn authenticate_spawned_generation(
+    session_id: &str,
+    pid: u32,
+    socket_path: &Path,
+    process_start_identity: Option<u64>,
+    peer_pid: Option<u32>,
+) -> Result<Option<WorkerRecord>> {
+    let _generation_lock = lock_generation(session_id)?;
+    let Some(current) = load_existing_strict(session_id)? else {
+        return Ok(None);
+    };
+    if current.session_id != session_id
+        || current.pid != pid
+        || current.socket_path != socket_path
+        || peer_pid != Some(current.pid)
+        || (process_start_identity.is_some()
+            && current.process_start_identity != process_start_identity)
+    {
+        return Ok(None);
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if current.process_start_identity.is_none()
+        || current.process_start_identity != process_start_identity_for(current.pid)
+    {
+        return Ok(None);
+    }
+    Ok(Some(current))
 }
 
 pub fn list() -> Result<Vec<WorkerRecord>> {
@@ -266,12 +536,42 @@ pub fn list() -> Result<Vec<WorkerRecord>> {
     Ok(out)
 }
 
+/// Enumerate every persisted worker record without treating malformed state
+/// as absence. Authority-sensitive bulk teardown must fail closed rather than
+/// silently leave an undiscovered runner eligible for replacement.
+pub(crate) fn list_existing_strict() -> Result<Vec<WorkerRecord>> {
+    let dir = workers_dir()?;
+    let read = match std::fs::read_dir(&dir) {
+        Ok(read) => read,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", dir.display())),
+    };
+    let mut out = Vec::new();
+    for entry in read {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        out.push(
+            serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing worker record at {}", path.display()))?,
+        );
+    }
+    Ok(out)
+}
+
 /// Remove the JSON entry and the unix socket file (if present). A
 /// non-empty `.log` file is intentionally left behind so the user can read
 /// it after the worker exits; an empty (0-byte) log carries no post-mortem
 /// value and is swept so a crash loop doesn't litter the workers dir with
 /// dead empty logs. See #1945.
 pub fn delete(session_id: &str) -> Result<()> {
+    let _generation_lock = lock_generation(session_id)?;
+    delete_unlocked(session_id)
+}
+
+fn delete_unlocked(session_id: &str) -> Result<()> {
     if let Ok(p) = record_path(session_id) {
         let _ = std::fs::remove_file(&p);
     }
@@ -292,30 +592,44 @@ pub fn delete(session_id: &str) -> Result<()> {
 /// Update the `last_attached_at` field in place. Best-effort: any I/O
 /// error is logged and swallowed because attach itself has already
 /// succeeded; the timestamp is purely for observability.
-pub fn mark_attached(session_id: &str) {
-    if let Ok(Some(mut rec)) = load(session_id) {
-        rec.last_attached_at = Some(now_secs());
-        rec.detached_at = None;
-        if let Err(e) = save(&rec) {
-            debug!(
-                target: "acp.registry",
-                session = %session_id,
-                "failed to update last_attached_at: {e}"
-            );
-        }
+fn update_generation_if_current(
+    expected: &WorkerRecord,
+    update: impl FnOnce(&mut WorkerRecord),
+) -> Result<bool> {
+    let _generation_lock = lock_generation(&expected.session_id)?;
+    let Some(mut current) = load_existing_strict(&expected.session_id)? else {
+        return Ok(false);
+    };
+    if !same_generation(&current, expected) {
+        return Ok(false);
+    }
+    update(&mut current);
+    save_unlocked(&current)?;
+    Ok(true)
+}
+
+pub fn mark_attached(record: &WorkerRecord) {
+    if let Err(e) = update_generation_if_current(record, |current| {
+        current.last_attached_at = Some(now_secs());
+        current.detached_at = None;
+    }) {
+        debug!(
+            target: "acp.registry",
+            session = %record.session_id,
+            "failed to update last_attached_at: {e}"
+        );
     }
 }
 
-pub fn mark_detached(session_id: &str) {
-    if let Ok(Some(mut rec)) = load(session_id) {
-        rec.detached_at = Some(now_secs());
-        if let Err(e) = save(&rec) {
-            debug!(
-                target: "acp.registry",
-                session = %session_id,
-                "failed to update detached_at: {e}"
-            );
-        }
+pub fn mark_detached(record: &WorkerRecord) {
+    if let Err(e) = update_generation_if_current(record, |current| {
+        current.detached_at = Some(now_secs());
+    }) {
+        debug!(
+            target: "acp.registry",
+            session = %record.session_id,
+            "failed to update detached_at: {e}"
+        );
     }
 }
 
@@ -323,16 +637,15 @@ pub fn mark_detached(session_id: &str) {
 /// supervisor when the drain task observes an `AcpSessionAssigned`
 /// event, so a fresh `aoe serve` knows to call `session/load` instead
 /// of `session/new` on reattach.
-pub fn update_stored_acp_session_id(session_id: &str, acp_id: Option<&str>) {
-    if let Ok(Some(mut rec)) = load(session_id) {
-        rec.stored_acp_session_id = acp_id.filter(|s| !s.is_empty()).map(|s| s.to_string());
-        if let Err(e) = save(&rec) {
-            debug!(
-                target: "acp.registry",
-                session = %session_id,
-                "failed to update stored_acp_session_id: {e}"
-            );
-        }
+pub fn update_stored_acp_session_id(record: &WorkerRecord, acp_id: Option<&str>) {
+    if let Err(e) = update_generation_if_current(record, |current| {
+        current.stored_acp_session_id = acp_id.filter(|s| !s.is_empty()).map(|s| s.to_string());
+    }) {
+        debug!(
+            target: "acp.registry",
+            session = %record.session_id,
+            "failed to update stored_acp_session_id: {e}"
+        );
     }
 }
 
@@ -430,50 +743,17 @@ pub fn pid_source_for(session_id: &str) -> Option<u32> {
     }
 }
 
-/// Reap the runner for `session_id`: resolve its PID via `pid_source_for`
-/// (on-disk record, or `SO_PEERCRED` on the live socket when the record is
-/// unreadable; see #2102), SIGTERM its whole process group, then remove
-/// the registry entry and socket.
-///
-/// The canonical teardown used by the supervisor's shutdown paths and by a
-/// fresh spawn that supersedes a stale runner, so no prior agent tree is
-/// left orphaned. When a PID is resolved, the signal targets the whole
-/// process group (`killpg`) rather than the leader alone: the group can
-/// outlive its leader pid, so gating on leader liveness would skip the
-/// killpg and leak surviving descendants. `killpg` ignores ESRCH, so an
-/// already-empty group is a harmless no-op. See #1689.
-pub fn terminate(session_id: &str) {
-    let terminated_pid = pid_source_for(session_id);
-    if let Some(pid) = terminated_pid {
-        crate::process::worker::terminate_process_group(pid);
-    }
-    // Generation-aware cleanup: only remove the entry and socket if they
-    // still belong to the runner we just signalled. A replacement runner
-    // can bind the socket and `save` a new record (with a different pid)
-    // before we reach this line; deleting then would strand the successor,
-    // whose own watchdog would see "missing" and cascade. If the record is
-    // gone, unreadable, or still carries the terminated pid, the files are
-    // ours to clear.
-    match load(session_id) {
-        Ok(Some(rec)) if Some(rec.pid) != terminated_pid => {
-            debug!(
-                target: "acp.registry",
-                session = %session_id,
-                current_pid = rec.pid,
-                "skipping cleanup; registry entry now belongs to a replacement runner"
-            );
-        }
-        _ => {
-            delete(session_id).ok();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    #[test]
+    fn native_start_time_keeps_subsecond_identity() {
+        assert_eq!(combine_process_start_time(42, 7), Some(42_000_007));
+        assert_eq!(combine_process_start_time(u64::MAX, 1), None);
+    }
 
     fn with_temp_home<F: FnOnce()>(f: F) {
         // Root under /tmp instead of the default $TMPDIR (which on
@@ -719,7 +999,7 @@ mod tests {
                 None,
             );
             save(&rec).unwrap();
-            update_stored_acp_session_id("sess-empty-acp", Some(""));
+            update_stored_acp_session_id(&rec, Some(""));
             let loaded = load("sess-empty-acp").unwrap().unwrap();
             assert_eq!(loaded.stored_acp_session_id, None);
         });
@@ -782,6 +1062,89 @@ mod tests {
 
     #[test]
     #[serial]
+    fn compare_delete_preserves_a_published_replacement_generation() {
+        with_temp_home(|| {
+            let socket = socket_path_for("replace-race").unwrap();
+            let old = WorkerRecord::new(
+                "replace-race".into(),
+                41,
+                socket.clone(),
+                "aoe-agent".into(),
+                "aoe-agent".into(),
+                PathBuf::from("/repo"),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            );
+            save(&old).unwrap();
+            let replacement = WorkerRecord {
+                pid: 42,
+                started_at: old.started_at.saturating_add(1),
+                ..old.clone()
+            };
+            save(&replacement).unwrap();
+
+            assert_eq!(
+                delete_record_if_current(&old, None).unwrap(),
+                GenerationDeleteOutcome::Changed
+            );
+            assert_eq!(load("replace-race").unwrap().unwrap().pid, 42);
+
+            #[cfg(target_os = "linux")]
+            {
+                let mut live = std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .expect("spawn live replacement");
+                let live_record = WorkerRecord {
+                    pid: live.id(),
+                    ..replacement
+                };
+                save(&live_record).unwrap();
+                let wrong_identity = process_start_identity_for(live.id()).map(|value| value + 1);
+                assert_eq!(
+                    delete_record_if_current(&live_record, wrong_identity).unwrap(),
+                    GenerationDeleteOutcome::Changed
+                );
+                assert_eq!(load("replace-race").unwrap().unwrap().pid, live.id());
+                let _ = live.kill();
+                let _ = live.wait();
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn dead_record_with_persisted_process_identity_is_deleted() {
+        with_temp_home(|| {
+            let mut record = WorkerRecord::new(
+                "dead-generation".into(),
+                2_000_000_000,
+                PathBuf::from("/tmp/dead-generation.sock"),
+                "aoe-agent".into(),
+                "aoe-agent".into(),
+                PathBuf::from("/repo"),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            );
+            record.process_start_identity = Some(1234);
+            save(&record).unwrap();
+
+            assert_eq!(
+                delete_dead_record_if_current(&record).unwrap(),
+                GenerationDeleteOutcome::Deleted
+            );
+            assert!(load("dead-generation").unwrap().is_none());
+        });
+    }
+
+    #[test]
+    #[serial]
     fn delete_sweeps_empty_log_but_keeps_nonempty() {
         with_temp_home(|| {
             // Empty log (worker died before writing anything): swept.
@@ -824,7 +1187,7 @@ mod tests {
             );
             rec.detached_at = Some(100);
             save(&rec).unwrap();
-            mark_attached("x");
+            mark_attached(&rec);
             let after = load("x").unwrap().unwrap();
             assert!(after.last_attached_at.is_some());
             assert!(after.detached_at.is_none());
@@ -833,14 +1196,12 @@ mod tests {
 
     #[test]
     #[serial]
-    fn terminate_deletes_entry_for_dead_pid() {
+    fn stale_generation_metadata_update_preserves_replacement_bytes() {
         with_temp_home(|| {
-            // 2e9 is not a live pid (see is_pid_alive_unlikely_pid), so
-            // terminate sends no signal and just clears the stale entry.
-            let rec = WorkerRecord::new(
-                "term-dead".into(),
-                2_000_000_000,
-                PathBuf::from("/tmp/term-dead.sock"),
+            let old = WorkerRecord::new(
+                "metadata-race".into(),
+                41,
+                PathBuf::from("/tmp/metadata-race.sock"),
                 "aoe-agent".into(),
                 "aoe-agent".into(),
                 PathBuf::from("/repo"),
@@ -850,20 +1211,189 @@ mod tests {
                 None,
                 None,
             );
-            save(&rec).unwrap();
-            assert!(record_path("term-dead").unwrap().exists());
-            terminate("term-dead");
-            assert!(!record_path("term-dead").unwrap().exists());
+            save(&old).unwrap();
+            let replacement = WorkerRecord {
+                pid: 42,
+                process_start_identity: Some(4242),
+                started_at: old.started_at.saturating_add(1),
+                ..old.clone()
+            };
+            save(&replacement).unwrap();
+            let path = record_path("metadata-race").unwrap();
+            let before = std::fs::read(&path).unwrap();
+
+            mark_attached(&old);
+            mark_detached(&old);
+            update_stored_acp_session_id(&old, Some("stale-acp-id"));
+
+            assert_eq!(std::fs::read(path).unwrap(), before);
         });
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     #[serial]
-    fn terminate_missing_entry_is_noop() {
+    fn legacy_identity_backfill_returns_metadata_authority() {
+        use std::os::unix::net::UnixListener;
+
         with_temp_home(|| {
-            // No entry, no panic, nothing to delete.
-            terminate("does-not-exist");
-            assert!(!record_path("does-not-exist").unwrap().exists());
+            let socket = socket_path_for("legacy-backfill").unwrap();
+            let _listener = UnixListener::bind(&socket).unwrap();
+            let mut legacy = WorkerRecord::new(
+                "legacy-backfill".into(),
+                std::process::id(),
+                socket.clone(),
+                "aoe-agent".into(),
+                "aoe-agent".into(),
+                PathBuf::from("/repo"),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            );
+            legacy.process_start_identity = None;
+            save(&legacy).unwrap();
+
+            let authenticated =
+                authenticate_generation_record(&legacy, "legacy-backfill", &socket, None)
+                    .unwrap()
+                    .expect("legacy runner authenticated by canonical socket peer");
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            assert!(authenticated.process_start_identity.is_some());
+
+            update_stored_acp_session_id(&authenticated, Some("session-from-legacy"));
+            assert_eq!(
+                load("legacy-backfill")
+                    .unwrap()
+                    .unwrap()
+                    .stored_acp_session_id
+                    .as_deref(),
+                Some("session-from-legacy")
+            );
+
+            let explicit_socket = socket_path_for("legacy-explicit-peer").unwrap();
+            let mut explicit = WorkerRecord::new(
+                "legacy-explicit-peer".into(),
+                std::process::id(),
+                explicit_socket.clone(),
+                "aoe-agent".into(),
+                "aoe-agent".into(),
+                PathBuf::from("/repo"),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            );
+            explicit.process_start_identity = None;
+            save(&explicit).unwrap();
+            assert!(authenticate_generation_record(
+                &explicit,
+                "legacy-explicit-peer",
+                &explicit_socket,
+                Some(std::process::id()),
+            )
+            .unwrap()
+            .is_some());
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial]
+    fn legacy_identity_without_reachable_or_matching_peer_fails_closed() {
+        use std::os::unix::net::UnixListener;
+
+        with_temp_home(|| {
+            let missing_socket = socket_path_for("legacy-missing-peer").unwrap();
+            let mut missing = WorkerRecord::new(
+                "legacy-missing-peer".into(),
+                std::process::id(),
+                missing_socket.clone(),
+                "aoe-agent".into(),
+                "aoe-agent".into(),
+                PathBuf::from("/repo"),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            );
+            missing.process_start_identity = None;
+            save(&missing).unwrap();
+            assert!(authenticate_generation_record(
+                &missing,
+                "legacy-missing-peer",
+                &missing_socket,
+                None,
+            )
+            .unwrap()
+            .is_none());
+
+            let mismatched_socket = socket_path_for("legacy-mismatched-peer").unwrap();
+            let _listener = UnixListener::bind(&mismatched_socket).unwrap();
+            let mut mismatched = WorkerRecord::new(
+                "legacy-mismatched-peer".into(),
+                2_000_000_000,
+                mismatched_socket.clone(),
+                "aoe-agent".into(),
+                "aoe-agent".into(),
+                PathBuf::from("/repo"),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            );
+            mismatched.process_start_identity = None;
+            save(&mismatched).unwrap();
+            assert!(authenticate_generation_record(
+                &mismatched,
+                "legacy-mismatched-peer",
+                &mismatched_socket,
+                None,
+            )
+            .unwrap()
+            .is_none());
+        });
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[serial]
+    fn stale_legacy_identity_cannot_bind_or_update_current_generation() {
+        with_temp_home(|| {
+            let socket = socket_path_for("legacy-stale").unwrap();
+            let current = WorkerRecord::new(
+                "legacy-stale".into(),
+                std::process::id(),
+                socket.clone(),
+                "aoe-agent".into(),
+                "aoe-agent".into(),
+                PathBuf::from("/repo"),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            );
+            assert!(current.process_start_identity.is_some());
+            save(&current).unwrap();
+            let mut stale_legacy = current.clone();
+            stale_legacy.process_start_identity = None;
+            let before = std::fs::read(record_path("legacy-stale").unwrap()).unwrap();
+
+            assert!(
+                authenticate_generation_record(&stale_legacy, "legacy-stale", &socket, None,)
+                    .unwrap()
+                    .is_none()
+            );
+            update_stored_acp_session_id(&stale_legacy, Some("stale-session"));
+            assert_eq!(
+                std::fs::read(record_path("legacy-stale").unwrap()).unwrap(),
+                before
+            );
         });
     }
 
