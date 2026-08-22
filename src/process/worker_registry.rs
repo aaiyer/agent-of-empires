@@ -31,6 +31,146 @@ use tracing::{debug, warn};
 
 use crate::util::now_secs;
 
+#[cfg(all(test, unix))]
+pub(crate) mod test_support {
+    use std::io::BufRead as _;
+    use std::os::unix::process::CommandExt as _;
+    use std::path::Path;
+    use std::process::{Child, Command, Stdio};
+
+    #[derive(Clone, Copy)]
+    pub(crate) enum TermBehavior {
+        Terminate,
+        Ignore,
+        Notify,
+    }
+
+    pub(crate) struct SocketPeer {
+        child: Child,
+        term_seen: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
+    impl SocketPeer {
+        pub(crate) fn spawn(socket: &Path, term_behavior: TermBehavior) -> Self {
+            let behavior = match term_behavior {
+                TermBehavior::Terminate => "terminate",
+                TermBehavior::Ignore => "ignore",
+                TermBehavior::Notify => "notify",
+            };
+            let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "process::worker_registry::tests::authenticated_unix_listener_fixture",
+                    "--nocapture",
+                ])
+                .env("AOE_TEST_RUNNER_SOCKET", socket)
+                .env("AOE_TEST_RUNNER_TERM", behavior)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .expect("spawn authenticated runner fixture");
+            let output = child.stdout.take().expect("runner fixture stdout");
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+            let (term_tx, term_rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                let mut term_tx = Some(term_tx);
+                for line in std::io::BufReader::new(output)
+                    .lines()
+                    .map_while(Result::ok)
+                {
+                    if line.contains("runner-listener-ready") {
+                        let _ = ready_tx.send(());
+                    } else if line.contains("runner-listener-term") {
+                        if let Some(tx) = term_tx.take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                }
+            });
+            if ready_rx.recv().is_err() {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("authenticated runner fixture exited before readiness");
+            }
+            Self {
+                child,
+                term_seen: matches!(term_behavior, TermBehavior::Notify).then_some(term_rx),
+            }
+        }
+
+        pub(crate) fn pid(&self) -> u32 {
+            self.child.id()
+        }
+
+        pub(crate) async fn wait_for_term(&mut self) {
+            self.term_seen
+                .take()
+                .expect("fixture does not report SIGTERM")
+                .await
+                .expect("runner fixture exited before SIGTERM");
+        }
+    }
+
+    impl Drop for SocketPeer {
+        fn drop(&mut self) {
+            if matches!(self.child.try_wait(), Ok(None)) {
+                crate::process::worker::kill_process_group(self.child.id());
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    extern "C" fn report_term(_: nix::libc::c_int) {
+        const MESSAGE: &[u8] = b"runner-listener-term\n";
+        // SAFETY: `write` is async-signal-safe and the buffer is static.
+        unsafe {
+            nix::libc::write(
+                nix::libc::STDOUT_FILENO,
+                MESSAGE.as_ptr().cast(),
+                MESSAGE.len(),
+            );
+        }
+    }
+
+    pub(super) fn run_listener_fixture() {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixListener;
+
+        let signal = match std::env::var("AOE_TEST_RUNNER_TERM").as_deref() {
+            Ok("terminate") => None,
+            Ok("ignore") => Some(nix::sys::signal::SigHandler::SigIgn),
+            Ok("notify") => Some(nix::sys::signal::SigHandler::Handler(report_term)),
+            other => panic!("invalid runner TERM behavior: {other:?}"),
+        };
+        if let Some(handler) = signal {
+            let action = nix::sys::signal::SigAction::new(
+                handler,
+                nix::sys::signal::SaFlags::SA_RESTART,
+                nix::sys::signal::SigSet::empty(),
+            );
+            // SAFETY: the fixture installs its TERM behavior before starting
+            // threads or announcing readiness.
+            unsafe { nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGTERM, &action) }
+                .unwrap();
+        }
+
+        let socket = std::env::var_os("AOE_TEST_RUNNER_SOCKET").expect("runner socket path");
+        let listener = UnixListener::bind(socket).expect("bind runner socket");
+        println!("runner-listener-ready");
+        std::io::stdout().flush().unwrap();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => drop(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => panic!("accept runner socket: {error}"),
+            }
+        }
+    }
+}
+
 // Generic worker-subprocess plumbing now lives in `process::worker`; the
 // registry is the ACP consumer of it. Re-exported so the names referenced
 // across the ACP code (and its tests) keep resolving here.
@@ -697,6 +837,13 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn authenticated_unix_listener_fixture() {
+        super::test_support::run_listener_fixture();
+    }
 
     fn with_temp_home<F: FnOnce()>(f: F) {
         // Root under /tmp instead of the default $TMPDIR (which on

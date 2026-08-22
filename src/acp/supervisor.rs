@@ -4095,23 +4095,6 @@ cursor-acp-bridge = "agent acp"
         );
     }
 
-    // Child-process fixture whose listening Unix socket exposes its real PID.
-    #[cfg(unix)]
-    #[test]
-    #[ignore]
-    fn authenticated_unix_listener_fixture() {
-        use std::io::Write as _;
-        use std::os::unix::net::UnixListener;
-
-        let socket = std::env::var_os("AOE_TEST_RUNNER_SOCKET").expect("runner socket path");
-        let listener = UnixListener::bind(socket).expect("bind runner socket");
-        println!("runner-listener-ready");
-        std::io::stdout().flush().unwrap();
-        for stream in listener.incoming() {
-            drop(stream.unwrap());
-        }
-    }
-
     /// #3241: the reattach half of the enforcement. Workers are detached rather
     /// than killed on daemon shutdown, so a runner started under a permissive
     /// policy is still alive when the policy tightens. Attaching it would let it
@@ -4141,41 +4124,17 @@ cursor-acp-bridge = "agent acp"
         // terminate path signals the pid's whole process group. `process_group(0)`
         // makes the child its own group leader so the killpg lands on it alone;
         // using our own pid here would SIGTERM the test process.
-        use std::io::BufRead as _;
-        use std::os::unix::process::CommandExt as _;
-        let spawn_runner = |socket: &std::path::Path| {
-            let mut runner = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--ignored",
-                    "--exact",
-                    "acp::supervisor::tests::authenticated_unix_listener_fixture",
-                    "--nocapture",
-                ])
-                .env("AOE_TEST_RUNNER_SOCKET", socket)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .process_group(0)
-                .spawn()
-                .expect("spawn authenticated runner fixture");
-            let mut output = std::io::BufReader::new(runner.stdout.take().unwrap());
-            let mut line = String::new();
-            while output.read_line(&mut line).unwrap() != 0 {
-                if line.contains("runner-listener-ready") {
-                    return runner;
-                }
-                line.clear();
-            }
-            panic!("authenticated runner fixture exited before readiness");
-        };
-
         let result = async {
             let sup = Supervisor::new(VecSink::new());
             let socket = crate::process::worker_registry::socket_path_for("s-policy").unwrap();
-            let permitted_runner = spawn_runner(&socket);
-            let permitted_pid = permitted_runner.id();
+            let permitted_runner = crate::process::worker_registry::test_support::SocketPeer::spawn(
+                &socket,
+                crate::process::worker_registry::test_support::TermBehavior::Terminate,
+            );
+            let permitted_pid = permitted_runner.pid();
             let mut record = crate::process::worker_registry::WorkerRecord::new(
                 "s-policy".into(),
-                permitted_runner.id(),
+                permitted_pid,
                 socket.clone(),
                 "codex-acp".into(),
                 "codex".into(),
@@ -4222,8 +4181,11 @@ cursor-acp-bridge = "agent acp"
                 c.acp.allowed_agents = vec!["claude".to_string()];
             })
             .unwrap();
-            let denied_runner = spawn_runner(&socket);
-            let denied_pid = denied_runner.id();
+            let denied_runner = crate::process::worker_registry::test_support::SocketPeer::spawn(
+                &socket,
+                crate::process::worker_registry::test_support::TermBehavior::Terminate,
+            );
+            let denied_pid = denied_runner.pid();
             let mut denied_record = crate::process::worker_registry::WorkerRecord::new(
                 "s-policy".into(),
                 denied_pid,
@@ -4552,6 +4514,8 @@ cursor-acp-bridge = "agent acp"
             env_allowlist: None,
         };
         let socket_path = tmp.path().join("budget.sock");
+        #[cfg(unix)]
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let dummy_config = SpawnConfig {
             agent_key: "claude".into(),
             tool: "claude".into(),
@@ -4723,6 +4687,8 @@ cursor-acp-bridge = "agent acp"
         }
         let session_id = "restart-generation-drift";
         let socket = crate::process::worker_registry::socket_path_for(session_id).unwrap();
+        #[cfg(unix)]
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let original = crate::process::worker_registry::WorkerRecord::new(
             session_id.into(),
             std::process::id(),
@@ -5048,8 +5014,6 @@ cursor-acp-bridge = "agent acp"
     #[tokio::test]
     #[serial_test::serial]
     async fn shutdown_publishes_stopped_event() {
-        use std::os::unix::process::CommandExt as _;
-
         let tmp = tempfile::TempDir::new().unwrap();
         unsafe {
             std::env::set_var("HOME", tmp.path());
@@ -5057,15 +5021,14 @@ cursor-acp-bridge = "agent acp"
         }
         let sink = VecSink::new();
         let sup = Supervisor::new(sink.clone());
-        let mut runner = std::process::Command::new("sleep")
-            .arg("60")
-            .process_group(0)
-            .spawn()
-            .expect("spawn stand-in runner");
         let socket_path = crate::process::worker_registry::socket_path_for("s-stop").unwrap();
+        let runner = crate::process::worker_registry::test_support::SocketPeer::spawn(
+            &socket_path,
+            crate::process::worker_registry::test_support::TermBehavior::Terminate,
+        );
         let record = crate::process::worker_registry::WorkerRecord::new(
             "s-stop".into(),
-            runner.id(),
+            runner.pid(),
             socket_path.clone(),
             "claude".into(),
             "claude".into(),
@@ -5128,8 +5091,7 @@ cursor-acp-bridge = "agent acp"
         sup.shutdown("s-stop")
             .await
             .expect("shutdown should succeed");
-        let _ = runner.wait();
-        assert!(!crate::process::worker_registry::is_pid_alive(runner.id()));
+        assert!(!crate::process::worker_registry::is_pid_alive(runner.pid()));
 
         let frames = sink.frames.lock().unwrap();
         let stopped = frames
@@ -5215,29 +5177,17 @@ cursor-acp-bridge = "agent acp"
     #[tokio::test]
     #[serial_test::serial]
     async fn unresponsive_failed_reap_parks_exact_generation_for_reconciler_retry() {
-        use std::os::unix::process::CommandExt;
-
         let home = tempfile::TempDir::new().unwrap();
         let _app_dir = crate::session::test_support::isolate_app_dir_at(home.path());
         let id = "s-unresponsive-reap-retry";
-        let ready = home.path().join("term-handler-ready");
-        let mut command = std::process::Command::new("sh");
-        command
-            .arg("-c")
-            .arg("trap '' TERM; touch \"$READY\"; while :; do sleep 1; done")
-            .env("READY", &ready)
-            .process_group(0);
-        let mut runner = command.spawn().expect("spawn TERM-ignoring runner group");
-        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !ready.exists() && std::time::Instant::now() < ready_deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        assert!(ready.exists(), "fixture must install its TERM handler");
-
         let socket = crate::process::worker_registry::socket_path_for(id).unwrap();
+        let runner = crate::process::worker_registry::test_support::SocketPeer::spawn(
+            &socket,
+            crate::process::worker_registry::test_support::TermBehavior::Ignore,
+        );
         let record = crate::process::worker_registry::WorkerRecord::new(
             id.into(),
-            runner.id(),
+            runner.pid(),
             socket.clone(),
             "fake-agent".into(),
             "fake-agent".into(),
@@ -5302,7 +5252,6 @@ cursor-acp-bridge = "agent acp"
             .unwrap()
             .exists());
         assert!(sup.take_respawn_requests().is_empty());
-        let _ = runner.wait();
     }
 
     /// `Supervisor::shutdown` against an `Stdio` test fixture must NOT
@@ -5503,24 +5452,20 @@ cursor-acp-bridge = "agent acp"
     #[tokio::test]
     #[serial_test::serial]
     async fn shutdown_and_wait_timeout_retains_the_replacement_fence() {
-        use std::os::unix::process::CommandExt;
-
         let tmp = tempfile::TempDir::new().unwrap();
         unsafe {
             std::env::set_var("HOME", tmp.path());
             std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
         }
-        let mut runner = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("trap '' TERM; while :; do sleep 1; done")
-            .process_group(0)
-            .spawn()
-            .expect("spawn TERM-ignoring runner");
         let session_id = "shutdown-timeout-fence";
         let socket = crate::process::worker_registry::socket_path_for(session_id).unwrap();
+        let runner = crate::process::worker_registry::test_support::SocketPeer::spawn(
+            &socket,
+            crate::process::worker_registry::test_support::TermBehavior::Ignore,
+        );
         let record = crate::process::worker_registry::WorkerRecord::new(
             session_id.into(),
-            runner.id(),
+            runner.pid(),
             socket.clone(),
             "fake-agent".into(),
             "fake-agent".into(),
@@ -5560,7 +5505,6 @@ cursor-acp-bridge = "agent acp"
                 .unwrap()
                 .is_some()
         );
-        let _ = runner.wait();
     }
 
     /// Regression: Ok(None) skips the poll and returns promptly.

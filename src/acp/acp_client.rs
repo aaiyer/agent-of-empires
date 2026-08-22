@@ -10511,6 +10511,8 @@ mod tests {
         let session_id = "metadata-owner";
         let socket =
             crate::process::worker_registry::socket_path_for(session_id).expect("socket path");
+        #[cfg(unix)]
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let old = crate::process::worker_registry::WorkerRecord::new(
             session_id.into(),
             std::process::id(),
@@ -10792,7 +10794,6 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn generation_lock_wait_does_not_block_tokio_worker() {
-        use std::os::unix::process::CommandExt;
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let scratch = tempfile::tempdir().expect("scratch dir");
@@ -10800,17 +10801,15 @@ mod tests {
             ("HOME", scratch.path().join("home")),
             ("XDG_CONFIG_HOME", scratch.path().join("xdg")),
         ]);
-        let mut command = std::process::Command::new("sh");
-        command
-            .arg("-c")
-            .arg("trap '' TERM; while :; do sleep 1; done")
-            .process_group(0);
-        let mut process = command.spawn().expect("spawn isolated process group");
         let session_id = "nonblocking-generation-lock";
         let socket = crate::process::worker_registry::socket_path_for(session_id).unwrap();
+        let process = crate::process::worker_registry::test_support::SocketPeer::spawn(
+            &socket,
+            crate::process::worker_registry::test_support::TermBehavior::Ignore,
+        );
         let record = crate::process::worker_registry::WorkerRecord::new(
             session_id.into(),
-            process.id(),
+            process.pid(),
             socket.clone(),
             "fake-agent".into(),
             "fake-agent".into(),
@@ -10844,29 +10843,24 @@ mod tests {
             unlocker.join().expect("join generation-lock holder"),
             "Tokio timer must run while the blocking generation lock is held"
         );
-        let _ = process.wait();
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[serial_test::serial]
     async fn exact_generation_teardown_honors_its_deadline() {
-        use std::os::unix::process::CommandExt;
-
         let scratch = tempfile::tempdir().expect("scratch dir");
         let _env = crate::session::test_support::EnvGuard::set(&[
             ("HOME", scratch.path().join("home")),
             ("XDG_CONFIG_HOME", scratch.path().join("xdg")),
         ]);
-        let mut command = std::process::Command::new("sh");
-        command
-            .arg("-c")
-            .arg("trap '' TERM; while :; do sleep 1; done")
-            .process_group(0);
-        let mut process = command.spawn().expect("spawn TERM-ignoring group");
-        let pid = process.id();
         let session_id = "bounded-generation-teardown";
         let socket = crate::process::worker_registry::socket_path_for(session_id).unwrap();
+        let process = crate::process::worker_registry::test_support::SocketPeer::spawn(
+            &socket,
+            crate::process::worker_registry::test_support::TermBehavior::Ignore,
+        );
+        let pid = process.pid();
         let record = crate::process::worker_registry::WorkerRecord::new(
             session_id.into(),
             pid,
@@ -10900,7 +10894,7 @@ mod tests {
             record.process_start_identity
         );
         assert_eq!(retained.started_at, record.started_at);
-        let _ = process.wait();
+        drop(process);
         assert!(!crate::process::worker_registry::is_pid_alive(pid));
     }
 
@@ -10967,8 +10961,6 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn runner_generation_drift_never_signals_either_process_group() {
-        use std::os::unix::process::CommandExt;
-
         let scratch = tempfile::tempdir().expect("scratch dir");
         let home = scratch.path().join("home");
         let xdg = scratch.path().join("xdg");
@@ -10979,19 +10971,16 @@ mod tests {
             ("XDG_CONFIG_HOME", xdg),
         ]);
 
-        let spawn_group = || {
-            let mut command = std::process::Command::new("sleep");
-            command.arg("30").process_group(0);
-            command.spawn().expect("spawn isolated process group")
-        };
-        let mut old = spawn_group();
-        let mut replacement = spawn_group();
         let session_id = "generation-drift";
         let socket =
             crate::process::worker_registry::socket_path_for(session_id).expect("canonical socket");
+        let old = crate::process::worker_registry::test_support::SocketPeer::spawn(
+            &socket,
+            crate::process::worker_registry::test_support::TermBehavior::Terminate,
+        );
         let old_record = crate::process::worker_registry::WorkerRecord::new(
             session_id.into(),
-            old.id(),
+            old.pid(),
             socket.clone(),
             "fake-agent".into(),
             "fake-agent".into(),
@@ -11014,7 +11003,7 @@ mod tests {
         assert!(
             RunnerGeneration::from_record(&stale_identity_record, session_id, &socket).is_none()
         );
-        assert!(crate::process::worker_registry::is_pid_alive(old.id()));
+        assert!(crate::process::worker_registry::is_pid_alive(old.pid()));
         crate::process::worker_registry::save(&old_record).expect("restore old generation");
         let stale_legacy_record = crate::process::worker_registry::WorkerRecord {
             process_start_identity: None,
@@ -11025,18 +11014,23 @@ mod tests {
         {
             let _ = terminate_runner_generation(&stale_legacy_generation).await;
         }
-        assert!(crate::process::worker_registry::is_pid_alive(old.id()));
+        assert!(crate::process::worker_registry::is_pid_alive(old.pid()));
         let generation = RunnerGeneration::from_record(&old_record, session_id, &socket)
             .expect("capture old generation");
         let mut wrong_process = generation.clone();
         wrong_process.process_start_identity =
             wrong_process.process_start_identity.map(|id| id + 1);
         assert!(!terminate_runner_generation(&wrong_process).await);
-        assert!(crate::process::worker_registry::is_pid_alive(old.id()));
+        assert!(crate::process::worker_registry::is_pid_alive(old.pid()));
+        std::fs::remove_file(&socket).unwrap();
+        let replacement = crate::process::worker_registry::test_support::SocketPeer::spawn(
+            &socket,
+            crate::process::worker_registry::test_support::TermBehavior::Terminate,
+        );
         let replacement_record = crate::process::worker_registry::WorkerRecord {
-            pid: replacement.id(),
+            pid: replacement.pid(),
             process_start_identity: crate::process::worker_registry::process_start_identity_for(
-                replacement.id(),
+                replacement.pid(),
             ),
             started_at: old_record.started_at.saturating_add(1),
             ..old_record
@@ -11045,28 +11039,21 @@ mod tests {
             .expect("publish replacement generation");
 
         assert!(!terminate_runner_generation(&generation).await);
-        assert!(crate::process::worker_registry::is_pid_alive(old.id()));
+        assert!(crate::process::worker_registry::is_pid_alive(old.pid()));
         assert!(crate::process::worker_registry::is_pid_alive(
-            replacement.id()
+            replacement.pid()
         ));
 
-        crate::process::worker::kill_process_group(old.id());
-        crate::process::worker::kill_process_group(replacement.id());
-        let _ = old.wait();
-        let _ = replacement.wait();
-
-        let term_seen = scratch.path().join("term-seen");
-        let mut stubborn_command = std::process::Command::new("sh");
-        stubborn_command
-            .arg("-c")
-            .arg("trap 'touch \"$TERM_SEEN\"' TERM; while :; do sleep 1; done")
-            .env("TERM_SEEN", &term_seen)
-            .process_group(0);
-        let mut stubborn = stubborn_command.spawn().expect("spawn TERM-ignoring group");
-        let mut successor = spawn_group();
+        drop(old);
+        drop(replacement);
+        std::fs::remove_file(&socket).unwrap();
+        let mut stubborn = crate::process::worker_registry::test_support::SocketPeer::spawn(
+            &socket,
+            crate::process::worker_registry::test_support::TermBehavior::Notify,
+        );
         let stubborn_record = crate::process::worker_registry::WorkerRecord::new(
             session_id.into(),
-            stubborn.id(),
+            stubborn.pid(),
             socket.clone(),
             "fake-agent".into(),
             "fake-agent".into(),
@@ -11083,17 +11070,16 @@ mod tests {
                 .expect("capture stubborn generation");
         let teardown =
             tokio::spawn(async move { terminate_runner_generation(&stubborn_generation).await });
-        for _ in 0..300 {
-            if term_seen.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(term_seen.exists(), "fixture must observe initial SIGTERM");
+        stubborn.wait_for_term().await;
+        std::fs::remove_file(&socket).unwrap();
+        let successor = crate::process::worker_registry::test_support::SocketPeer::spawn(
+            &socket,
+            crate::process::worker_registry::test_support::TermBehavior::Terminate,
+        );
         let successor_record = crate::process::worker_registry::WorkerRecord {
-            pid: successor.id(),
+            pid: successor.pid(),
             process_start_identity: crate::process::worker_registry::process_start_identity_for(
-                successor.id(),
+                successor.pid(),
             ),
             started_at: stubborn_record.started_at.saturating_add(1),
             ..stubborn_record
@@ -11101,15 +11087,12 @@ mod tests {
         crate::process::worker_registry::save(&successor_record)
             .expect("publish successor before SIGKILL escalation");
         assert!(!teardown.await.expect("teardown task"));
-        assert!(crate::process::worker_registry::is_pid_alive(stubborn.id()));
         assert!(crate::process::worker_registry::is_pid_alive(
-            successor.id()
+            stubborn.pid()
         ));
-
-        crate::process::worker::kill_process_group(stubborn.id());
-        crate::process::worker::kill_process_group(successor.id());
-        let _ = stubborn.wait();
-        let _ = successor.wait();
+        assert!(crate::process::worker_registry::is_pid_alive(
+            successor.pid()
+        ));
     }
 
     /// `ModelConfig` is a category upstream already names, so it must map

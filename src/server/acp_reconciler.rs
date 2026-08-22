@@ -1069,9 +1069,7 @@ async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
                     }
                     continue;
                 }
-                runner_generation
-                    .matches_record(&record)
-                    .then_some(runner_generation)
+                Some(runner_generation)
             }
             Ok(None) => {
                 if crate::acp::acp_client::runner_generation_has_drifted(&runner_generation) {
@@ -2875,22 +2873,17 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn drained_stale_generation_drift_consumes_restart_intent_without_killing_replacement() {
-        use std::os::unix::process::CommandExt;
-
         let id = "s-drained-generation-drift";
         let (state, _home, project) = capacity_test_state(id).await;
-        let spawn_group = || {
-            let mut command = std::process::Command::new("sleep");
-            command.arg("30").process_group(0);
-            command.spawn().expect("spawn isolated process group")
-        };
-        let mut stale = spawn_group();
-        let mut replacement = spawn_group();
         let socket =
             crate::process::worker_registry::socket_path_for(id).expect("canonical worker socket");
+        let stale = crate::process::worker_registry::test_support::SocketPeer::spawn(
+            &socket,
+            crate::process::worker_registry::test_support::TermBehavior::Terminate,
+        );
         let stale_record = crate::process::worker_registry::WorkerRecord::new(
             id.into(),
-            stale.id(),
+            stale.pid(),
             socket.clone(),
             "fake-agent".into(),
             "fake-agent".into(),
@@ -2905,10 +2898,15 @@ mod tests {
         let stale_generation =
             crate::acp::acp_client::RunnerGeneration::from_record(&stale_record, id, &socket)
                 .expect("capture stale generation");
+        std::fs::remove_file(&socket).unwrap();
+        let replacement = crate::process::worker_registry::test_support::SocketPeer::spawn(
+            &socket,
+            crate::process::worker_registry::test_support::TermBehavior::Terminate,
+        );
         let replacement_record = crate::process::worker_registry::WorkerRecord {
-            pid: replacement.id(),
+            pid: replacement.pid(),
             process_start_identity: crate::process::worker_registry::process_start_identity_for(
-                replacement.id(),
+                replacement.pid(),
             ),
             started_at: stale_record.started_at.saturating_add(1),
             ..stale_record
@@ -2927,9 +2925,9 @@ mod tests {
             .iter()
             .any(|(pending, _)| pending == id));
         assert!(!crate::process::worker_registry::take_restart_marker(id));
-        assert!(crate::process::worker_registry::is_pid_alive(stale.id()));
+        assert!(crate::process::worker_registry::is_pid_alive(stale.pid()));
         assert!(crate::process::worker_registry::is_pid_alive(
-            replacement.id()
+            replacement.pid()
         ));
 
         // The production pass must not treat a live PID with a missing
@@ -2943,7 +2941,7 @@ mod tests {
             .mark_build_respawn_pending(id, replacement_generation.clone());
         super::respawn_drained_stale_workers(&state).await;
         assert!(!crate::process::worker_registry::is_pid_alive(
-            replacement.id()
+            replacement.pid()
         ));
         assert!(crate::process::worker_registry::load(id)
             .expect("load torn-down generation")
@@ -2959,15 +2957,17 @@ mod tests {
             "a fully reaped parked generation must re-arm one replacement attempt"
         );
 
-        crate::process::worker::kill_process_group(stale.id());
-        let _ = stale.wait();
-        let _ = replacement.wait();
+        drop(stale);
+        drop(replacement);
 
-        let mut dead = spawn_group();
+        let dead = crate::process::worker_registry::test_support::SocketPeer::spawn(
+            &socket,
+            crate::process::worker_registry::test_support::TermBehavior::Terminate,
+        );
         let dead_record = crate::process::worker_registry::WorkerRecord {
-            pid: dead.id(),
+            pid: dead.pid(),
             process_start_identity: crate::process::worker_registry::process_start_identity_for(
-                dead.id(),
+                dead.pid(),
             ),
             started_at: replacement_record.started_at.saturating_add(1),
             ..replacement_record
@@ -2976,8 +2976,7 @@ mod tests {
         let dead_generation =
             crate::acp::acp_client::RunnerGeneration::from_record(&dead_record, id, &socket)
                 .expect("capture generation before it dies");
-        crate::process::worker::kill_process_group(dead.id());
-        let _ = dead.wait();
+        drop(dead);
         crate::process::worker_registry::mark_restart_pending(id);
         state
             .acp_supervisor
@@ -3010,29 +3009,17 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn failed_drain_reap_retries_the_same_generation_then_respawns_once() {
-        use std::os::unix::process::CommandExt;
-
         let id = "s-drained-reap-retry";
         let (state, _home, project) = capacity_test_state(id).await;
-        let ready = project.path().join("term-handler-ready");
-        let mut command = std::process::Command::new("sh");
-        command
-            .arg("-c")
-            .arg("trap '' TERM; touch \"$READY\"; while :; do sleep 1; done")
-            .env("READY", &ready)
-            .process_group(0);
-        let mut runner = command.spawn().expect("spawn TERM-ignoring runner group");
-        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !ready.exists() && std::time::Instant::now() < ready_deadline {
-            std::thread::yield_now();
-        }
-        assert!(ready.exists(), "fixture must install its TERM handler");
-
         let socket =
             crate::process::worker_registry::socket_path_for(id).expect("canonical worker socket");
+        let runner = crate::process::worker_registry::test_support::SocketPeer::spawn(
+            &socket,
+            crate::process::worker_registry::test_support::TermBehavior::Ignore,
+        );
         let record = crate::process::worker_registry::WorkerRecord::new(
             id.into(),
-            runner.id(),
+            runner.pid(),
             socket.clone(),
             "fake-agent".into(),
             "fake-agent".into(),
@@ -3083,7 +3070,6 @@ mod tests {
             state.acp_supervisor.take_respawn_requests(),
             vec![id.to_string()]
         );
-        let _ = runner.wait();
     }
 
     #[tokio::test]
