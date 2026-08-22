@@ -113,6 +113,21 @@ fn wait_for(path: &Path, what: &str) {
     }
 }
 
+fn wait_for_u32(path: &Path, what: &str) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(value) = std::fs::read_to_string(path) {
+            if let Ok(value) = value.parse() {
+                return value;
+            }
+        }
+        if Instant::now() > deadline {
+            panic!("{what} never became a u32 at {}", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Read one length-prefixed control frame (4-byte big-endian length, then
 /// that many JSON bytes) and parse it as a generic JSON value.
 fn read_frame(stream: &mut UnixStream) -> serde_json::Value {
@@ -338,11 +353,7 @@ for line in sys.stdin:
     wait_for(&record, "old registry record");
     wait_for(&control, "old control socket");
     wait_for(&socket, "old relay socket");
-    wait_for(&agent_pid_file, "old agent pid");
-    let old_agent_pid = std::fs::read_to_string(&agent_pid_file)
-        .expect("read old agent pid")
-        .parse::<u32>()
-        .expect("parse old agent pid");
+    let old_agent_pid = wait_for_u32(&agent_pid_file, "old agent pid");
 
     let attach = AcpClient::attach(
         socket.clone(),

@@ -181,6 +181,14 @@ pub enum SupervisorError {
     SpawnCancelled(String),
 }
 
+impl SupervisorError {
+    /// A background spawn lost a race to another owner of the same worker.
+    /// Explicit spawn requests still surface this error as a conflict.
+    pub(crate) fn is_benign_background_spawn_race(&self) -> bool {
+        matches!(self, Self::AlreadyRunning(_))
+    }
+}
+
 /// What the caller should do with the prompt text after
 /// `publish_user_prompt_with_attachments` recorded it. The publish step
 /// owns clear-command detection (it already resolves the session's
@@ -1170,18 +1178,17 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Like `shutdown` but waits for the runner process to actually exit
     /// before returning, so a subsequent `spawn` for the same session id
     /// doesn't race the SIGTERM and collide on the worker socket file.
-    /// Bounded by `deadline`; on timeout the worker is still removed
-    /// from the in-memory map, so a subsequent spawn won't return
-    /// AlreadyRunning, but the caller should treat it as best-effort
-    /// cleanup. Used by the `/acp/switch-agent` path so the new
-    /// agent's spawn binds a clean socket. See #1282.
+    /// Bounded by `deadline`; on timeout the authenticated worker handle stays
+    /// installed as a replacement fence and the caller receives an error.
+    /// Used by the `/acp/switch-agent` path so the new agent's spawn binds a
+    /// clean socket. See #1282.
     pub async fn shutdown_and_wait(
         &self,
         session_id: &str,
         deadline: std::time::Duration,
     ) -> Result<(), SupervisorError> {
         match self
-            .shutdown_with_reason(session_id, "user_stopped", false, true, Some(deadline))
+            .shutdown_with_reason(session_id, "user_stopped", false, Some(deadline))
             .await
         {
             Ok(()) => {}
@@ -2669,7 +2676,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// next prompt (#1710). For permanent removal use
     /// [`Self::shutdown_and_delete`].
     pub async fn shutdown(&self, session_id: &str) -> Result<(), SupervisorError> {
-        self.shutdown_with_reason(session_id, "user_stopped", false, false, None)
+        self.shutdown_with_reason(session_id, "user_stopped", false, None)
             .await
     }
 
@@ -2680,7 +2687,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// banner, the next prompt respawns the worker. Preserves the
     /// agent transcript so that respawn resumes instead of resetting.
     pub async fn shutdown_idle(&self, session_id: &str) -> Result<(), SupervisorError> {
-        self.shutdown_with_reason(session_id, "idle_auto_stop", false, false, None)
+        self.shutdown_with_reason(session_id, "idle_auto_stop", false, None)
             .await
     }
 
@@ -2690,7 +2697,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// structured view mode), never for reversible teardown, which must keep the
     /// transcript resumable. See #1710 and `shutdown`.
     pub async fn shutdown_and_delete(&self, session_id: &str) -> Result<(), SupervisorError> {
-        self.shutdown_with_reason(session_id, "user_stopped", true, false, None)
+        self.shutdown_with_reason(session_id, "user_stopped", true, None)
             .await
     }
 
@@ -2699,9 +2706,12 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         stop_reason: &str,
         delete_adapter_state: bool,
-        best_effort_registry: bool,
         teardown_deadline: Option<Duration>,
     ) -> Result<(), SupervisorError> {
+        // Registry I/O is synchronous. Read it off the async executor before
+        // taking `workers`; exact-generation teardown revalidates the record
+        // before signalling or deletion.
+        let disk_record = load_worker_record_strict(session_id).await;
         // Hold workers + pending_resumes simultaneously so the spawn
         // can't observe an empty workers map, finish the handshake,
         // and insert a WorkerHandle while we're walking through this
@@ -2765,13 +2775,9 @@ impl<S: BroadcastSink> Supervisor<S> {
                 Ok(())
             };
             if let Err(error) = teardown {
-                if best_effort_registry {
-                    warn!(target: "acp.supervisor", session = %session_id, %error,
-                        "best-effort shutdown could not confirm exact runner exit; retaining worker handle to block replacement");
-                    return Ok(());
-                } else {
-                    return Err(error);
-                }
+                warn!(target: "acp.supervisor", session = %session_id, %error,
+                    "shutdown could not confirm exact runner exit; retaining worker handle to block replacement");
+                return Err(error);
             }
             let removed = {
                 let mut workers = self.workers.lock().await;
@@ -2807,10 +2813,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         // No in-memory worker, but there may still be a detached
         // runner in the registry (e.g. a previous daemon detached and
         // shutdown is called against the disk-only entry).
-        let disk_record = crate::process::worker_registry::load_existing_strict(session_id)
-            .map_err(|error| {
-                SupervisorError::Acp(AcpError::Spawn(format!("registry load: {error}")))
-            })?;
+        let disk_record = disk_record?;
         if let Some(record) = disk_record {
             // If a resume is mid-handshake against this same runner,
             // the SIGTERM below races the handshake; mark the session
@@ -2879,21 +2882,30 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// subprocess dies. For the everyday `aoe serve --stop` flow, use
     /// `detach_all` instead so workers outlive the daemon.
     pub async fn shutdown_all(&self) -> Result<(), SupervisorError> {
-        let mut session_ids: HashSet<String> =
-            crate::process::worker_registry::list_existing_strict()
-                .map_err(|error| {
-                    SupervisorError::Acp(AcpError::Spawn(format!("registry list: {error}")))
-                })?
-                .into_iter()
-                .map(|record| record.session_id)
-                .collect();
+        let session_ids: HashSet<String> = crate::process::worker_registry::list_existing_strict()
+            .map_err(|error| {
+                SupervisorError::Acp(AcpError::Spawn(format!("registry list: {error}")))
+            })?
+            .into_iter()
+            .map(|record| record.session_id)
+            .collect();
+        let mut session_ids = session_ids;
         session_ids.extend(self.workers.lock().await.keys().cloned());
+        let mut session_ids: Vec<_> = session_ids.into_iter().collect();
+        session_ids.sort();
+        let mut first_error = None;
         for session_id in session_ids {
             debug!(target: "acp.supervisor", session = %session_id, "shutting down");
-            self.shutdown_with_reason(&session_id, "user_stopped", false, false, None)
-                .await?;
+            if let Err(error) = self
+                .shutdown_with_reason(&session_id, "user_stopped", false, None)
+                .await
+            {
+                warn!(target: "acp.supervisor", session = %session_id, %error,
+                    "shutdown-all could not stop worker; continuing");
+                first_error.get_or_insert(error);
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Drop the daemon-side handle to every worker without killing the
@@ -3397,6 +3409,22 @@ async fn terminate_runner_for_session_with_deadline(
     Ok(())
 }
 
+async fn load_worker_record_strict(
+    session_id: &str,
+) -> Result<Option<crate::process::worker_registry::WorkerRecord>, SupervisorError> {
+    let session_id = session_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::process::worker_registry::load_existing_strict(&session_id)
+    })
+    .await
+    .map_err(|error| {
+        SupervisorError::Acp(AcpError::Spawn(format!(
+            "registry load task failed: {error}"
+        )))
+    })?
+    .map_err(|error| SupervisorError::Acp(AcpError::Spawn(format!("registry load: {error}"))))
+}
+
 #[derive(Debug)]
 enum RestartDecision {
     // Boxed because `SpawnConfig` is significantly larger than the
@@ -3428,15 +3456,36 @@ async fn restart_decision(
     session_id: &str,
     captured_generation: Option<&super::acp_client::RunnerGeneration>,
 ) -> RestartDecision {
+    let (runner_managed, observed_client) = {
+        let guard = workers.lock().await;
+        let Some(handle) = guard.get(session_id) else {
+            debug!(
+                target: "acp.supervisor",
+                session = %session_id,
+                "restart_decision: worker entry gone (shutdown / delete)"
+            );
+            return RestartDecision::Gone;
+        };
+        (
+            matches!(
+                handle.kind,
+                WorkerKind::Runner { .. } | WorkerKind::Attached
+            ),
+            Arc::clone(&handle.client),
+        )
+    };
+    let disk_record = if runner_managed {
+        Some(load_worker_record_strict(session_id).await)
+    } else {
+        None
+    };
     let mut guard = workers.lock().await;
     let Some(handle) = guard.get_mut(session_id) else {
-        debug!(
-            target: "acp.supervisor",
-            session = %session_id,
-            "restart_decision: worker entry gone (shutdown / delete)"
-        );
         return RestartDecision::Gone;
     };
+    if !Arc::ptr_eq(&observed_client, &handle.client) {
+        return RestartDecision::Superseded;
+    }
     // Registry-deletion signal: if the on-disk record for this session
     // was removed but we still hold a WorkerHandle, the user terminated
     // the runner externally (`aoe acp stop|kill`). Don't respawn;
@@ -3451,12 +3500,8 @@ async fn restart_decision(
     // registry-gone signal is meaningful for both. `Stdio` test
     // fixtures have no registry entry by construction and must be
     // skipped here so the "gone" check doesn't tear them down.
-    let runner_managed = matches!(
-        handle.kind,
-        WorkerKind::Runner { .. } | WorkerKind::Attached
-    );
     if runner_managed {
-        match crate::process::worker_registry::load_existing_strict(session_id) {
+        match disk_record.expect("runner-managed worker reads registry") {
             Err(error) => {
                 warn!(target: "acp.supervisor", session = %session_id, %error,
                     "restart_decision: registry authority unreadable; parking exact teardown");
@@ -5381,6 +5426,106 @@ cursor-acp-bridge = "agent acp"
             before,
             "a stale handle must neither signal nor rewrite the replacement generation"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_all_continues_after_a_worker_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+        let sup = Supervisor::new(VecSink::new());
+        let (failed_client, _tx) = AcpClient::fake_for_test(AcpSessionId("a-fails".into()));
+        sup.workers.lock().await.insert(
+            "a-fails".into(),
+            WorkerHandle {
+                client: Arc::new(failed_client),
+                drain_task: tokio::spawn(async {}),
+                restart_history: Vec::new(),
+                kind: WorkerKind::Attached,
+            },
+        );
+        insert_stdio_worker(&sup, "z-succeeds").await;
+
+        let error = sup
+            .shutdown_all()
+            .await
+            .expect_err("one failed worker makes shutdown-all report failure");
+        assert!(error
+            .to_string()
+            .contains("no authenticated runner generation"));
+        let workers = sup.workers.lock().await;
+        assert!(workers.contains_key("a-fails"));
+        assert!(
+            !workers.contains_key("z-succeeds"),
+            "shutdown-all must continue after the first failure"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_and_wait_timeout_retains_the_replacement_fence() {
+        use std::os::unix::process::CommandExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+        let mut runner = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; while :; do sleep 1; done")
+            .process_group(0)
+            .spawn()
+            .expect("spawn TERM-ignoring runner");
+        let session_id = "shutdown-timeout-fence";
+        let socket = crate::process::worker_registry::socket_path_for(session_id).unwrap();
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            session_id.into(),
+            runner.id(),
+            socket.clone(),
+            "fake-agent".into(),
+            "fake-agent".into(),
+            tmp.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&record).unwrap();
+        let generation =
+            crate::acp::acp_client::RunnerGeneration::from_record(&record, session_id, &socket)
+                .unwrap();
+        let sup = Supervisor::new(VecSink::new());
+        let (client, _tx) = AcpClient::fake_for_test_with_runner_generation(
+            AcpSessionId(session_id.into()),
+            generation,
+        );
+        sup.workers.lock().await.insert(
+            session_id.into(),
+            WorkerHandle {
+                client: Arc::new(client),
+                drain_task: tokio::spawn(async {}),
+                restart_history: Vec::new(),
+                kind: WorkerKind::Attached,
+            },
+        );
+
+        assert!(sup
+            .shutdown_and_wait(session_id, Duration::from_millis(100))
+            .await
+            .is_err());
+        assert!(sup.workers.lock().await.contains_key(session_id));
+        assert!(
+            crate::process::worker_registry::load_existing_strict(session_id)
+                .unwrap()
+                .is_some()
+        );
+        let _ = runner.wait();
     }
 
     /// Regression: Ok(None) skips the poll and returns promptly.

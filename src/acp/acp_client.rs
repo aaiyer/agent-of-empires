@@ -2153,7 +2153,8 @@ pub(crate) async fn terminate_runner_generation_with_deadline(
         crate::process::worker::kill_process_group(generation.pid);
         drop(generation_lock);
     }
-    if !wait_for_runner_exit(generation.pid, deadline.saturating_sub(started.elapsed())).await {
+    let reap_deadline = deadline.saturating_sub(started.elapsed());
+    if reap_deadline.is_zero() || !wait_for_runner_exit(generation.pid, reap_deadline).await {
         return false;
     }
 

@@ -1661,6 +1661,9 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
     let agent = req.agent.clone();
     let spawn_result = state.acp_supervisor.spawn(req).await;
     if let Err(e) = spawn_result {
+        if e.is_benign_background_spawn_race() {
+            return ResumeOutcome::SpawnFinished;
+        }
         // CapacityFull is transient, not a spawn failure: hand it to the
         // join handler as CapacityDeferred (refund budget, re-arm, publish
         // once) instead of burning the crash budget and orphaning the
@@ -2049,11 +2052,12 @@ pub(crate) async fn trigger_resume_background(
                 // AlreadyRunning / SpawnCancelled are benign: a worker
                 // already exists or the session was intentionally torn
                 // down mid-handshake. Only surface real startup failures.
-                if !matches!(
-                    e,
-                    crate::acp::supervisor::SupervisorError::AlreadyRunning(_)
-                        | crate::acp::supervisor::SupervisorError::SpawnCancelled(_)
-                ) {
+                if !e.is_benign_background_spawn_race()
+                    && !matches!(
+                        e,
+                        crate::acp::supervisor::SupervisorError::SpawnCancelled(_)
+                    )
+                {
                     let still_present = service
                         .instances
                         .read()
@@ -2167,6 +2171,13 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
                     "orphan runner teardown deferred because its generation changed or did not exit"
                 );
             }
+        } else {
+            tracing::warn!(
+                target: "acp.supervisor",
+                session = %record.session_id,
+                pid = record.pid,
+                "live orphan runner generation could not be authenticated; leaving it untouched"
+            );
         }
     }
 }

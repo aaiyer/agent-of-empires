@@ -586,6 +586,11 @@ pub(crate) async fn spawn_structured_session(
                                 service_for_check.drain_pending_initial_turn(&id).await;
                             }
                         }
+                        Err(e) if e.is_benign_background_spawn_race() => {
+                            if has_pending_initial_turn {
+                                service_for_check.drain_pending_initial_turn(&id).await;
+                            }
+                        }
                         Err(e) => {
                             let still_present = service_for_check
                                 .instances

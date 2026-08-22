@@ -2107,6 +2107,9 @@ pub async fn acp_enable(
             })
             .await
         {
+            if e.is_benign_background_spawn_race() {
+                return;
+            }
             // Capacity-aware banner selection (and the benign first-tick
             // duplicate) is documented on `structured_spawn_error_message`.
             let message = structured_spawn_error_message(&e, &agent_name);
@@ -2882,6 +2885,10 @@ mod tests {
                 SupervisorError::UnknownSession("s-1".into()),
                 StatusCode::NOT_FOUND,
             ),
+            (
+                SupervisorError::AlreadyRunning("s-1".into()),
+                StatusCode::CONFLICT,
+            ),
         ];
         for (err, expected) in cases {
             assert_eq!(
@@ -2890,6 +2897,9 @@ mod tests {
                 "{err}"
             );
         }
+        let race = SupervisorError::AlreadyRunning("s-1".into());
+        assert!(race.is_benign_background_spawn_race());
+        assert!(!SupervisorError::SpawnCancelled("s-1".into()).is_benign_background_spawn_race());
 
         // The prefix is load-bearing: the composer keys its re-queue (and
         // its banner suppression) on a 503 body that starts with it.
