@@ -23,6 +23,8 @@ export interface ClientCapabilities {
   nameOnlyWizard: boolean;
   /** Settings and other deployment-authority surfaces are reachable. */
   canManageDeployment: boolean;
+  /** Safe presentation settings are reachable without deployment authority. */
+  canOpenSettings: boolean;
   /** Session workdir, view, agent, and fork authority is reachable. */
   canManageSessionAuthority: boolean;
   /** Background-agent and plugin panes are reachable. */
@@ -43,6 +45,7 @@ export function getClientCapabilities(serverAbout: ServerAbout | null | undefine
     canManageProjects: !clientOnly,
     nameOnlyWizard: clientOnly,
     canManageDeployment: !mayaRestricted,
+    canOpenSettings: true,
     canManageSessionAuthority: !mayaRestricted,
     canUseExtensions: !clientOnly,
     canUseChildAgents: !cityhall,

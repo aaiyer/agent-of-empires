@@ -249,6 +249,7 @@ serve = [
 cap-std = ["dep:cap-std"]
 
 [dev-dependencies]
+tokio = { version = "1.52", features = ["test-util"] }
 serial_test = "3.4"
 # Test-only tracing capture (#2756, I4): asserts the equal-timestamp guard's
 # drop branch logged. Its target `session.store` is rejected by the default

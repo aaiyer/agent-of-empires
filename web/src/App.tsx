@@ -351,7 +351,7 @@ function AppContent({
   const settingsTabMatch = useMatch("/settings/:tab");
   const profilesMatch = useMatch("/profiles");
   const activeSessionId = sessionMatch?.params.sessionId ?? null;
-  const showSettings = caps.canManageDeployment && (settingsRootMatch !== null || settingsTabMatch !== null);
+  const showSettings = caps.canOpenSettings && (settingsRootMatch !== null || settingsTabMatch !== null);
   const settingsTab = settingsTabMatch?.params.tab ?? null;
 
   const {
@@ -1504,10 +1504,10 @@ function AppContent({
   }, [navigate]);
 
   const handleOpenSettings = useCallback(() => {
-    if (!caps.canManageDeployment) return;
+    if (!caps.canOpenSettings) return;
     navigate("/settings");
     if (window.innerWidth < 768) setSidebarOpen(false);
-  }, [caps.canManageDeployment, navigate]);
+  }, [caps.canOpenSettings, navigate]);
 
   // Profiles moved into Settings as a tab; redirect the retired standalone
   // route so old bookmarks and links still land somewhere valid.
@@ -1784,10 +1784,7 @@ function AppContent({
   });
   const visibleCommandActions = caps.mayaRestricted
     ? commandActions.filter(
-        (action) =>
-          action.id !== "action:new-scratch-session" &&
-          action.id !== "action:toggle-diff" &&
-          action.id !== "settings:open",
+        (action) => action.id !== "action:new-scratch-session" && action.id !== "action:toggle-diff",
       )
     : commandActions;
 
@@ -1837,6 +1834,7 @@ function AppContent({
           }}
           readOnly={serverAbout?.read_only}
           cityhall={caps.cityhall}
+          mayaRestricted={caps.mayaRestricted}
         />
       );
     }
@@ -2354,6 +2352,7 @@ function AppContent({
               readOnly={serverAbout?.read_only}
               canManageProjects={caps.canManageProjects}
               canManageSessionAuthority={caps.canManageSessionAuthority}
+              canOpenSettings={caps.canOpenSettings}
               sortMode={sidebarSortMode}
               onSortModeChange={selectSidebarSortMode}
               pluginSortRef={pluginSortRef}

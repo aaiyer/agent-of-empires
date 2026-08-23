@@ -367,6 +367,8 @@ interface Props {
   canManageProjects?: boolean;
   /** Hide workdir, view, agent, fork, and settings authority controls. */
   canManageSessionAuthority?: boolean;
+  /** Show the settings entry even when authority-bearing controls are hidden. */
+  canOpenSettings?: boolean;
   sortMode: SidebarSortMode;
   onSortModeChange: (mode: SidebarSortMode) => void;
   pluginSortRef: { pluginId: string; entryId: string } | null;
@@ -3141,6 +3143,7 @@ export function WorkspaceSidebar({
   readOnly,
   canManageProjects = true,
   canManageSessionAuthority = true,
+  canOpenSettings = true,
   sortMode,
   onSortModeChange,
   pluginSortRef,
@@ -4311,7 +4314,7 @@ export function WorkspaceSidebar({
               onEmptyTrash={() => onEmptyTrash?.()}
             />
           )}
-          {canManageSessionAuthority && (
+          {canOpenSettings && (
             <button
               onClick={onSettings}
               {...tourAnchor(TOUR_ANCHORS.sidebarSettings)}

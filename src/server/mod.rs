@@ -7588,7 +7588,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maya_restricted_router_denies_settings_and_reports_profile() {
+    async fn maya_import_route_accepts_both_source_thread_grammars() {
+        use tower::ServiceExt;
+
+        let mut state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vecs(&["localhost"]),
+            Vec::new(),
+            None,
+        );
+        Arc::get_mut(&mut state)
+            .expect("unique test state")
+            .maya_restricted = true;
+        let app = test_support::build_router_for_test(state);
+        let remote: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        for source in [
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "maya-import-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        ] {
+            let body = serde_json::json!({
+                "source_t3_thread_id": source,
+                "source_catalog_sha256": "a".repeat(64),
+            });
+            let mut request = axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/api/maya/import-session")
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(remote));
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains("invalid source T3 thread id"),
+                "route rejected supported source identity {source} before binding authentication"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn maya_restricted_router_projects_settings_and_reports_profile() {
         use tower::ServiceExt;
 
         let mut state = test_support::build_test_app_state_with_policy(
@@ -7602,23 +7647,26 @@ mod tests {
         state_mut.profile = "maya".to_string();
         let remote: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
-        let mut denied_request = axum::http::Request::builder()
+        let mut settings_request = axum::http::Request::builder()
             .uri("/api/settings")
             .header("host", "localhost")
             .body(axum::body::Body::empty())
             .unwrap();
-        denied_request
+        settings_request
             .extensions_mut()
             .insert(axum::extract::ConnectInfo(remote));
-        let denied = test_support::build_router_for_test(state.clone())
-            .oneshot(denied_request)
+        let settings = test_support::build_router_for_test(state.clone())
+            .oneshot(settings_request)
             .await
             .unwrap();
-        assert_eq!(denied.status(), axum::http::StatusCode::FORBIDDEN);
-        let denied_body = axum::body::to_bytes(denied.into_body(), usize::MAX)
+        assert_eq!(settings.status(), axum::http::StatusCode::OK);
+        let settings_body = axum::body::to_bytes(settings.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert!(String::from_utf8_lossy(&denied_body).contains("maya_restricted"));
+        let settings_payload: serde_json::Value = serde_json::from_slice(&settings_body).unwrap();
+        assert!(settings_payload.get("theme").is_some());
+        assert!(settings_payload.get("sound").is_some());
+        assert_eq!(settings_payload.as_object().unwrap().len(), 2);
 
         let mut about_request = axum::http::Request::builder()
             .uri("/api/about")
@@ -7639,6 +7687,66 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&about_body).unwrap();
         assert_eq!(payload["profile"], "maya");
         assert_eq!(payload["maya_restricted"], true);
+    }
+
+    #[tokio::test]
+    async fn maya_managed_selectors_survive_list_and_session_routing() {
+        use tower::ServiceExt;
+
+        let mut allowed = Instance::new("Maya", maya_restricted::PROJECT_PATH);
+        allowed.id = "0123456789abcdef".into();
+        allowed.tool = "codex".into();
+        allowed.view = crate::session::View::Structured;
+        allowed.source_profile = maya_restricted::PROFILE_NAME.into();
+        allowed.agent_model = Some("gpt-5.6-sol".into());
+        allowed.acp_mode_id = Some("agent-full-access".into());
+        allowed.acp_effort = Some("max".into());
+        let mut hidden = allowed.clone();
+        hidden.id = "fedcba9876543210".into();
+        hidden.agent_model = Some("caller-controlled-model".into());
+
+        let mut state = test_support::build_test_app_state_with_policy(
+            vec![allowed, hidden],
+            vecs(&["localhost"]),
+            Vec::new(),
+            None,
+        );
+        let state_mut = Arc::get_mut(&mut state).expect("unique test state");
+        state_mut.maya_restricted = true;
+        state_mut.profile = maya_restricted::PROFILE_NAME.into();
+        let app = test_support::build_router_for_test(state);
+        let remote: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        for (uri, expected) in [
+            ("/api/sessions", axum::http::StatusCode::OK),
+            (
+                "/api/sessions/0123456789abcdef/acp/replay?since=0",
+                axum::http::StatusCode::OK,
+            ),
+            (
+                "/api/sessions/fedcba9876543210/acp/replay?since=0",
+                axum::http::StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let mut request = axum::http::Request::builder()
+                .uri(uri)
+                .header("host", "localhost")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(remote));
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected, "{uri}");
+            if uri == "/api/sessions" {
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["sessions"].as_array().unwrap().len(), 1);
+                assert_eq!(body["sessions"][0]["id"], "0123456789abcdef");
+            }
+        }
     }
 
     #[tokio::test]

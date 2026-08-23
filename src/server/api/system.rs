@@ -224,7 +224,25 @@ pub struct SettingsQuery {
     pub profile: Option<String>,
 }
 
+fn maya_presentation_settings(value: serde_json::Value) -> serde_json::Value {
+    let mut result = serde_json::Map::new();
+    if let Some(theme) = value.get("theme").and_then(serde_json::Value::as_object) {
+        result.insert(
+            "theme".into(),
+            serde_json::json!({
+                "name": theme.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                "color_mode": theme.get("color_mode").cloned().unwrap_or(serde_json::Value::Null),
+            }),
+        );
+    }
+    if let Some(sound) = value.get("sound") {
+        result.insert("sound".into(), sound.clone());
+    }
+    serde_json::Value::Object(result)
+}
+
 pub async fn get_settings(
+    State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<SettingsQuery>,
 ) -> impl IntoResponse {
     let config_result = if let Some(ref profile_name) = query.profile {
@@ -234,7 +252,13 @@ pub async fn get_settings(
     };
 
     match config_result {
-        Ok(config) => match serde_json::to_value(&config) {
+        Ok(config) => match serde_json::to_value(&config).map(|value| {
+            if state.maya_restricted {
+                maya_presentation_settings(value)
+            } else {
+                value
+            }
+        }) {
             Ok(val) => (StatusCode::OK, Json(val)).into_response(),
             Err(e) => {
                 tracing::error!(target: "http.api.system", "Settings serialization failed: {}", e);
@@ -438,8 +462,17 @@ pub async fn get_cityhall_bundle(
 /// per-field JSX, so a new config field appears on the web automatically. No
 /// secrets: descriptors are pure metadata (labels, widgets, validation, write
 /// policy), so this needs no elevation, only normal authentication.
-pub async fn get_settings_schema() -> Json<Vec<crate::session::settings_schema::FieldDescriptor>> {
-    Json(runtime_schema())
+pub async fn get_settings_schema(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<crate::session::settings_schema::FieldDescriptor>> {
+    let mut schema = runtime_schema();
+    if state.maya_restricted {
+        schema.retain(|descriptor| {
+            descriptor.section == "sound"
+                || (descriptor.section == "theme" && descriptor.field != "idle_decay_minutes")
+        });
+    }
+    Json(schema)
 }
 
 /// `GET /api/settings/resolved` returns every setting's effective value plus
@@ -1861,10 +1894,28 @@ const CITYHALL_PROFILE_LEAVES: &[&str] = &[
     "session.trash_retention_days",
 ];
 
+/// Presentation-only profile leaves exposed by the Maya browser host. The
+/// restricted router admits the fixed `maya` profile path, and this handler
+/// keeps that path from becoming a general profile-authority writer.
+const MAYA_PRESENTATION_PROFILE_LEAVES: &[&str] = &[
+    "sound.enabled",
+    "sound.on_start",
+    "sound.on_running",
+    "sound.on_waiting",
+    "sound.on_idle",
+    "sound.on_error",
+    "sound.on_approval",
+    "sound.volume",
+];
+
 /// Walk a sparse settings patch and return the first dotted leaf path not in
 /// [`CITYHALL_PROFILE_LEAVES`], or `None` when every leaf is permitted.
 fn first_non_cityhall_profile_leaf(patch: &serde_json::Value) -> Option<String> {
-    fn walk(prefix: &str, v: &serde_json::Value) -> Option<String> {
+    first_unlisted_profile_leaf(patch, CITYHALL_PROFILE_LEAVES)
+}
+
+fn first_unlisted_profile_leaf(patch: &serde_json::Value, allowed: &[&str]) -> Option<String> {
+    fn walk_allowed(prefix: &str, v: &serde_json::Value, allowed: &[&str]) -> Option<String> {
         match v {
             serde_json::Value::Object(map) => {
                 for (k, child) in map {
@@ -1873,17 +1924,17 @@ fn first_non_cityhall_profile_leaf(patch: &serde_json::Value) -> Option<String> 
                     } else {
                         format!("{prefix}.{k}")
                     };
-                    if let Some(bad) = walk(&path, child) {
+                    if let Some(bad) = walk_allowed(&path, child, allowed) {
                         return Some(bad);
                     }
                 }
                 None
             }
-            _ if CITYHALL_PROFILE_LEAVES.contains(&prefix) => None,
+            _ if allowed.contains(&prefix) => None,
             _ => Some(prefix.to_string()),
         }
     }
-    walk("", patch)
+    walk_allowed("", patch, allowed)
 }
 
 pub async fn update_profile_settings(
@@ -1927,6 +1978,28 @@ pub async fn update_profile_settings(
                 Json(serde_json::json!({
                     "error": "cityhall_mode",
                     "message": format!("Field '{bad}' is not writable in CityHall mode"),
+                })),
+            )
+                .into_response();
+        }
+    }
+    if state.maya_restricted {
+        if name != crate::server::maya_restricted::PROFILE_NAME {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "maya_restricted",
+                    "message": "Only the fixed Maya profile is writable",
+                })),
+            )
+                .into_response();
+        }
+        if let Some(bad) = first_unlisted_profile_leaf(&body, MAYA_PRESENTATION_PROFILE_LEAVES) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "maya_restricted",
+                    "message": format!("Field '{bad}' is not a presentation setting"),
                 })),
             )
                 .into_response();
@@ -2178,6 +2251,47 @@ mod tests {
         assert_eq!(
             first_non_cityhall_profile_leaf(&serde_json::json!({"theme": {"name": "x"}})),
             Some("theme.name".to_string())
+        );
+    }
+
+    #[test]
+    fn maya_profile_leaf_allows_only_presentation_sound_controls() {
+        assert_eq!(
+            first_unlisted_profile_leaf(
+                &serde_json::json!({
+                    "sound": {
+                        "enabled": true,
+                        "on_approval": "approval.wav",
+                        "volume": 0.8
+                    }
+                }),
+                MAYA_PRESENTATION_PROFILE_LEAVES,
+            ),
+            None
+        );
+        assert_eq!(
+            first_unlisted_profile_leaf(
+                &serde_json::json!({"sandbox": {"environment": {"TOKEN": "x"}}}),
+                MAYA_PRESENTATION_PROFILE_LEAVES,
+            ),
+            Some("sandbox.environment.TOKEN".to_string())
+        );
+    }
+
+    #[test]
+    fn maya_settings_projection_omits_authority_bearing_configuration() {
+        let projected = maya_presentation_settings(serde_json::json!({
+            "theme": {"name": "amber", "color_mode": "truecolor", "idle_decay_minutes": 5},
+            "sound": {"enabled": true, "volume": 0.5},
+            "agents": {"codex": {"command": "/tmp/forged"}},
+            "sandbox": {"environment": {"TOKEN": "secret"}}
+        }));
+        assert_eq!(
+            projected,
+            serde_json::json!({
+                "theme": {"name": "amber", "color_mode": "truecolor"},
+                "sound": {"enabled": true, "volume": 0.5}
+            })
         );
     }
 

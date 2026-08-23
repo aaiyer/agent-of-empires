@@ -58,7 +58,7 @@ pub fn bind_codex_agent_spec(
         "Maya Codex launcher does not match the built-in prefix"
     );
     anyhow::ensure!(
-        is_source_thread_id(aoe_session_id),
+        is_aoe_session_id(aoe_session_id),
         "invalid AoE session identity"
     );
     if let Some(id) = assigned_codex_session_id {
@@ -90,8 +90,9 @@ pub fn is_restricted_session(instance: &crate::session::Instance) -> bool {
         && instance.worktree_info.is_none()
         && instance.workspace_info.is_none()
         && instance.agent_name.is_none()
-        && instance.agent_model.is_none()
-        && instance.acp_effort.is_none()
+        && instance.agent_model.as_deref().is_none_or(is_managed_model)
+        && instance.acp_mode_id.as_deref().is_none_or(is_managed_mode)
+        && instance.acp_effort.as_deref().is_none_or(is_managed_effort)
 }
 
 pub fn first_turn_title(prompt: &str) -> String {
@@ -137,11 +138,37 @@ fn is_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-fn is_source_thread_id(value: &str) -> bool {
+fn is_aoe_session_id(value: &str) -> bool {
     value.len() == 16
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn is_source_thread_id(value: &str) -> bool {
+    canonical_codex_session_id(value.strip_prefix("maya-import-").unwrap_or(value))
+}
+
+fn is_managed_model(value: &str) -> bool {
+    matches!(
+        value,
+        "gpt-5.6-sol"
+            | "gpt-5.6-terra"
+            | "gpt-5.6-luna"
+            | "gpt-5.5"
+            | "gpt-5.4"
+            | "gpt-5.4-mini"
+            | "gpt-5.2"
+            | "codex-auto-review"
+    )
+}
+
+fn is_managed_mode(value: &str) -> bool {
+    matches!(value, "read-only" | "agent" | "agent-full-access")
+}
+
+fn is_managed_effort(value: &str) -> bool {
+    matches!(value, "low" | "medium" | "high" | "xhigh" | "max" | "ultra")
 }
 
 fn canonical_codex_session_id(value: &str) -> bool {
@@ -384,6 +411,19 @@ pub fn route_allowed(method: &Method, path: &str) -> bool {
     if path == "/api/skills" && *method == Method::GET {
         return true;
     }
+    if matches!(
+        path,
+        "/api/settings" | "/api/settings/schema" | "/api/sounds"
+    ) && *method == Method::GET
+    {
+        return true;
+    }
+    if path.starts_with("/api/sounds/file/") && *method == Method::GET {
+        return true;
+    }
+    if path == "/api/profiles/maya/settings" && *method == Method::PATCH {
+        return true;
+    }
     if path == "/api/theme" && *method == Method::PATCH {
         return true;
     }
@@ -412,7 +452,7 @@ pub fn route_allowed(method: &Method, path: &str) -> bool {
                 ),
             ) => true,
             (&Method::GET, Some("acp/replay")) => true,
-            (&Method::GET, Some("acp/files" | "acp/context-primer" | "acp/worker-log")) => true,
+            (&Method::GET, Some("acp/files" | "acp/context-primer")) => true,
             (&Method::POST, Some("acp/mode" | "acp/config-option")) => true,
             (&Method::GET, Some("diff/files" | "diff/file" | "file")) => true,
             (&Method::POST | &Method::DELETE, Some("terminal")) => true,
@@ -513,7 +553,6 @@ mod tests {
             (Method::GET, "/api/sessions/s-1/acp/replay"),
             (Method::GET, "/api/sessions/s-1/acp/files"),
             (Method::GET, "/api/sessions/s-1/acp/context-primer"),
-            (Method::GET, "/api/sessions/s-1/acp/worker-log"),
             (Method::POST, "/api/sessions/s-1/acp/mode"),
             (Method::POST, "/api/sessions/s-1/acp/config-option"),
             (Method::GET, "/api/sessions/s-1/diff/files"),
@@ -534,6 +573,11 @@ mod tests {
             (Method::POST, "/api/presence"),
             (Method::GET, "/api/tips"),
             (Method::GET, "/api/skills"),
+            (Method::GET, "/api/settings"),
+            (Method::GET, "/api/settings/schema"),
+            (Method::GET, "/api/sounds"),
+            (Method::GET, "/api/sounds/file/approval.wav"),
+            (Method::PATCH, "/api/profiles/maya/settings"),
             (Method::POST, "/api/tips/show"),
             (Method::POST, "/api/app-state/tip-seen"),
             (Method::GET, "/api/app-state/web-ui-state"),
@@ -551,8 +595,9 @@ mod tests {
 
         for (method, path) in [
             (Method::GET, "/api/agents"),
-            (Method::GET, "/api/settings"),
+            (Method::GET, "/api/sessions/s-1/acp/worker-log"),
             (Method::PATCH, "/api/settings"),
+            (Method::PATCH, "/api/profiles/other/settings"),
             (Method::GET, "/api/profiles"),
             (Method::GET, "/api/projects"),
             (Method::DELETE, "/api/workspaces"),
@@ -664,9 +709,9 @@ mod tests {
 
     #[test]
     fn import_catalog_is_canonical_and_unique() {
-        let bytes = b"{\"schema\":\"maya.aoe.import-bindings.v1\",\"type\":\"maya-aoe-import-bindings\",\"profile\":\"maya\",\"project_path\":\"/home/aaiyer/maya/maya-main\",\"source_catalog_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"entries\":[{\"source_t3_thread_id\":\"0123456789abcdef\",\"title\":\"Imported thread\",\"managed_codex_session_id\":\"11111111-1111-4111-8111-111111111111\"}]}\n";
+        let bytes = b"{\"schema\":\"maya.aoe.import-bindings.v1\",\"type\":\"maya-aoe-import-bindings\",\"profile\":\"maya\",\"project_path\":\"/home/aaiyer/maya/maya-main\",\"source_catalog_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"entries\":[{\"source_t3_thread_id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"title\":\"Imported thread\",\"managed_codex_session_id\":\"11111111-1111-4111-8111-111111111111\"},{\"source_t3_thread_id\":\"maya-import-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\",\"title\":\"Imported prefixed thread\",\"managed_codex_session_id\":\"22222222-2222-4222-8222-222222222222\"}]}\n";
         let parsed = parse_import_bindings(bytes).expect("canonical catalog");
-        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries.len(), 2);
 
         let mut noncanonical = bytes.to_vec();
         noncanonical.insert(1, b' ');
@@ -677,9 +722,43 @@ mod tests {
             .expect("catalog suffix")
             .iter()
             .copied()
-            .chain(b",{\"source_t3_thread_id\":\"0123456789abcdef\",\"title\":\"Other\",\"managed_codex_session_id\":\"22222222-2222-4222-8222-222222222222\"}]}\n".iter().copied())
+            .chain(b",{\"source_t3_thread_id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"title\":\"Other\",\"managed_codex_session_id\":\"33333333-3333-4333-8333-333333333333\"}]}\n".iter().copied())
             .collect::<Vec<_>>();
         assert!(parse_import_bindings(&duplicate).is_err());
+
+        for invalid in [
+            "0123456789abcdef",
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+            "maya-import-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa-extra",
+        ] {
+            assert!(
+                !is_source_thread_id(invalid),
+                "accepted source id {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_selectors_keep_restricted_sessions_visible() {
+        let mut instance = crate::session::Instance::new("Maya", PROJECT_PATH);
+        instance.tool = "codex".into();
+        instance.view = crate::session::View::Structured;
+        instance.source_profile = PROFILE_NAME.into();
+        instance.agent_model = Some("gpt-5.6-sol".into());
+        instance.acp_mode_id = Some("agent-full-access".into());
+        instance.acp_effort = Some("max".into());
+        assert!(is_restricted_session(&instance));
+
+        for (model, mode, effort) in [
+            (Some("other"), Some("agent"), Some("high")),
+            (Some("gpt-5.6-sol"), Some("other"), Some("high")),
+            (Some("gpt-5.6-sol"), Some("agent"), Some("other")),
+        ] {
+            instance.agent_model = model.map(str::to_owned);
+            instance.acp_mode_id = mode.map(str::to_owned);
+            instance.acp_effort = effort.map(str::to_owned);
+            assert!(!is_restricted_session(&instance));
+        }
     }
 
     #[test]

@@ -52,7 +52,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use serde::Deserialize;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -120,10 +120,18 @@ enum WatchdogShutdown {
     DetachedRetentionExpired,
 }
 
-/// Cap on agent → daemon notification lines stored while detached.
-/// Each entry is at most one ndjson line (a few KB). Past this, oldest
-/// entries are dropped; the daemon-side event_store still has them.
-const NOTIFICATION_BUFFER_LINES: usize = 256;
+/// Bounds for relay data retained while a daemon is detached and for the
+/// transcript emitted during one `session/load`. Imported history must never
+/// be silently truncated: capture fails before publication when either bound
+/// is exceeded, while the detached queue is sized to contain one complete
+/// accepted replay plus ordinary notifications.
+const MAX_REPLAY_LINES: usize = 65_536;
+const MAX_REPLAY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
+
+/// Deadline for one relay socket write. A dead peer can otherwise fill the
+/// unix socket buffer and park the sole stdout fanout forever.
+const RELAY_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// An agent that exits within this window of being spawned is treated as a
 /// broken spawn and logged at warn (not info), so a crash loop is visible in
@@ -668,9 +676,12 @@ struct RunnerShared {
     /// The currently-attached daemon's send-side of the unix socket. The
     /// fanout task writes agent → daemon notifications here when set.
     active_outbound: Mutex<Option<tokio::net::unix::OwnedWriteHalf>>,
-    /// Ring of agent → daemon ndjson lines that arrived while no daemon
-    /// was attached. Drained into the next attached daemon's outbound.
-    pending: Mutex<VecDeque<Vec<u8>>>,
+    /// Serialises relay delivery without holding either shared state mutex
+    /// across a socket await.
+    relay_delivery: Mutex<()>,
+    /// Agent → daemon ndjson lines that arrived while no daemon was
+    /// attached. Drained losslessly into the next attached daemon.
+    pending: Mutex<PendingLines>,
     /// JSON-RPC request ids the agent issued to the daemon that have
     /// not yet seen a response. Populated from agent → daemon traffic
     /// (`method` + numeric `id`) and cleared on response (`id` only).
@@ -708,7 +719,7 @@ struct RunnerShared {
     /// `session/load` response. Capturing only this request-owned window lets
     /// the stdout reader reach the response even when the relay socket is
     /// full; the ordered replay is drained asynchronously afterward.
-    load_replay_capture: Mutex<Option<Vec<Vec<u8>>>>,
+    load_replay_capture: Mutex<Option<ReplayCapture>>,
     /// Monotonic JSON-RPC id allocator for the requests the runner issues
     /// to the agent on its own (`initialize`, `session/*`, `session/prompt`)
     /// now that it owns the client side of the protocol. On the v2 path the
@@ -749,7 +760,61 @@ struct RunnerHandshake {
     /// Exact relay frames captured during the established `session/load`.
     /// Retained across daemon reattach so a crash before durable import
     /// settlement can replay the complete prefix instead of a truncated tail.
-    load_replay: Vec<Vec<u8>>,
+    load_replay: Arc<[Vec<u8>]>,
+}
+
+#[derive(Default)]
+struct PendingLines {
+    lines: VecDeque<Vec<u8>>,
+    bytes: usize,
+}
+
+impl PendingLines {
+    fn push_back(&mut self, line: Vec<u8>) -> bool {
+        if self.bytes.saturating_add(line.len()) > MAX_PENDING_BYTES {
+            return false;
+        }
+        self.bytes += line.len();
+        self.lines.push_back(line);
+        true
+    }
+
+    fn push_front(&mut self, line: Vec<u8>) {
+        self.bytes += line.len();
+        self.lines.push_front(line);
+    }
+
+    fn pop_front(&mut self) -> Option<Vec<u8>> {
+        let line = self.lines.pop_front()?;
+        self.bytes -= line.len();
+        Some(line)
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&Vec<u8>) -> bool) {
+        self.lines.retain(|line| keep(line));
+        self.bytes = self.lines.iter().map(Vec::len).sum();
+    }
+}
+
+#[derive(Default)]
+struct ReplayCapture {
+    lines: Vec<Vec<u8>>,
+    bytes: usize,
+    overflowed: bool,
+}
+
+impl ReplayCapture {
+    fn push(&mut self, line: &[u8]) {
+        if self.overflowed
+            || self.lines.len() >= MAX_REPLAY_LINES
+            || self.bytes.saturating_add(line.len()) > MAX_REPLAY_BYTES
+        {
+            self.overflowed = true;
+            return;
+        }
+        self.bytes += line.len();
+        self.lines.push(line.to_vec());
+    }
 }
 
 /// Control-channel state for the sibling `<id>.control.sock`. A single
@@ -814,6 +879,17 @@ const RUNNER_REQUEST_ID_BASE: i64 = 1 << 48;
 /// runs. Phase A of #1054.
 const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
+async fn write_relay_line<W: AsyncWrite + Unpin>(out: &mut W, line: &[u8]) -> bool {
+    matches!(
+        tokio::time::timeout(RELAY_WRITE_TIMEOUT, async {
+            out.write_all(line).await?;
+            out.flush().await
+        })
+        .await,
+        Ok(Ok(()))
+    )
+}
+
 /// Write a control frame with a bounded deadline. Returns `true` on a
 /// successful write, `false` on a write error or timeout; callers treat
 /// `false` as a dead/stalled socket and run their drop/buffer cleanup.
@@ -850,7 +926,8 @@ impl RunnerShared {
     fn new() -> Self {
         Self {
             active_outbound: Mutex::new(None),
-            pending: Mutex::new(VecDeque::with_capacity(NOTIFICATION_BUFFER_LINES)),
+            relay_delivery: Mutex::new(()),
+            pending: Mutex::new(PendingLines::default()),
             outstanding_requests: Mutex::new(HashMap::new()),
             prompt_requests: Mutex::new(HashSet::new()),
             control: Mutex::new(ControlChannel::default()),
@@ -863,8 +940,8 @@ impl RunnerShared {
         }
     }
 
-    /// Forward a line to the daemon if attached; else buffer. Returns
-    /// whether forwarding happened (false → buffered/consumed).
+    /// Forward a line to the daemon if attached; else buffer. Returns false
+    /// only when the bounded detached queue cannot accept the line.
     async fn deliver_line(&self, line: &[u8]) -> bool {
         // #2976 Phase B: a response to a request the RUNNER issued
         // (`initialize` / `session/*` during the runner-owned handshake) is
@@ -878,15 +955,15 @@ impl RunnerShared {
                 if let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) {
                     let _ = tx.send(value);
                 }
-                return false;
+                return true;
             }
         }
 
         if is_session_update_notification(line) {
             let mut capture = self.load_replay_capture.lock().await;
-            if let Some(lines) = capture.as_mut() {
-                lines.push(line.to_vec());
-                return false;
+            if let Some(capture) = capture.as_mut() {
+                capture.push(line);
+                return !capture.overflowed;
             }
         }
 
@@ -935,28 +1012,26 @@ impl RunnerShared {
         // response is forwarded to the daemon below either way.
         self.refresh_session_cache_from_relay(line).await;
 
-        let mut guard = self.active_outbound.lock().await;
-        if let Some(out) = guard.as_mut() {
-            if out.write_all(line).await.is_ok() && out.flush().await.is_ok() {
+        let _delivery = self.relay_delivery.lock().await;
+        let outbound = self.active_outbound.lock().await.take();
+        if let Some(mut out) = outbound {
+            if write_relay_line(&mut out, line).await {
+                *self.active_outbound.lock().await = Some(out);
                 return true;
             }
-            // Write failure: daemon side closed. Drop the writer and
-            // buffer this line for the next attach.
-            *guard = None;
         }
-        // Buffer while STILL holding `active_outbound`. Dropping it before
-        // locking `pending` opens a TOCTOU window: a reattaching
-        // `install_outbound` (which locks `active_outbound` then `pending`
-        // in the same order) could drain `pending` and install its writer in
-        // the gap, stranding this line until the next reattach. Holding the
-        // lock makes the "no live writer, so buffer" step atomic. Lock order
-        // is `active_outbound` then `pending` everywhere, so no deadlock.
+        // The delivery gate keeps this no-writer decision atomic with attach,
+        // without retaining either state mutex across the socket await.
         let mut pending = self.pending.lock().await;
-        while pending.len() >= NOTIFICATION_BUFFER_LINES {
-            pending.pop_front();
+        let accepted = pending.push_back(line.to_vec());
+        if !accepted {
+            warn!(
+                target: "acp.runner",
+                bytes = pending.bytes,
+                "detached relay buffer exhausted; refusing to silently truncate output"
+            );
         }
-        pending.push_back(line.to_vec());
-        false
+        accepted
     }
 
     /// Peek-parse a daemon → agent line: if it's a response (id without
@@ -1069,27 +1144,19 @@ impl RunnerShared {
         &self,
         mut out: tokio::net::unix::OwnedWriteHalf,
     ) -> Option<tokio::net::unix::OwnedWriteHalf> {
-        // Hold `active_outbound` across the whole drain + install so a
-        // concurrent `deliver_line` (which locks `active_outbound` first,
-        // sees None, then buffers into `pending`) cannot slip a line into
-        // `pending` after we have drained it but before the writer is
-        // installed. Lock order is `active_outbound` then `pending`
-        // everywhere, so this cannot deadlock.
-        let mut guard = self.active_outbound.lock().await;
-        let prev = guard.take();
-        let mut pending = self.pending.lock().await;
-        while let Some(line) = pending.pop_front() {
-            if out.write_all(&line).await.is_err() || out.flush().await.is_err() {
-                // Drain failed mid-way, so push the remaining lines back
-                // and surface the write half as unusable. `active_outbound`
-                // stays None (via the earlier take), matching the old
-                // behavior of leaving no live writer on a failed attach.
-                pending.push_front(line);
+        let _delivery = self.relay_delivery.lock().await;
+        let prev = self.active_outbound.lock().await.take();
+        loop {
+            let line = self.pending.lock().await.pop_front();
+            let Some(line) = line else {
+                break;
+            };
+            if !write_relay_line(&mut out, &line).await {
+                self.pending.lock().await.push_front(line);
                 return None;
             }
         }
-        drop(pending);
-        *guard = Some(out);
+        *self.active_outbound.lock().await = Some(out);
         self.main_attached
             .store(true, std::sync::atomic::Ordering::Relaxed);
         prev
@@ -1330,7 +1397,7 @@ impl RunnerShared {
             handshake
                 .session
                 .clone()
-                .map(|session| (session, handshake.load_replay.clone()))
+                .map(|session| (session, Arc::clone(&handshake.load_replay)))
         };
         if let Some((cached, replay)) = cached {
             if method == "session/load" {
@@ -1343,20 +1410,26 @@ impl RunnerShared {
             return Ok(cached);
         }
         if method == "session/load" {
-            *self.load_replay_capture.lock().await = Some(Vec::new());
+            *self.load_replay_capture.lock().await = Some(ReplayCapture::default());
         }
         let response = self
             .agent_request(agent_stdin, method, request.clone())
             .await;
-        let replay = if method == "session/load" {
+        let capture = if method == "session/load" {
             self.load_replay_capture
                 .lock()
                 .await
                 .take()
                 .unwrap_or_default()
         } else {
-            Vec::new()
+            ReplayCapture::default()
         };
+        if capture.overflowed {
+            return Err(transport_error(
+                "session/load replay exceeds the bounded runner capture",
+            ));
+        }
+        let replay: Arc<[Vec<u8>]> = capture.lines.into();
         let response = response
             .ok_or_else(|| transport_error(&format!("agent closed before answering {method}")))?;
         let result = handshake_result(&response)?;
@@ -1365,7 +1438,7 @@ impl RunnerShared {
         {
             let mut handshake = self.handshake.lock().await;
             handshake.session = Some(cached.clone());
-            handshake.load_replay = replay.clone();
+            handshake.load_replay = Arc::clone(&replay);
         }
         if method == "session/load" {
             self.schedule_history_replay(
@@ -1388,14 +1461,20 @@ impl RunnerShared {
     /// until all preceding relay frames have been processed.
     fn schedule_history_replay(
         self: &Arc<Self>,
-        replay: Vec<Vec<u8>>,
+        replay: Arc<[Vec<u8>]>,
         acp_session_id: String,
         replay_token: String,
     ) {
         let shared = Arc::clone(self);
         tokio::spawn(async move {
-            for line in replay {
-                shared.deliver_line(&line).await;
+            for line in replay.iter() {
+                if !shared.deliver_line(line).await {
+                    warn!(
+                        target: "acp.runner",
+                        "history replay paused before its barrier because the detached queue is full"
+                    );
+                    return;
+                }
             }
             shared
                 .emit_history_replay_barrier(&acp_session_id, &replay_token)
@@ -2378,6 +2457,61 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$AOE_TEST_RESPONSE_ID"
         control_handler.await.expect("control handler");
         fanout.await.expect("stdout fanout");
         child.wait().await.expect("fixture exits");
+    }
+
+    #[test]
+    fn replay_capture_rejects_overflow_without_truncating_a_prefix() {
+        let mut capture = ReplayCapture::default();
+        let line = vec![b'x'; MAX_REPLAY_BYTES + 1];
+        capture.push(&line);
+        assert!(capture.overflowed);
+        assert!(capture.lines.is_empty());
+        assert_eq!(capture.bytes, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_write_times_out_when_transport_stays_full() {
+        let (mut writer, reader) = tokio::io::duplex(1);
+        writer
+            .write_all(&[b'x'])
+            .await
+            .expect("fill relay transport");
+        let write = tokio::spawn(async move { write_relay_line(&mut writer, b"next").await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(RELAY_WRITE_TIMEOUT).await;
+        assert!(!write.await.expect("bounded relay writer"));
+        drop(reader);
+    }
+
+    #[tokio::test]
+    async fn failed_relay_write_preserves_full_line_for_reattach() {
+        let shared = RunnerShared::new();
+        let (closed_daemon, runner) = UnixStream::pair().expect("closed socket pair");
+        let (_runner_read, runner_write) = runner.into_split();
+        assert!(shared.install_outbound(runner_write).await.is_none());
+        drop(closed_daemon);
+
+        let line = vec![b'x'; 1024 * 1024];
+        assert!(shared.deliver_line(&line).await);
+        {
+            let pending = shared.pending.lock().await;
+            assert_eq!(pending.bytes, line.len());
+            assert_eq!(pending.lines.front(), Some(&line));
+        }
+
+        let (daemon, runner) = UnixStream::pair().expect("replacement socket pair");
+        let (mut daemon_read, _daemon_write) = daemon.into_split();
+        let (_runner_read, runner_write) = runner.into_split();
+        let line_len = line.len();
+        let read = tokio::spawn(async move {
+            let mut received = vec![0; line_len];
+            tokio::io::AsyncReadExt::read_exact(&mut daemon_read, &mut received)
+                .await
+                .expect("read recovered relay line");
+            received
+        });
+        assert!(shared.install_outbound(runner_write).await.is_none());
+        assert_eq!(read.await.expect("reader task"), line);
     }
 
     /// Only `session/load` has a request-owned identity. A successful-looking

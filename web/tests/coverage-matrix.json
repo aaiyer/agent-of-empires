@@ -9,12 +9,14 @@
       "specs": [
         "tests/maya-restricted-shell.spec.ts",
         "src/lib/__tests__/clientCapabilities.test.ts",
+        "src/components/__tests__/SettingsView.mayaRestricted.test.tsx",
         "src/components/acp/Composer.toolbarButtons.test.tsx",
         "src/components/__tests__/WorkspaceSidebarTrash.test.tsx",
         "src/components/session-wizard/__tests__/SessionWizard.hooksTrust.test.tsx"
       ],
       "components": [
         "web/src/App.tsx",
+        "web/src/components/SettingsView.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/acp/BackgroundAgentsPanel.tsx",
         "web/src/components/acp/Composer.tsx",

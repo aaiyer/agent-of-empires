@@ -210,6 +210,26 @@ const CITYHALL_TAB_IDS = new Set<TabId>(["theme", "session", "mcp", "telemetry",
 const CITYHALL_SESSION_FIELDS = ["delete_to_trash", "confirm_delete", "trash_retention_days"];
 const CITYHALL_THEME_HIDDEN = ["color_mode", "idle_decay_minutes"];
 
+// Maya exposes only presentation state. Agent, project, provider, deployment,
+// and host configuration remain behind the restricted server capability gate.
+const MAYA_SIDEBAR: SidebarItem[] = [
+  { kind: "divider", label: "Appearance" },
+  { kind: "tab", id: "theme", label: "Theme" },
+  { kind: "tab", id: "structured-view", label: "Conversation display" },
+  { kind: "tab", id: "sound", label: "Sound" },
+  { kind: "tab", id: "panels", label: "Panels" },
+];
+const MAYA_TAB_IDS = new Set<TabId>(["theme", "structured-view", "sound", "panels"]);
+const MAYA_THEME_HIDDEN = ["idle_decay_minutes"];
+
+function curateMayaSchema(schema: SettingsFieldDescriptor[]): SettingsFieldDescriptor[] {
+  return schema.filter(
+    (descriptor) =>
+      descriptor.section === "sound" ||
+      (descriptor.section === "theme" && !MAYA_THEME_HIDDEN.includes(descriptor.field)),
+  );
+}
+
 // Fields the CityHall settings search may surface: only sections whose tab is in
 // the curated sidebar, and within those only the fields the curated tabs
 // actually render. Without this, search lists every advanced field (type "yolo"
@@ -245,6 +265,8 @@ interface Props {
    *  advanced settings PATCH is closed server-side in this mode; theme and the
    *  surfaced fields write through their own endpoints. See #7. */
   cityhall?: boolean;
+  /** Maya restricted host: show only safe presentation controls. */
+  mayaRestricted?: boolean;
 }
 
 const ALL_TAB_IDS = new Set<TabId>([
@@ -315,6 +337,7 @@ export function SettingsView({
   onSelectProfile,
   readOnly,
   cityhall = false,
+  mayaRestricted = false,
 }: Props) {
   const offline = useServerDown();
   const [settings, setSettings] = useState<Record<string, unknown> | null>(null);
@@ -332,7 +355,7 @@ export function SettingsView({
   // tmux-* flakes).
   // Seed from the `?profile=` query (deep-link from the Profiles page) when
   // present, else empty (see the note above on why not "default").
-  const [selectedProfile, setSelectedProfile] = useState(profile ?? "");
+  const [selectedProfile, setSelectedProfile] = useState(mayaRestricted ? "maya" : (profile ?? ""));
   // Bumped only on a user-initiated profile switch (the header picker), never
   // on the mount-time fetchProfiles resolution that flips selectedProfile from
   // its "" seed to the default. The content fieldset keys its remount on this
@@ -359,30 +382,40 @@ export function SettingsView({
   // know the list is loaded; before that it may just be a not-yet-fetched valid
   // page, so we hold a loading state rather than rejecting it.
   const [pluginsLoaded, setPluginsLoaded] = useState(false);
-  const refreshPluginPages = useCallback(
-    () =>
-      fetchPlugins().then((res) => {
-        if (res) setPluginPages(pluginSettingsPages(res.plugins));
-        setPluginsLoaded(true);
-      }),
-    [],
-  );
+  const refreshPluginPages = useCallback(() => {
+    if (mayaRestricted) {
+      setPluginsLoaded(true);
+      return Promise.resolve();
+    }
+    return fetchPlugins().then((res) => {
+      if (res) setPluginPages(pluginSettingsPages(res.plugins));
+      setPluginsLoaded(true);
+    });
+  }, [mayaRestricted]);
   useEffect(() => {
     void refreshPluginPages();
   }, [refreshPluginPages]);
-  const sidebar: SidebarItem[] = cityhall ? CITYHALL_SIDEBAR : buildSidebar(pluginPages);
+  const sidebar: SidebarItem[] = mayaRestricted
+    ? MAYA_SIDEBAR
+    : cityhall
+      ? CITYHALL_SIDEBAR
+      : buildSidebar(pluginPages);
   const tabs = sidebar.filter((s): s is { kind: "tab"; id: string; label: string } => s.kind === "tab");
   const pluginPageDest = parsePluginPageTab(tab);
   // The declared nav entry a plugin-page route resolves to, or undefined when
   // the route matches no enabled contribution (typo, removed, or disabled).
   const pluginPageNav = pluginPageDest ? pluginPages.find((p) => p.tabId === tab) : undefined;
-  const activeTab: TabId = cityhall
-    ? isTabId(tab) && CITYHALL_TAB_IDS.has(tab)
+  const activeTab: TabId = mayaRestricted
+    ? isTabId(tab) && MAYA_TAB_IDS.has(tab)
       ? tab
       : "theme"
-    : isTabId(tab)
-      ? tab
-      : "session";
+    : cityhall
+      ? isTabId(tab) && CITYHALL_TAB_IDS.has(tab)
+        ? tab
+        : "theme"
+      : isTabId(tab)
+        ? tab
+        : "session";
   // The nav highlight/label id: the raw parametric tab only for a route that
   // matches a real plugin page, else the resolved built-in TabId (so an invalid
   // plugin-page route highlights the fallback tab, not a phantom entry).
@@ -396,7 +429,10 @@ export function SettingsView({
   const [schemaError, setSchemaError] = useState<string | null>(null);
   // Search indexes the curated schema in CityHall mode, so it cannot offer a
   // field whose tab is hidden (the jump would clamp back to Theme).
-  const searchSchema = useMemo(() => (cityhall ? curateCityhallSchema(schema) : schema), [cityhall, schema]);
+  const searchSchema = useMemo(
+    () => (mayaRestricted ? curateMayaSchema(schema) : cityhall ? curateCityhallSchema(schema) : schema),
+    [cityhall, mayaRestricted, schema],
+  );
   // Set when a settings-search hit is chosen: switch to the hit's tab and ask
   // the matching SchemaSection to scroll the field into view and highlight it.
   // The nonce bumps on every jump so re-selecting the same field (or jumping to
@@ -412,11 +448,12 @@ export function SettingsView({
   );
 
   useEffect(() => {
+    if (mayaRestricted) return;
     fetchProfiles().then((p) => {
       setProfiles(p);
       setSelectedProfile((current) => resolveSelectedProfile(current, p));
     });
-  }, []);
+  }, [mayaRestricted]);
 
   const loadSchema = useCallback(async () => {
     setSchemaLoading(true);
@@ -710,7 +747,7 @@ export function SettingsView({
             focusRequest={focusRequest}
             values={(settings?.theme ?? {}) as Record<string, unknown>}
             onSaveField={saveThemeField}
-            hideFields={cityhall ? CITYHALL_THEME_HIDDEN : undefined}
+            hideFields={mayaRestricted ? MAYA_THEME_HIDDEN : cityhall ? CITYHALL_THEME_HIDDEN : undefined}
           />
         );
       case "diff":
@@ -807,6 +844,7 @@ export function SettingsView({
       case "skills":
         return <SkillsManager readOnly={readOnly || cityhall} />;
       case "structured-view": {
+        if (mayaRestricted) return <StructuredViewDisplaySettings />;
         if (!settings) {
           return <div className="text-sm text-text-dim">Loading settings...</div>;
         }
@@ -855,7 +893,7 @@ export function SettingsView({
         schema={searchSchema}
         schemaLoading={schemaLoading}
         onSearchJump={handleSearchJump}
-        hideProfileSelector={cityhall}
+        hideProfileSelector={cityhall || mayaRestricted}
       />
 
       {/* Mobile tabs (horizontal scroll) */}
