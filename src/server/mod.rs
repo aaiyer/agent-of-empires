@@ -2673,6 +2673,8 @@ const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
 /// #7.
 #[cfg(test)]
 const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
+    // Migration/import is an administrative operation, unavailable in CityHall.
+    ("POST", "/api/maya/import-session"),
     // Terminal surface.
     ("POST", "/api/sessions/{id}/ensure"),
     ("POST", "/api/sessions/{id}/send"),
@@ -5722,13 +5724,17 @@ async fn acp_event_listener(state: Arc<AppState>) {
 
         let status_intent = derive_acp_status(frame.event.as_ref());
         let acp_change = derive_acp_session_change(frame.event.as_ref());
+        let assigned_id = match acp_change.as_ref() {
+            Some(AcpSessionChange::Assigned(id)) => Some(id.clone()),
+            _ => None,
+        };
         if status_intent.is_none() && acp_change.is_none() {
             continue;
         }
 
         // Acquire `instances` once for both branches. Releases before
         // the (potentially blocking) sessions.json save.
-        let profile_to_save = {
+        let (profile_to_save, settling_import) = {
             let mut instances = state.instances.write().await;
             let Some(inst) = instances.iter_mut().find(|i| i.id == frame.session_id) else {
                 continue;
@@ -5737,13 +5743,21 @@ async fn acp_event_listener(state: Arc<AppState>) {
                 continue;
             }
 
+            let settling_import = assigned_id.as_ref().is_some_and(|assigned| {
+                inst.acp_session_id.as_deref() == Some(assigned.as_str())
+                    && inst.import_pending == Some(true)
+            });
             apply_status_intent(inst, status_intent, &state.status_tx);
-            apply_acp_session_change(inst, &frame.session_id, acp_change.as_ref())
+            (
+                apply_acp_session_change(inst, &frame.session_id, acp_change.as_ref()),
+                settling_import,
+            )
         };
 
         // Persist `acp_session_id` to disk if the field changed.
         // Sync FS (file copy + JSON write) goes through spawn_blocking
         // so the runtime stays responsive under large session lists.
+        let mut durable = true;
         if let Some(profile) = profile_to_save {
             let session_id_for_log = frame.session_id.clone();
             let session_id_for_save = frame.session_id.clone();
@@ -5752,22 +5766,17 @@ async fn acp_event_listener(state: Arc<AppState>) {
             let file_watch = state.file_watch.clone();
             let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let storage = crate::session::Storage::new(&profile_for_save, file_watch)?;
-                storage.update(|all, _groups| {
-                    if let Some(inst) = all.iter_mut().find(|i| i.id == session_id_for_save) {
-                        apply_acp_session_change(
-                            inst,
-                            &session_id_for_save,
-                            acp_change_for_save.as_ref(),
-                        );
-                    }
-                    Ok(())
-                })?;
-                Ok(())
+                persist_acp_session_change(
+                    &storage,
+                    &session_id_for_save,
+                    acp_change_for_save.as_ref(),
+                )
             })
             .await;
             match save_result {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
+                    durable = false;
                     tracing::warn!(
                         target: "acp.event_listener",
                         session = %session_id_for_log,
@@ -5775,6 +5784,7 @@ async fn acp_event_listener(state: Arc<AppState>) {
                     );
                 }
                 Err(join_err) => {
+                    durable = false;
                     tracing::warn!(
                         target: "acp.event_listener",
                         session = %session_id_for_log,
@@ -5783,7 +5793,39 @@ async fn acp_event_listener(state: Arc<AppState>) {
                 }
             }
         }
+        if durable {
+            if let Some(acp_session_id) = assigned_id.as_deref() {
+                state
+                    .acp_supervisor
+                    .acknowledge_history_replay(&frame.session_id, acp_session_id)
+                    .await;
+            }
+        } else if settling_import {
+            // The live projection was cleared before the blocking save. Restore
+            // retry authority when that durable write failed; the runner still
+            // retains the replay because no acknowledgement was sent.
+            let mut instances = state.instances.write().await;
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == frame.session_id) {
+                if inst.acp_session_id.as_deref() == assigned_id.as_deref() {
+                    inst.import_pending = Some(true);
+                }
+            }
+        }
     }
+}
+
+#[cfg(feature = "serve")]
+fn persist_acp_session_change(
+    storage: &crate::session::Storage,
+    session_id: &str,
+    change: Option<&AcpSessionChange>,
+) -> anyhow::Result<()> {
+    storage.update(|all, _groups| {
+        if let Some(inst) = all.iter_mut().find(|i| i.id == session_id) {
+            apply_acp_session_change(inst, session_id, change);
+        }
+        Ok(())
+    })
 }
 
 /// Seed each acp-enabled session's `Instance.status` from the most
@@ -8781,6 +8823,58 @@ mod tests {
         assert!(
             profile.is_some(),
             "a new id assignment must persist regardless of markers"
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn import_replay_settlement_is_retryable_until_assignment_is_durable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sessions_path = temp.path().join("sessions.json");
+        let mut storage =
+            crate::session::Storage::new_for_test_path("import-settlement", sessions_path.clone());
+        let mut imported = Instance::new("sess-1", "/tmp/imported");
+        imported.acp_session_id = Some("stored-history".into());
+        imported.import_pending = Some(true);
+        let session_id = imported.id.clone();
+        storage
+            .update(|instances, _groups| {
+                *instances = vec![imported.clone()];
+                Ok(())
+            })
+            .expect("seed pending import");
+        let seeded = storage.load().expect("reload seeded import");
+        assert_eq!(seeded[0].acp_session_id.as_deref(), Some("stored-history"));
+        assert_eq!(seeded[0].import_pending, Some(true));
+
+        storage.set_fail_writes_for_test(true);
+        assert!(
+            persist_acp_session_change(
+                &storage,
+                &session_id,
+                Some(&AcpSessionChange::Assigned("stored-history".into())),
+            )
+            .is_err(),
+            "a failed durable write must not settle the import"
+        );
+        let failed = storage.load().expect("reload failed settlement");
+        assert_eq!(failed[0].acp_session_id.as_deref(), Some("stored-history"));
+        assert_eq!(failed[0].import_pending, Some(true));
+
+        storage.set_fail_writes_for_test(false);
+        persist_acp_session_change(
+            &storage,
+            &session_id,
+            Some(&AcpSessionChange::Assigned("stored-history".into())),
+        )
+        .expect("persist import settlement");
+        drop(storage);
+        let restarted =
+            crate::session::Storage::new_for_test_path("import-settlement-restart", sessions_path);
+        assert_eq!(
+            restarted.load().expect("reload settled import")[0].import_pending,
+            None,
+            "only the durable assignment makes a restart observe settlement"
         );
     }
 

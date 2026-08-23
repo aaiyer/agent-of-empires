@@ -3338,21 +3338,27 @@ impl AcpClient {
         Ok(())
     }
 
-    pub(crate) async fn acknowledge_history_replay(&self, acp_session_id: &str) {
+    pub(crate) async fn acknowledge_history_replay(&self, acp_session_id: &str) -> bool {
         let Some(control) = self.control_client.as_ref() else {
-            return;
+            return false;
         };
-        let Some(pending) = control.pending_history_replay.as_ref() else {
-            return;
+        let Some(pending) = control.pending_history_replay().await else {
+            return false;
         };
         if pending.acp_session_id != acp_session_id {
-            return;
+            return false;
         }
-        let _ = control
+        if control
             .send(ControlBody::HistoryReplaySettled {
                 replay_token: pending.replay_token.clone(),
             })
-            .await;
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        control.clear_history_replay(&pending.replay_token).await;
+        true
     }
 
     /// Drain the next event the agent emitted. Returns None once the
@@ -4216,7 +4222,7 @@ struct DaemonControlClient {
     write: Mutex<tokio::net::unix::OwnedWriteHalf>,
     handshake_rx: Mutex<mpsc::Receiver<ControlBody>>,
     completion: Arc<std::sync::Mutex<Option<oneshot::Sender<control_protocol::PromptOutcome>>>>,
-    pending_history_replay: Option<control_protocol::PendingHistoryReplay>,
+    pending_history_replay: Mutex<Option<control_protocol::PendingHistoryReplay>>,
 }
 
 impl DaemonControlClient {
@@ -4316,6 +4322,27 @@ impl DaemonControlClient {
 
     async fn cancel(&self) {
         let _ = self.send(ControlBody::Cancel).await;
+    }
+
+    async fn pending_history_replay(&self) -> Option<control_protocol::PendingHistoryReplay> {
+        self.pending_history_replay.lock().await.clone()
+    }
+
+    async fn arm_history_replay(&self, acp_session_id: String, replay_token: String) {
+        *self.pending_history_replay.lock().await = Some(control_protocol::PendingHistoryReplay {
+            acp_session_id,
+            replay_token,
+        });
+    }
+
+    async fn clear_history_replay(&self, replay_token: &str) {
+        let mut pending = self.pending_history_replay.lock().await;
+        if pending
+            .as_ref()
+            .is_some_and(|pending| pending.replay_token == replay_token)
+        {
+            pending.take();
+        }
     }
 }
 
@@ -4472,7 +4499,7 @@ async fn connect_runner_control_v2(
         write: Mutex::new(write_half),
         handshake_rx: Mutex::new(hs_rx),
         completion,
-        pending_history_replay,
+        pending_history_replay: Mutex::new(pending_history_replay),
     }))
 }
 
@@ -7481,11 +7508,12 @@ async fn run_connection_task<W, R>(
                     // Assigned as a no-op, so this doesn't rewrite
                     // sessions.json.
                     if seed_history_replay {
-                        let pending = control_client
-                            .as_ref()
-                            .and_then(|control| control.pending_history_replay.as_ref())
-                            .filter(|pending| pending.acp_session_id == stored)
-                            .ok_or_else(|| {
+                        let pending = match control_client.as_ref() {
+                            Some(control) => control.pending_history_replay().await,
+                            None => None,
+                        }
+                        .filter(|pending| pending.acp_session_id == stored)
+                        .ok_or_else(|| {
                                 acp_internal_error(format!(
                                     "runner has no unsettled replay for imported session `{stored}`"
                                 ))
@@ -7733,6 +7761,11 @@ async fn run_connection_task<W, R>(
                                             settle_import: seed_history_replay,
                                             completion: Some(tx),
                                         });
+                                    control_client
+                                        .as_ref()
+                                        .expect("runner control is present")
+                                        .arm_history_replay(stored.clone(), token.clone())
+                                        .await;
                                     (Some(token), Some(rx))
                                 } else {
                                     (None, None)
@@ -7853,6 +7886,11 @@ async fn run_connection_task<W, R>(
                                         .lock()
                                         .expect("history replay barrier mutex poisoned")
                                         .take();
+                                    if let (Some(control), Some(token)) =
+                                        (control_client.as_ref(), replay_token.as_deref())
+                                    {
+                                        control.clear_history_replay(token).await;
+                                    }
                                     // Import seed (#2276): the replay may have
                                     // partially populated the (otherwise empty)
                                     // event store before load failed. Falling
@@ -7876,6 +7914,11 @@ async fn run_connection_task<W, R>(
                                         .lock()
                                         .expect("history replay barrier mutex poisoned")
                                         .take();
+                                    if let (Some(control), Some(token)) =
+                                        (control_client.as_ref(), replay_token.as_deref())
+                                    {
+                                        control.clear_history_replay(token).await;
+                                    }
                                     warn!(
                                         target: "acp.protocol",
                                         session = %session_label,
@@ -7893,6 +7936,11 @@ async fn run_connection_task<W, R>(
                                         .lock()
                                         .expect("history replay barrier mutex poisoned")
                                         .take();
+                                    if let (Some(control), Some(token)) =
+                                        (control_client.as_ref(), replay_token.as_deref())
+                                    {
+                                        control.clear_history_replay(token).await;
+                                    }
                                     warn!(
                                         target: "acp.protocol",
                                         session = %session_label,
@@ -12735,6 +12783,86 @@ done
             consume_history_replay_barrier(&notification("stored-history", TOKEN), &armed)
                 .is_none(),
             "a replayed marker is idempotent"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_runner_replay_token_survives_until_successful_settlement() {
+        use crate::acp::control_protocol::{self, ControlBody};
+
+        const TOKEN: &str = "55555555-5555-4555-8555-555555555555";
+        let (daemon, runner) = tokio::net::UnixStream::pair().expect("control socket pair");
+        let (_daemon_read, daemon_write) = daemon.into_split();
+        let (mut runner_read, _runner_write) = runner.into_split();
+        let (_handshake_tx, handshake_rx) = mpsc::channel(1);
+        let control = Arc::new(DaemonControlClient {
+            write: Mutex::new(daemon_write),
+            handshake_rx: Mutex::new(handshake_rx),
+            completion: Arc::new(std::sync::Mutex::new(None)),
+            // A fresh v4 connection starts with no replay in Hello. The
+            // subsequent session/load must arm the daemon-side token rather
+            // than leaving that initial snapshot stale.
+            pending_history_replay: Mutex::new(None),
+        });
+        let (mut client, _events) = AcpClient::fake_for_test(AcpSessionId("fresh-replay".into()));
+        client.control_client = Some(control.clone());
+
+        control
+            .arm_history_replay("stored-history".into(), TOKEN.into())
+            .await;
+        assert!(
+            client.acknowledge_history_replay("stored-history").await,
+            "the fresh session/load token must be acknowledged"
+        );
+        assert_eq!(
+            control_protocol::read_frame(&mut runner_read)
+                .await
+                .expect("read settlement frame"),
+            Some(ControlBody::HistoryReplaySettled {
+                replay_token: TOKEN.into(),
+            })
+        );
+        assert!(
+            control.pending_history_replay().await.is_none(),
+            "successful settlement consumes the exact token"
+        );
+        assert!(
+            !client.acknowledge_history_replay("stored-history").await,
+            "a settled token cannot be acknowledged twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_runner_replay_settlement_remains_retryable() {
+        const TOKEN: &str = "66666666-6666-4666-8666-666666666666";
+        let (daemon, runner) = tokio::net::UnixStream::pair().expect("control socket pair");
+        let (_daemon_read, daemon_write) = daemon.into_split();
+        drop(runner);
+        let (_handshake_tx, handshake_rx) = mpsc::channel(1);
+        let control = Arc::new(DaemonControlClient {
+            write: Mutex::new(daemon_write),
+            handshake_rx: Mutex::new(handshake_rx),
+            completion: Arc::new(std::sync::Mutex::new(None)),
+            pending_history_replay: Mutex::new(Some(control_protocol::PendingHistoryReplay {
+                acp_session_id: "stored-history".into(),
+                replay_token: TOKEN.into(),
+            })),
+        });
+        let (mut client, _events) =
+            AcpClient::fake_for_test(AcpSessionId("reattached-replay".into()));
+        client.control_client = Some(control.clone());
+
+        assert!(
+            !client.acknowledge_history_replay("stored-history").await,
+            "a disconnected runner cannot be settled"
+        );
+        assert_eq!(
+            control
+                .pending_history_replay()
+                .await
+                .expect("failed settlement retains retry token")
+                .replay_token,
+            TOKEN
         );
     }
 

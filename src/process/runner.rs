@@ -1026,8 +1026,9 @@ impl RunnerShared {
         self.refresh_session_cache_from_relay(line).await;
 
         // Preserve post-load traffic behind an unsettled imported replay. The
-        // dedicated replay task owns the live relay until its barrier lands;
-        // ordinary traffic is drained immediately afterward.
+        // delivery gate makes this decision atomic with replay barrier commit,
+        // pending drain, attach, and detach.
+        let _delivery = self.relay_delivery.lock().await;
         if self
             .history_replay
             .lock()
@@ -1038,7 +1039,6 @@ impl RunnerShared {
             return self.pending.lock().await.push_back(line.to_vec());
         }
 
-        let _delivery = self.relay_delivery.lock().await;
         let outbound = self.active_outbound.lock().await.take();
         if let Some(mut out) = outbound {
             if write_relay_line(&mut out, line).await {
@@ -1193,6 +1193,7 @@ impl RunnerShared {
     }
 
     async fn clear_outbound(&self) {
+        let _delivery = self.relay_delivery.lock().await;
         *self.active_outbound.lock().await = None;
         self.main_attached
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1551,35 +1552,43 @@ impl RunnerShared {
         Some(line)
     }
 
-    async fn deliver_replay_line(&self, line: &[u8]) -> bool {
+    async fn deliver_replay_step(&self, token: &str, line: &[u8], barrier: bool) -> bool {
         let _delivery = self.relay_delivery.lock().await;
         let outbound = self.active_outbound.lock().await.take();
         let Some(mut out) = outbound else {
             return false;
         };
-        if write_relay_line(&mut out, line).await {
-            *self.active_outbound.lock().await = Some(out);
-            true
-        } else {
-            false
+        if !write_relay_line(&mut out, line).await {
+            return false;
         }
-    }
-
-    async fn drain_pending_after_replay(&self) {
-        let _delivery = self.relay_delivery.lock().await;
-        let Some(mut out) = self.active_outbound.lock().await.take() else {
-            return;
-        };
-        loop {
-            let Some(line) = self.pending.lock().await.pop_front() else {
-                break;
+        {
+            let mut pending = self.history_replay.lock().await;
+            let Some(replay) = pending.as_mut() else {
+                return false;
             };
-            if !write_relay_line(&mut out, &line).await {
-                self.pending.lock().await.push_front(line);
-                return;
+            if replay.replay_token != token {
+                return false;
+            }
+            if barrier {
+                replay.barrier_delivered = true;
+                replay.running = false;
+            } else {
+                replay.next_line += 1;
+            }
+        }
+        if barrier {
+            loop {
+                let Some(line) = self.pending.lock().await.pop_front() else {
+                    break;
+                };
+                if !write_relay_line(&mut out, &line).await {
+                    self.pending.lock().await.push_front(line);
+                    return false;
+                }
             }
         }
         *self.active_outbound.lock().await = Some(out);
+        true
     }
 
     async fn resume_history_replay(self: &Arc<Self>) {
@@ -1618,7 +1627,7 @@ impl RunnerShared {
                     }
                     return;
                 };
-                if !shared.deliver_replay_line(&line).await {
+                if !shared.deliver_replay_step(&token, &line, barrier).await {
                     if let Some(replay) = shared.history_replay.lock().await.as_mut() {
                         if replay.replay_token == token {
                             replay.running = false;
@@ -1626,25 +1635,7 @@ impl RunnerShared {
                     }
                     return;
                 }
-                let done = {
-                    let mut pending = shared.history_replay.lock().await;
-                    let Some(replay) = pending.as_mut() else {
-                        return;
-                    };
-                    if replay.replay_token != token {
-                        return;
-                    }
-                    if barrier {
-                        replay.barrier_delivered = true;
-                        replay.running = false;
-                        true
-                    } else {
-                        replay.next_line += 1;
-                        false
-                    }
-                };
-                if done {
-                    shared.drain_pending_after_replay().await;
+                if barrier {
                     return;
                 }
             }
@@ -2702,17 +2693,26 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$AOE_TEST_RESPONSE_ID"
             .expect("retain replay");
         tokio::task::yield_now().await;
 
-        // Reproduce a daemon dying after it requests replay but before the
-        // first relay write. Holding the production delivery lock makes that
-        // crash boundary deterministic.
+        // Reproduce a daemon dying during replay. Reading the first line proves
+        // a replay write and cursor advance completed; clear_outbound must then
+        // serialize behind any in-flight write and reset the retained cursor.
         let (first_daemon, first_runner) = UnixStream::pair().expect("first relay");
-        let (_first_read, first_write) = first_runner.into_split();
+        let (first_read, _first_daemon_write) = first_daemon.into_split();
+        let (_first_runner_read, first_write) = first_runner.into_split();
         assert!(shared.install_outbound(first_write).await.is_none());
-        let delivery = shared.relay_delivery.lock().await;
         shared.resume_history_replay().await;
+        let mut first_reader = BufReader::new(first_read);
+        let mut first_line = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            first_reader.read_line(&mut first_line),
+        )
+        .await
+        .expect("first replay line timeout")
+        .expect("read first replay line");
+        assert_eq!(first_line, "first\n");
         shared.clear_outbound().await;
-        drop(first_daemon);
-        drop(delivery);
+        drop(first_reader);
         tokio::task::yield_now().await;
 
         let (next_line, replay_token) = {
@@ -2750,6 +2750,52 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$AOE_TEST_RESPONSE_ID"
 
         shared.settle_history_replay(TOKEN).await;
         assert!(shared.history_replay.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn live_notification_stays_after_replay_barrier_and_older_pending_lines() {
+        const TOKEN: &str = "44444444-4444-4444-8444-444444444444";
+        let shared = Arc::new(RunnerShared::new());
+        shared
+            .schedule_history_replay(
+                vec![b"replay\n".to_vec()].into(),
+                "stored-history".into(),
+                TOKEN.into(),
+            )
+            .await
+            .expect("retain replay");
+        tokio::task::yield_now().await;
+        assert!(shared.deliver_line(b"pending-live\n").await);
+
+        let (daemon, runner) = UnixStream::pair().expect("relay");
+        let (daemon_read, _daemon_write) = daemon.into_split();
+        let (_runner_read, runner_write) = runner.into_split();
+        assert!(shared.install_outbound(runner_write).await.is_none());
+        shared.resume_history_replay().await;
+        let live = {
+            let shared = Arc::clone(&shared);
+            tokio::spawn(async move { shared.deliver_line(b"concurrent-live\n").await })
+        };
+
+        let mut reader = BufReader::new(daemon_read);
+        let mut received = Vec::new();
+        for _ in 0..4 {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+                .await
+                .expect("ordered replay timeout")
+                .expect("read ordered replay");
+            received.push(line);
+        }
+        assert_eq!(received[0], "replay\n");
+        let barrier: serde_json::Value =
+            serde_json::from_str(&received[1]).expect("typed replay barrier");
+        assert_eq!(
+            barrier["params"]["update"]["_meta"][HISTORY_REPLAY_META_KEY],
+            TOKEN
+        );
+        assert_eq!(&received[2..], &["pending-live\n", "concurrent-live\n"]);
+        assert!(live.await.expect("live delivery task"));
     }
 
     /// Only `session/load` has a request-owned identity. A successful-looking

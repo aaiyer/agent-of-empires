@@ -1881,7 +1881,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             drop(client);
             return Err(SupervisorError::SpawnCancelled(session_id));
         }
-        let drain_task = self.start_drain_task(session_id.clone(), inbound, Arc::clone(&client));
+        let drain_task = self.start_drain_task(session_id.clone(), inbound);
         let client_for_mode = (acp_mode_id.is_some() || yolo_mode).then(|| Arc::clone(&client));
         workers.insert(
             session_id.clone(),
@@ -1944,7 +1944,6 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         session_id: String,
         initial_inbound: mpsc::Receiver<Event>,
-        settle_client: Arc<AcpClient>,
     ) -> JoinHandle<()> {
         let sink = Arc::clone(&self.sink);
         let workers = Arc::clone(&self.workers);
@@ -2068,11 +2067,6 @@ impl<S: BroadcastSink> Supervisor<S> {
                         }
                         let seq = next_seq(&next_seqs, &session_id);
                         sink.publish(&session_id, seq, &event);
-                        if let Event::AcpSessionAssigned { acp_session_id } = &event {
-                            settle_client
-                                .acknowledge_history_replay(acp_session_id)
-                                .await;
-                        }
                     }
 
                     // Channel closed: the agent's connection task ended.
@@ -2566,6 +2560,16 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// single worker-map lookup when the worker is already live.
     pub async fn wait_until_ready(&self, session_id: &str) -> Result<(), SupervisorError> {
         self.ready_client(session_id).await.map(|_| ())
+    }
+
+    /// Acknowledge runner-retained history only after the server has durably
+    /// persisted the matching ACP assignment and import settlement.
+    pub async fn acknowledge_history_replay(&self, session_id: &str, acp_session_id: &str) -> bool {
+        self.wait_for_worker(session_id, WORKER_READY_TIMEOUT).await;
+        let Ok(client) = self.client_for_session(session_id).await else {
+            return false;
+        };
+        client.acknowledge_history_replay(acp_session_id).await
     }
 
     /// Send a user prompt (with optional attachments) to a running
@@ -3149,7 +3153,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             drop(client);
             return Err(SupervisorError::SpawnCancelled(session_id));
         }
-        let drain_task = self.start_drain_task(session_id.clone(), inbound, Arc::clone(&client));
+        let drain_task = self.start_drain_task(session_id.clone(), inbound);
         workers.insert(
             session_id.clone(),
             WorkerHandle {
@@ -4940,7 +4944,7 @@ cursor-acp-bridge = "agent acp"
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Event>(16);
         let (client, _client_tx) = AcpClient::fake_for_test(AcpSessionId("s-rl".into()));
         let client = Arc::new(client);
-        let drain = sup.start_drain_task("s-rl".into(), inbound_rx, Arc::clone(&client));
+        let drain = sup.start_drain_task("s-rl".into(), inbound_rx);
         {
             let mut workers = sup.workers.lock().await;
             workers.insert(
