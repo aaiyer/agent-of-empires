@@ -1765,6 +1765,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions",
             get(api::list_sessions).post(api::create_session),
         )
+        .route("/api/maya/import-session", post(api::maya_import_session))
         // Static segment; registered before /api/sessions/{id} so the
         // literal "search" never resolves as a session id. See #2515.
         .route("/api/sessions/search", get(api::search_sessions))
@@ -7523,6 +7524,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normal_profile_rejects_maya_import_route_before_binding_access() {
+        use tower::ServiceExt;
+
+        let state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vecs(&["localhost"]),
+            Vec::new(),
+            None,
+        );
+        let remote: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let mut request = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/api/maya/import-session")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"source_t3_thread_id":"0123456789abcdef","source_catalog_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+            ))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let response = test_support::build_router_for_test(state)
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn maya_import_rejects_malformed_source_before_session_create() {
+        use tower::ServiceExt;
+
+        let mut state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vecs(&["localhost"]),
+            Vec::new(),
+            None,
+        );
+        Arc::get_mut(&mut state)
+            .expect("unique test state")
+            .maya_restricted = true;
+        let remote: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let mut request = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/api/maya/import-session")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"source_t3_thread_id":"malformed","source_catalog_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+            ))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let response = test_support::build_router_for_test(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(state.instances.read().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn maya_restricted_router_denies_settings_and_reports_profile() {
         use tower::ServiceExt;
 
@@ -7577,7 +7642,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maya_restricted_router_denies_all_terminal_routes() {
+    async fn maya_restricted_router_denies_alternate_terminal_routes() {
         use axum::http::{Method, StatusCode};
         use tower::ServiceExt;
 
@@ -7602,49 +7667,9 @@ mod tests {
         for (method, uri) in [
             (
                 Method::POST,
-                "/api/sessions/maya-terminal-route-test/terminal",
-            ),
-            (
-                Method::POST,
-                "/api/sessions/maya-terminal-route-test/terminal?index=0",
-            ),
-            (
-                Method::POST,
-                "/api/sessions/maya-terminal-route-test/terminal?index=1",
-            ),
-            (
-                Method::POST,
-                "/api/sessions/maya-terminal-route-test/terminal?index=0&index=0",
-            ),
-            (
-                Method::POST,
-                "/api/sessions/maya-terminal-route-test/terminal?index=0&command=sh",
-            ),
-            (
-                Method::POST,
-                "/api/sessions/maya-terminal-route-test/terminal?index=wat",
-            ),
-            (
-                Method::DELETE,
-                "/api/sessions/maya-terminal-route-test/terminal",
-            ),
-            (
-                Method::POST,
                 "/api/sessions/maya-terminal-route-test/container-terminal?index=0",
             ),
             (Method::GET, "/sessions/maya-terminal-route-test/live-ws"),
-            (
-                Method::GET,
-                "/sessions/maya-terminal-route-test/terminal/live-ws",
-            ),
-            (
-                Method::GET,
-                "/sessions/maya-terminal-route-test/terminal/live-ws?index=0",
-            ),
-            (
-                Method::GET,
-                "/sessions/maya-terminal-route-test/terminal/live-ws?index=0&env=x",
-            ),
             (
                 Method::GET,
                 "/sessions/maya-terminal-route-test/container-terminal/live-ws?index=0",

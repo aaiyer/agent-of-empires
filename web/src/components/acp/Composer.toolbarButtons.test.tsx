@@ -16,7 +16,7 @@ import { AssistantRuntimeProvider, useExternalStoreRuntime, type ThreadMessageLi
 
 import { Composer } from "./Composer";
 
-function Harness() {
+function Harness({ restricted = false }: { restricted?: boolean }) {
   const runtime = useExternalStoreRuntime<ThreadMessageLike>({
     messages: [],
     isRunning: false,
@@ -42,6 +42,7 @@ function Harness() {
         promptCapabilities={null}
         pendingAttachments={[]}
         setPendingAttachments={() => {}}
+        restricted={restricted}
       />
     </AssistantRuntimeProvider>
   );
@@ -102,6 +103,12 @@ describe("Composer toolbar trigger buttons", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add file context (@)" }));
     fireEvent.click(screen.getByRole("button", { name: "Slash command (/)" }));
     expect(textarea.value).toMatch(/@.*\//s);
+  });
+
+  it("keeps native @ and / controls in the Maya restricted shell", () => {
+    render(<Harness restricted />);
+    expect(screen.getByRole("button", { name: "Add file context (@)" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Slash command (/)" })).toBeTruthy();
   });
 
   it("disables Send while the composer is empty and enables it once text is typed", () => {

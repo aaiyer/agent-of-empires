@@ -44,6 +44,7 @@ pub(crate) struct StructuredSessionSpec {
     /// Idempotency key, persisted onto the created instance so a retry (even
     /// across a daemon restart) can be matched back to it. See #3156.
     pub idempotency_key: Option<String>,
+    pub maya_import_source: Option<crate::session::MayaImportSourceBinding>,
     pub allow_hooks: bool,
     /// Resolved source profile (request profile, else the server default).
     pub profile: String,
@@ -143,6 +144,7 @@ pub(crate) async fn spawn_structured_session(
             custom_instruction,
             callback_url,
             idempotency_key,
+            maya_import_source,
             allow_hooks,
             profile,
             created_by_plugin,
@@ -249,6 +251,7 @@ pub(crate) async fn spawn_structured_session(
         instance.acp_mode_id = acp_mode_id;
         instance.callback_url = callback_url;
         instance.idempotency_key = idempotency_key;
+        instance.maya_import_source = maya_import_source;
         let build_warnings = build_result.warnings;
         let created_worktree = build_result.created_worktree;
         let created_workspace_worktrees = build_result.created_workspace_worktrees;

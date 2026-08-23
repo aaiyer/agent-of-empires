@@ -511,16 +511,20 @@ impl SessionResponse {
             // and queued-prompt clear-boundary hint read these instead of a
             // client-side per-agent mirror.
             #[cfg(feature = "serve")]
-            clear_aliases: crate::acp::agent_profiles::resolve(
-                inst.agent_name
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(inst.tool.as_str()),
-            )
-            .clear_aliases
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
+            clear_aliases: if crate::server::maya_restricted::is_restricted_session(inst) {
+                Vec::new()
+            } else {
+                crate::acp::agent_profiles::resolve(
+                    inst.agent_name
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(inst.tool.as_str()),
+                )
+                .clear_aliases
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+            },
             claude_fullscreen: claude_fullscreen && inst.tool == "claude",
             // A session converted by `attach_project` (#3103) has a real
             // `workspace_info`, so this lists both repos with no special case:
@@ -5203,6 +5207,21 @@ pub struct MayaRestrictedCreateBody {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MayaImportSessionBody {
+    source_t3_thread_id: String,
+    source_catalog_sha256: String,
+}
+
+#[derive(Serialize)]
+pub struct MayaImportSessionResponse {
+    session: SessionResponse,
+    source_t3_thread_id: String,
+    source_catalog_sha256: String,
+    managed_codex_session_id: String,
+}
+
+#[derive(Deserialize)]
 #[serde(untagged)]
 pub enum CreateSessionRequestBody {
     MayaRestricted(MayaRestrictedCreateBody),
@@ -5253,6 +5272,160 @@ fn maya_restricted_create_body(body: MayaRestrictedCreateBody) -> CreateSessionB
         fork_from: None,
         callback_url: None,
         idempotency_key: None,
+    }
+}
+
+pub async fn maya_import_session(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<MayaImportSessionBody>,
+) -> impl IntoResponse {
+    if !state.maya_restricted {
+        return super::session_not_found();
+    }
+
+    let source_id = body.source_t3_thread_id;
+    let catalog_digest = body.source_catalog_sha256;
+    let source_for_load = source_id.clone();
+    let digest_for_load = catalog_digest.clone();
+    let binding = match tokio::task::spawn_blocking(move || {
+        crate::server::maya_restricted::load_import_binding(&source_for_load, &digest_for_load)
+    })
+    .await
+    {
+        Ok(Ok(binding)) => binding,
+        Ok(Err(error)) => {
+            tracing::warn!(target: "http.api.sessions", %error, "Maya import binding rejected");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_import_binding",
+                    "message": error.to_string(),
+                })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", %error, "Maya import binding task failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let idempotency_key = format!("maya-t3-import:{}", binding.source_t3_thread_id);
+    let lock = state.idempotency_lock(&idempotency_key).await;
+    let _guard = lock.lock_owned().await;
+    if let Some(existing) = {
+        let instances = state.instances.read().await;
+        find_by_idempotency_key(&instances, &idempotency_key).cloned()
+    } {
+        if !crate::server::maya_restricted::is_restricted_session(&existing)
+            || existing.acp_session_id.as_deref() != Some(binding.managed_codex_session_id.as_str())
+            || existing.maya_import_source.as_ref()
+                != Some(&crate::session::MayaImportSourceBinding {
+                    source_t3_thread_id: binding.source_t3_thread_id.clone(),
+                    source_catalog_sha256: catalog_digest.clone(),
+                    managed_codex_session_id: binding.managed_codex_session_id.clone(),
+                })
+        {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "import_binding_conflict",
+                    "message": "Existing import session does not match the authenticated binding",
+                })),
+            )
+                .into_response();
+        }
+        return (
+            StatusCode::OK,
+            Json(MayaImportSessionResponse {
+                session: SessionResponse::from_instance(
+                    &existing,
+                    crate::claude_settings::read_tui_fullscreen(),
+                ),
+                source_t3_thread_id: binding.source_t3_thread_id,
+                source_catalog_sha256: catalog_digest,
+                managed_codex_session_id: binding.managed_codex_session_id,
+            }),
+        )
+            .into_response();
+    }
+
+    let spec = crate::server::session_spawn::StructuredSessionSpec {
+        title: Some(binding.title),
+        path: crate::server::maya_restricted::PROJECT_PATH.into(),
+        group: String::new(),
+        tool: "codex".into(),
+        worktree_enabled: false,
+        worktree_branch: None,
+        create_new_branch: false,
+        base_branch: None,
+        sandbox: false,
+        sandbox_image: None,
+        yolo_mode: false,
+        extra_env: Vec::new(),
+        extra_args: String::new(),
+        command_override: String::new(),
+        extra_repo_paths: Vec::new(),
+        repo_base_branches: Vec::new(),
+        scratch: false,
+        trust_hooks: None,
+        custom_instruction: None,
+        callback_url: None,
+        idempotency_key: Some(idempotency_key),
+        maya_import_source: Some(crate::session::MayaImportSourceBinding {
+            source_t3_thread_id: binding.source_t3_thread_id.clone(),
+            source_catalog_sha256: catalog_digest.clone(),
+            managed_codex_session_id: binding.managed_codex_session_id.clone(),
+        }),
+        allow_hooks: false,
+        profile: crate::server::maya_restricted::PROFILE_NAME.into(),
+        created_by_plugin: None,
+        plugin_create_idempotency: None,
+        pending_initial_turn: None,
+        acp_mode_id: None,
+        #[cfg(feature = "serve")]
+        view: crate::session::View::Structured,
+        #[cfg(feature = "serve")]
+        agent_name: None,
+        #[cfg(feature = "serve")]
+        agent_model: None,
+        #[cfg(feature = "serve")]
+        agent_effort: None,
+        #[cfg(feature = "serve")]
+        import_acp_session_id: Some(binding.managed_codex_session_id.clone()),
+        #[cfg(feature = "serve")]
+        fork_seed: None,
+    };
+
+    match state
+        .session_service
+        .create_structured_session(spec, None, None, None)
+        .await
+    {
+        Ok((outcome, _)) => (
+            StatusCode::CREATED,
+            Json(MayaImportSessionResponse {
+                session: SessionResponse::from_instance(
+                    &outcome.instance,
+                    crate::claude_settings::read_tui_fullscreen(),
+                ),
+                source_t3_thread_id: binding.source_t3_thread_id,
+                source_catalog_sha256: catalog_digest,
+                managed_codex_session_id: binding.managed_codex_session_id,
+            }),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", %error, "Maya import create failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "import_create_failed",
+                    "message": error.to_string(),
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -6192,6 +6365,7 @@ pub async fn create_session(
         custom_instruction: body.custom_instruction,
         callback_url: body.callback_url,
         idempotency_key: body.idempotency_key,
+        maya_import_source: None,
         allow_hooks: !state.maya_restricted,
         profile,
         // Never decoded from the request body: only the plugin host path

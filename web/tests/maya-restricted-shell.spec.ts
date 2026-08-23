@@ -67,8 +67,11 @@ test("Maya reuses the normal shell while gating authority controls", async ({ pa
   await expect(page.getByTestId("sidebar-context-menu-fork")).toHaveCount(0);
   await expect(page.getByLabel("Settings")).toHaveCount(0);
 
-  await page.keyboard.press("Escape");
-  await page.keyboard.press("n");
+  await page.getByRole("heading", { name: "empires" }).click();
+  await expect(page.getByTestId("sidebar-context-menu")).toHaveCount(0);
+  await row.click();
+  await expect(page.getByPlaceholder(/Type @ for files, \/ for commands/)).toBeVisible();
+  await page.getByLabel("New project session").first().click();
   const wizard = page.getByTestId("session-wizard");
   await expect(wizard).toBeVisible();
   await wizard.getByPlaceholder("Auto-generated if empty").fill("Continue old thread");
@@ -76,15 +79,16 @@ test("Maya reuses the normal shell while gating authority controls", async ({ pa
   await expect.poll(() => createBody).toEqual({ title: "Continue old thread" });
 
   const forbiddenBackgroundRoutes = [
-    "/api/presence",
     "/api/settings",
     "/api/projects",
-    "/api/theme/current",
     "/api/plugins",
     "/api/plugins/ui-state",
     "/api/system/update-status",
     "/api/telemetry/status",
-    "/api/tips",
   ];
   expect(requests.filter((path) => forbiddenBackgroundRoutes.includes(path))).toEqual([]);
+  expect(requests).toContain("/api/presence");
+  expect(requests).toContain("/api/theme/current");
+  expect(requests).toContain("/api/tips");
+  expect(requests).toContain("/api/skills");
 });

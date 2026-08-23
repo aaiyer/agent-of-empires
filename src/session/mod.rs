@@ -80,9 +80,9 @@ pub(crate) use instance::{
 };
 pub use instance::{
     is_valid_session_color, EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome,
-    LifecycleOperation, LifecycleReservation, LifecycleReservationError, PluginCreateIdempotency,
-    SandboxInfo, SessionBucket, StartOutcome, Status, TerminalInfo, View, WorkspaceInfo,
-    WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
+    LifecycleOperation, LifecycleReservation, LifecycleReservationError, MayaImportSourceBinding,
+    PluginCreateIdempotency, SandboxInfo, SessionBucket, StartOutcome, Status, TerminalInfo, View,
+    WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
 };
 pub(crate) use storage::acquire_session_identity_lock;
 

@@ -4185,10 +4185,12 @@ impl DaemonControlClient {
         &self,
         method: &str,
         request: serde_json::Value,
+        replay_token: Option<String>,
     ) -> Result<(String, serde_json::Value), agent_client_protocol::Error> {
         self.send(ControlBody::EstablishSession {
             method: method.to_string(),
             request,
+            replay_token,
         })
         .await
         .map_err(|e| acp_internal_error(format!("control write failed: {e}")))?;
@@ -4447,10 +4449,26 @@ async fn establish_session_v2<Resp: serde::de::DeserializeOwned>(
     control: &DaemonControlClient,
     method: &str,
     request: &impl serde::Serialize,
+    replay_token: Option<String>,
 ) -> Result<Resp, agent_client_protocol::Error> {
     let params = serde_json::to_value(request)
         .map_err(|e| acp_internal_error(format!("serialize {method} params: {e}")))?;
-    let (_id, result) = control.establish_session(method, params).await?;
+    let expected_load_id = (method == "session/load")
+        .then(|| params.get("sessionId").and_then(serde_json::Value::as_str))
+        .flatten()
+        .map(str::to_string);
+    let (id, result) = control
+        .establish_session(method, params, replay_token)
+        .await?;
+    if expected_load_id
+        .as_deref()
+        .is_some_and(|expected| expected != id)
+    {
+        return Err(acp_internal_error(format!(
+            "runner returned session `{id}` for session/load of `{}`",
+            expected_load_id.as_deref().unwrap_or_default()
+        )));
+    }
     serde_json::from_value(result)
         .map_err(|e| acp_internal_error(format!("deserialize {method} result: {e}")))
 }
@@ -4784,18 +4802,21 @@ fn is_transcript_event(event: &Event) -> bool {
     )
 }
 
-/// Identify the runner's ordered `session/load` replay barrier before the
-/// private marker can enter transcript mapping or watchdog bookkeeping.
-fn is_history_replay_barrier(update: &SessionUpdate) -> bool {
-    matches!(
-        update,
-        SessionUpdate::AgentMessageChunk(chunk)
-            if matches!(
-                &chunk.content,
-                ContentBlock::Text(text)
-                    if text.text == crate::process::runner::HISTORY_REPLAY_BARRIER_TEXT
-            )
-    )
+struct ArmedHistoryReplay {
+    acp_session_id: String,
+    replay_token: String,
+    settle_import: bool,
+    completion: oneshot::Sender<()>,
+}
+
+fn history_replay_token(update: &SessionUpdate) -> Option<&str> {
+    let SessionUpdate::SessionInfoUpdate(info) = update else {
+        return None;
+    };
+    info.meta
+        .as_ref()?
+        .get(crate::process::runner::HISTORY_REPLAY_META_KEY)?
+        .as_str()
 }
 
 /// Consume a relay barrier and return the seeded import identity it commits.
@@ -4805,15 +4826,18 @@ fn is_history_replay_barrier(update: &SessionUpdate) -> bool {
 /// replayed barriers idempotent and binds the later assignment to the exact
 /// stored id that armed this load.
 fn consume_history_replay_barrier(
-    update: &SessionUpdate,
-    armed: &std::sync::Mutex<Option<String>>,
-) -> Option<Option<String>> {
-    is_history_replay_barrier(update).then(|| {
-        armed
-            .lock()
-            .expect("seeded replay barrier mutex poisoned")
-            .take()
-    })
+    notification: &SessionNotification,
+    armed: &std::sync::Mutex<Option<ArmedHistoryReplay>>,
+) -> Option<ArmedHistoryReplay> {
+    let token = history_replay_token(&notification.update)?;
+    let mut guard = armed.lock().expect("history replay barrier mutex poisoned");
+    let expected = guard.as_ref()?;
+    if notification.session_id.0.as_ref() != expected.acp_session_id
+        || token != expected.replay_token
+    {
+        return None;
+    }
+    guard.take()
 }
 
 /// Cheap discriminant for log breadcrumbs (matches the one in
@@ -6630,7 +6654,7 @@ async fn run_connection_task<W, R>(
     // Runner-mediated imported loads arm one in-order settlement marker.
     // The marker rides the relay after every preceding replay notification;
     // direct stdio has no marker and retains its response-ordered settlement.
-    let seeded_replay_barrier_armed = Arc::new(std::sync::Mutex::new(None::<String>));
+    let seeded_replay_barrier_armed = Arc::new(std::sync::Mutex::new(None::<ArmedHistoryReplay>));
     let seeded_replay_barrier_for_notif = seeded_replay_barrier_armed.clone();
     let seeded_replay_barrier_for_block = seeded_replay_barrier_armed.clone();
     let session_label_for_notif = session_label.clone();
@@ -6780,15 +6804,15 @@ async fn run_connection_task<W, R>(
                 let prompt_in_flight = prompt_in_flight_for_notif.clone();
                 let tool_context_cache = tool_context_cache_for_notif.clone();
                 async move {
-                    if let Some(settled_acp_session_id) = consume_history_replay_barrier(
-                        &notification.update,
+                    if let Some(settled) = consume_history_replay_barrier(
+                        &notification,
                         &seeded_replay_barrier_armed,
                     ) {
                         // The runner emits a barrier for every successful load.
                         // Only an imported/seeded load arms settlement; ordinary
                         // loads consume the marker without manufacturing a turn
                         // terminal. `swap` makes duplicate markers idempotent.
-                        if let Some(acp_session_id) = settled_acp_session_id {
+                        if settled.settle_import {
                             // Preserve the durable commit order: replay events,
                             // terminal settlement, then the assignment that
                             // clears import_pending. If the daemon dies before
@@ -6801,9 +6825,12 @@ async fn run_connection_task<W, R>(
                                 })
                                 .await;
                             let _ = event_tx
-                                .send(Event::AcpSessionAssigned { acp_session_id })
+                                .send(Event::AcpSessionAssigned {
+                                    acp_session_id: settled.acp_session_id.clone(),
+                                })
                                 .await;
                         }
+                        let _ = settled.completion.send(());
                         return Ok(());
                     }
                     last_event_at
@@ -7427,6 +7454,7 @@ async fn run_connection_task<W, R>(
                                 control,
                                 "session/fork",
                                 &req,
+                                None,
                             )
                             .await
                         } else {
@@ -7576,15 +7604,28 @@ async fn run_connection_task<W, R>(
                             // normally.
                             if !seed_history_replay {
                                 suppress_for_block.store(true, Ordering::Relaxed);
-                            } else if control_client.is_some() {
-                                // Arm before sending session/load: the runner can
-                                // relay the ordered barrier before SessionReady
-                                // resolves on the sibling control socket.
-                                *seeded_replay_barrier_for_block
-                                    .lock()
-                                    .expect("seeded replay barrier mutex poisoned") =
-                                    Some(stored.clone());
                             }
+                            let (replay_token, replay_completion) =
+                                if control_client.is_some() {
+                                    // Bind settlement to this exact load and
+                                    // session. The runner drains replay on the
+                                    // main relay, then emits a typed ACP metadata
+                                    // update carrying this unguessable token.
+                                    let token = uuid::Uuid::new_v4().to_string();
+                                    let (tx, rx) = oneshot::channel();
+                                    *seeded_replay_barrier_for_block
+                                        .lock()
+                                        .expect("history replay barrier mutex poisoned") =
+                                        Some(ArmedHistoryReplay {
+                                            acp_session_id: stored.clone(),
+                                            replay_token: token.clone(),
+                                            settle_import: seed_history_replay,
+                                            completion: tx,
+                                        });
+                                    (Some(token), Some(rx))
+                                } else {
+                                    (None, None)
+                                };
                             let req = ExactLoadSessionRequest::new(
                                 stored.clone(),
                                 agent_cwd.clone(),
@@ -7596,6 +7637,7 @@ async fn run_connection_task<W, R>(
                                     control,
                                     "session/load",
                                     &req,
+                                    replay_token.clone(),
                                 )
                                 .await
                             } else {
@@ -7603,6 +7645,25 @@ async fn run_connection_task<W, R>(
                             };
                             match load_result {
                                 Ok(resp) => {
+                                    if let Some(completion) = replay_completion {
+                                        match tokio::time::timeout(
+                                            Duration::from_secs(60),
+                                            completion,
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(())) => {}
+                                            Ok(Err(_)) | Err(_) => {
+                                                seeded_replay_barrier_for_block
+                                                    .lock()
+                                                    .expect("history replay barrier mutex poisoned")
+                                                    .take();
+                                                return Err(acp_internal_error(format!(
+                                                    "session/load replay fence did not settle for stored session `{stored}`"
+                                                )));
+                                            }
+                                        }
+                                    }
                                     info!(
                                         target: "acp.protocol",
                                         session = %session_label,
@@ -7677,6 +7738,10 @@ async fn run_connection_task<W, R>(
                                     acp_session_id = Some(SessionId::from(stored));
                                 }
                                 Err(e) if seed_history_replay => {
+                                    seeded_replay_barrier_for_block
+                                        .lock()
+                                        .expect("history replay barrier mutex poisoned")
+                                        .take();
                                     // Import seed (#2276): the replay may have
                                     // partially populated the (otherwise empty)
                                     // event store before load failed. Falling
@@ -7696,6 +7761,10 @@ async fn run_connection_task<W, R>(
                                     return Err(e);
                                 }
                                 Err(mut e) if maya_restricted => {
+                                    seeded_replay_barrier_for_block
+                                        .lock()
+                                        .expect("history replay barrier mutex poisoned")
+                                        .take();
                                     warn!(
                                         target: "acp.protocol",
                                         session = %session_label,
@@ -7709,6 +7778,10 @@ async fn run_connection_task<W, R>(
                                     return Err(e);
                                 }
                                 Err(e) => {
+                                    seeded_replay_barrier_for_block
+                                        .lock()
+                                        .expect("history replay barrier mutex poisoned")
+                                        .take();
                                     warn!(
                                         target: "acp.protocol",
                                         session = %session_label,
@@ -7737,8 +7810,13 @@ async fn run_connection_task<W, R>(
                         let req = ExactNewSessionRequest::new(agent_cwd.clone(), mcp_servers);
                         // #2976 Phase B: v2 runner owns session/new.
                         let new_session = if let Some(control) = control_client.as_ref() {
-                            establish_session_v2::<NewSessionResponse>(control, "session/new", &req)
-                                .await?
+                            establish_session_v2::<NewSessionResponse>(
+                                control,
+                                "session/new",
+                                &req,
+                                None,
+                            )
+                            .await?
                         } else {
                             connection.send_request(req).block_task().await?
                         };
@@ -12489,48 +12567,63 @@ done
     }
 
     #[test]
-    fn runner_history_replay_barrier_is_private_and_exact() {
-        let barrier: SessionUpdate = serde_json::from_value(serde_json::json!({
-            "sessionUpdate": "agent_message_chunk",
-            "content": {
-                "type": "text",
-                "text": crate::process::runner::HISTORY_REPLAY_BARRIER_TEXT,
+    fn runner_history_replay_barrier_is_typed_and_session_bound() {
+        const TOKEN: &str = "33333333-3333-4333-8333-333333333333";
+        let notification = |session: &str, token: &str| {
+            serde_json::from_value::<SessionNotification>(serde_json::json!({
+                "sessionId": session,
+                "update": {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {
+                        crate::process::runner::HISTORY_REPLAY_META_KEY: token,
+                    }
+                }
+            }))
+            .expect("deserialize typed runner replay barrier")
+        };
+        let (tx, _rx) = oneshot::channel();
+        let armed = std::sync::Mutex::new(Some(ArmedHistoryReplay {
+            acp_session_id: "stored-history".into(),
+            replay_token: TOKEN.into(),
+            settle_import: true,
+            completion: tx,
+        }));
+
+        assert!(
+            consume_history_replay_barrier(&notification("wrong-session", TOKEN), &armed).is_none(),
+            "a marker for another session must not settle this load"
+        );
+        assert!(
+            consume_history_replay_barrier(
+                &notification("stored-history", "44444444-4444-4444-8444-444444444444"),
+                &armed,
+            )
+            .is_none(),
+            "a marker from another load must not settle this load"
+        );
+
+        let transcript_collision: SessionNotification = serde_json::from_value(serde_json::json!({
+            "sessionId": "stored-history",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": TOKEN }
             }
         }))
-        .expect("deserialize runner replay barrier");
-        assert!(is_history_replay_barrier(&barrier));
-
-        let armed = std::sync::Mutex::new(None);
-        assert_eq!(
-            consume_history_replay_barrier(&barrier, &armed),
-            Some(None),
-            "ordinary load consumes its relay marker without settlement"
-        );
-        *armed.lock().expect("barrier test mutex") = Some("stored-history".into());
-        assert_eq!(
-            consume_history_replay_barrier(&barrier, &armed),
-            Some(Some("stored-history".into())),
-            "seeded load settles at its armed relay marker"
-        );
-        assert_eq!(
-            consume_history_replay_barrier(&barrier, &armed),
-            Some(None),
-            "a replayed barrier is idempotent"
-        );
-
-        let ordinary: SessionUpdate = serde_json::from_value(serde_json::json!({
-            "sessionUpdate": "agent_message_chunk",
-            "content": { "type": "text", "text": "ordinary assistant text" }
-        }))
-        .expect("deserialize ordinary agent chunk");
+        .expect("deserialize ordinary transcript chunk");
         assert!(
-            !is_history_replay_barrier(&ordinary),
-            "ordinary transcript content must not become a settlement"
+            consume_history_replay_barrier(&transcript_collision, &armed).is_none(),
+            "assistant transcript text cannot become a replay fence"
         );
-        assert_eq!(
-            consume_history_replay_barrier(&ordinary, &armed),
-            None,
-            "ordinary transcript content remains ordinary ACP traffic"
+
+        let settled =
+            consume_history_replay_barrier(&notification("stored-history", TOKEN), &armed)
+                .expect("exact session/load marker settles");
+        assert_eq!(settled.acp_session_id, "stored-history");
+        assert!(settled.settle_import);
+        assert!(
+            consume_history_replay_barrier(&notification("stored-history", TOKEN), &armed)
+                .is_none(),
+            "a replayed marker is idempotent"
         );
     }
 
@@ -12588,6 +12681,7 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}\n' "$id"
       ;;
     *'"method":"session/load"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"stored-authority","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"partial replay"}}}}\n'
       printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"stored session unavailable"}}\n' "$id"
       ;;
     *'"method":"session/new"'*)
@@ -12752,6 +12846,117 @@ done
             }),
             "the failed handshake must use the exact stored authority; wire capture:\n{wire}"
         );
+    }
+
+    /// A restricted stored identity is unusable when the adapter does not
+    /// advertise `session/load`. Fail before either session method instead of
+    /// weakening the assignment into a fresh `session/new`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn maya_restricted_missing_load_capability_refuses_session_new() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (script, capture) = write_load_failure_fake_agent(tmp.path());
+        let source = std::fs::read_to_string(&script).expect("read fake agent");
+        std::fs::write(
+            &script,
+            source.replace("\"loadSession\":true", "\"loadSession\":false"),
+        )
+        .expect("disable load capability");
+        let config = load_failure_spawn_config(&script, tmp.path(), true);
+        let mut client = AcpClient::spawn(
+            config,
+            AcpSessionId("maya-restricted-no-load-capability".into()),
+        )
+        .await
+        .expect("initialize completes before capability rejection");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut events = Vec::new();
+        let message = loop {
+            let event = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("missing load capability did not become visible")
+                .expect("missing load capability ended silently");
+            let message = match &event {
+                Event::AgentStartupError { message } => Some(message.clone()),
+                _ => None,
+            };
+            events.push(event);
+            if let Some(message) = message {
+                break message;
+            }
+        };
+        assert!(
+            message.contains("stored-authority")
+                && message.contains("does not advertise session/load")
+                && message.contains("refusing session/new fallback"),
+            "the retained identity and missing capability must be visible: {message}"
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            Event::SessionContextReset { .. } | Event::AcpSessionAssigned { .. }
+        )));
+        let wire = std::fs::read_to_string(capture).expect("read no-load capture");
+        assert_eq!(wire.matches("\"method\":\"session/load\"").count(), 0);
+        assert_eq!(wire.matches("\"method\":\"session/new\"").count(), 0);
+    }
+
+    /// A seeded import can receive a partial history prefix before load fails.
+    /// It remains retryable under the same exact assignment and must publish no
+    /// ready/terminal boundary or replacement session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn maya_restricted_seeded_load_failure_stays_unsettled() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (script, capture) = write_load_failure_fake_agent(tmp.path());
+        let mut config = load_failure_spawn_config(&script, tmp.path(), true);
+        config.seed_history_replay = true;
+        let mut client = AcpClient::spawn(
+            config,
+            AcpSessionId("maya-restricted-seeded-load-failure".into()),
+        )
+        .await
+        .expect("initialize completes before seeded load failure");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut events = Vec::new();
+        let message = loop {
+            let event = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("seeded load failure did not become visible")
+                .expect("seeded load failure ended silently");
+            let message = match &event {
+                Event::AgentStartupError { message } => Some(message.clone()),
+                _ => None,
+            };
+            events.push(event);
+            if let Some(message) = message {
+                break message;
+            }
+        };
+        assert!(
+            message.contains("stored session unavailable"),
+            "seeded load failure must remain visible: {message}"
+        );
+        assert!(events.iter().any(
+            |event| matches!(event, Event::AgentMessageChunk { text } if text == "partial replay")
+        ));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            Event::Stopped { .. }
+                | Event::SessionContextReset { .. }
+                | Event::AcpSessionAssigned { .. }
+        )));
+        let wire = std::fs::read_to_string(capture).expect("read seeded failure capture");
+        assert_eq!(wire.matches("\"method\":\"session/load\"").count(), 1);
+        assert_eq!(wire.matches("\"method\":\"session/new\"").count(), 0);
+        assert!(wire.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line).is_ok_and(|message| {
+                message["method"] == "session/load"
+                    && message["params"]["sessionId"] == "stored-authority"
+            })
+        }));
+        assert!(!wire.contains("replacement-id"));
     }
 
     /// Write a scripted stdio ACP agent for the conversation-reset tests

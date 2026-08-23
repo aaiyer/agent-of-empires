@@ -1610,6 +1610,14 @@ impl<S: BroadcastSink> Supervisor<S> {
             self.resolve_agent_spec(&agent, &resolved_cfg.session, &policy)
                 .await?
         };
+        if maya_restricted {
+            crate::server::maya_restricted::bind_codex_agent_spec(
+                &mut spec,
+                &session_id,
+                stored_acp_session_id.as_deref(),
+            )
+            .map_err(|error| SupervisorError::InvalidAgentCommand(error.to_string()))?;
+        }
         // Overlay the instance command override (e.g. opencode →
         // opencode-plannotator from `session.agent_command_override`)
         // so structured view launches the same binary tmux would. See #1766.
@@ -2596,6 +2604,15 @@ impl<S: BroadcastSink> Supervisor<S> {
         acp_mode_id: Option<&str>,
         yolo_mode: bool,
     ) -> Result<(), SupervisorError> {
+        if self
+            .maya_restricted
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(SupervisorError::Acp(AcpError::ResetFailed(
+                "Maya restricted sessions retain their server-assigned Codex identity; conversation reset is unavailable"
+                    .into(),
+            )));
+        }
         let client = self.ready_client(session_id).await?;
         match client.reset_session(text).await? {
             ResetSessionOutcome::Reset { new_acp_session_id } => {
@@ -5490,6 +5507,22 @@ cursor-acp-bridge = "agent acp"
             vec!["reset_session", "set_mode"],
             "an explicit persisted mode must be re-asserted after the reset"
         );
+    }
+
+    #[tokio::test]
+    async fn maya_restricted_reset_fails_before_session_new() {
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink);
+        sup.enable_maya_restricted();
+        let error = sup
+            .reset_session_context("0123456789abcdef", "/new", None, false)
+            .await
+            .expect_err("restricted identity cannot be reset");
+        assert!(matches!(
+            error,
+            SupervisorError::Acp(AcpError::ResetFailed(message))
+                if message.contains("server-assigned Codex identity")
+        ));
     }
 
     /// A rejected driven reset keeps the existing ACP conversation, so

@@ -666,6 +666,17 @@ pub struct PluginCreateIdempotency {
     pub payload_hash: String,
 }
 
+/// Server-authenticated provenance for a Maya T3 import. This is never
+/// decoded from the ordinary create surface; the restricted import route
+/// derives it from the root-owned bindings file and persists it atomically
+/// with the session so idempotent retries cannot bind a different source.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MayaImportSourceBinding {
+    pub source_t3_thread_id: String,
+    pub source_catalog_sha256: String,
+    pub managed_codex_session_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instance {
     pub id: String,
@@ -1016,6 +1027,8 @@ pub struct Instance {
     /// instance instead of creating a duplicate. See #3156.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maya_import_source: Option<MayaImportSourceBinding>,
 
     /// Per-session override for the diff base ref. Takes precedence
     /// over `DiffConfig.default_branch` and the auto-detected default
@@ -1638,6 +1651,7 @@ impl Instance {
             notify_on_error: None,
             callback_url: None,
             idempotency_key: None,
+            maya_import_source: None,
             base_branch_override: None,
             color: None,
             view: View::Terminal,

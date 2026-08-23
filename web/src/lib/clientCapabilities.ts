@@ -27,6 +27,8 @@ export interface ClientCapabilities {
   canManageSessionAuthority: boolean;
   /** Background-agent and plugin panes are reachable. */
   canUseExtensions: boolean;
+  /** Managed ACP child-agent activity is reachable. */
+  canUseChildAgents: boolean;
 }
 
 export function getClientCapabilities(serverAbout: ServerAbout | null | undefined): ClientCapabilities {
@@ -36,12 +38,13 @@ export function getClientCapabilities(serverAbout: ServerAbout | null | undefine
   return {
     cityhall,
     mayaRestricted,
-    canUseTerminal: !clientOnly,
-    canUseDiff: !clientOnly,
+    canUseTerminal: !cityhall,
+    canUseDiff: !cityhall,
     canManageProjects: !clientOnly,
     nameOnlyWizard: clientOnly,
     canManageDeployment: !mayaRestricted,
     canManageSessionAuthority: !mayaRestricted,
     canUseExtensions: !clientOnly,
+    canUseChildAgents: !cityhall,
   };
 }

@@ -40,8 +40,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// and typed prompt/cancel frames; the [`ControlBody::PromptCompleted`]
 /// shape changed, so v1 and v2 are wire-incompatible and the version gate
 /// is what keeps a mixed-version daemon/runner pair from misreading each
-/// other.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
+/// other. v3 adds a daemon-owned replay token to `session/load`, binding the
+/// ordered replay fence to that exact request without manufacturing assistant
+/// transcript text.
+pub const CONTROL_PROTOCOL_VERSION: u32 = 3;
 
 /// Hard cap on a single control frame. Phase A frames are tiny; reject
 /// anything larger as a framing error instead of allocating a huge
@@ -110,6 +112,8 @@ pub enum ControlBody {
     EstablishSession {
         method: String,
         request: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replay_token: Option<String>,
     },
     /// Run a turn. `request` is the ACP `session/prompt` params
     /// (`PromptRequest`); the runner assigns the canonical JSON-RPC id and
@@ -248,6 +252,7 @@ mod tests {
             ControlBody::EstablishSession {
                 method: "session/new".into(),
                 request: serde_json::json!({"cwd": "/tmp"}),
+                replay_token: None,
             },
             ControlBody::SessionReady {
                 acp_session_id: "sess-1".into(),

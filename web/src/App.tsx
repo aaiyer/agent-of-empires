@@ -328,8 +328,8 @@ function AppContent({
 }) {
   const [serverAbout, setServerAbout] = useState<ServerAbout | null>(initialAbout);
   const caps = useMemo(() => getClientCapabilities(serverAbout), [serverAbout]);
-  useDashboardPresence(!caps.mayaRestricted);
-  useResolvedTheme(!caps.mayaRestricted);
+  useDashboardPresence();
+  useResolvedTheme();
   // Wire the localStorage write chokepoint and pull the server-side UI-state
   // blob into localStorage. AppContent only mounts past auth, so this runs as
   // the authenticated user. Background (does NOT gate render): blocking first
@@ -338,10 +338,9 @@ function AppContent({
   // for the first session; hydration writes the synced values for the next
   // mount/reload. Same-device loads (populated cache) are unaffected.
   useEffect(() => {
-    if (caps.mayaRestricted) return;
     initWebUiSync();
     void hydrateWebUiStateFromServer();
-  }, [caps.mayaRestricted]);
+  }, []);
 
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -605,10 +604,11 @@ function AppContent({
     (id: string) => {
       if (!caps.canUseTerminal && isTerminalTabId(id)) return false;
       if (!caps.canUseDiff && (id === "diff" || id === "files")) return false;
-      if (!caps.canUseExtensions && (id === "agents" || id.startsWith("plugin:"))) return false;
+      if (!caps.canUseChildAgents && id === "agents") return false;
+      if (!caps.canUseExtensions && id.startsWith("plugin:")) return false;
       return !id.startsWith("plugin:") || pluginPaneById.has(id);
     },
-    [caps.canUseDiff, caps.canUseExtensions, caps.canUseTerminal, pluginPaneById],
+    [caps.canUseChildAgents, caps.canUseDiff, caps.canUseExtensions, caps.canUseTerminal, pluginPaneById],
   );
   // A dock's groups reduced to what's actually shown: each surviving group keeps
   // its persisted index (so a drop addresses the right group) and a valid active
@@ -741,7 +741,7 @@ function AppContent({
   // All tips orchestration (open state, mark-seen, the show toggle, the auto-pop
   // decision) lives in the hook / lib so it stays out of this component and is
   // unit-tested directly.
-  const tips = useTips(!caps.mayaRestricted);
+  const tips = useTips();
   const [showPalette, setShowPalette] = useState(false);
   // Palette content-search query (#2515); declared here so the keyboard
   // handlers below can clear it on close/toggle. Consumed lower down by
@@ -778,7 +778,7 @@ function AppContent({
     ...(caps.canUseTerminal ? ["terminal"] : []),
     // The background-agents panel only applies to structured-view (ACP)
     // sessions; a plain terminal session never launches sub-agents.
-    ...(caps.canUseExtensions && activeSession?.view === "structured" ? ["agents"] : []),
+    ...(caps.canUseChildAgents && activeSession?.view === "structured" ? ["agents"] : []),
     ...(caps.canUseExtensions ? pluginPanes.map((p) => p.id) : []),
   ];
 

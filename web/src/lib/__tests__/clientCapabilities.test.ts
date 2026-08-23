@@ -18,6 +18,7 @@ describe("getClientCapabilities", () => {
       canManageDeployment: true,
       canManageSessionAuthority: true,
       canUseExtensions: false,
+      canUseChildAgents: false,
     });
   });
 
@@ -33,6 +34,7 @@ describe("getClientCapabilities", () => {
       canManageDeployment: true,
       canManageSessionAuthority: true,
       canUseExtensions: true,
+      canUseChildAgents: true,
     });
   });
 
@@ -41,13 +43,14 @@ describe("getClientCapabilities", () => {
     expect(caps).toEqual({
       cityhall: false,
       mayaRestricted: true,
-      canUseTerminal: false,
-      canUseDiff: false,
+      canUseTerminal: true,
+      canUseDiff: true,
       canManageProjects: false,
       nameOnlyWizard: true,
       canManageDeployment: false,
       canManageSessionAuthority: false,
       canUseExtensions: false,
+      canUseChildAgents: true,
     });
   });
 

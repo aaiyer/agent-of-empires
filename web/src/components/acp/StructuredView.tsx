@@ -841,7 +841,7 @@ function AcpChrome({
                 <EmptyState onPick={sendPrompt} />
               </ThreadPrimitive.Empty>
 
-              {!restricted && state.activity.length > 0 && (
+              {state.activity.length > 0 && (
                 <div className="mb-2 flex">
                   <ToolDensityToggle density={toolDensity} onToggle={onToggleToolDensity} />
                 </div>
@@ -971,39 +971,31 @@ function AcpChrome({
                 disabled={state.workerRestarting || state.workerStopped || Boolean(state.startupError)}
               />
 
-              {!restricted && (
-                <ModeSwitchFailedNotice failure={state.modeSwitchFailed} onDismiss={dismissModeSwitchFailed} />
-              )}
+              <ModeSwitchFailedNotice failure={state.modeSwitchFailed} onDismiss={dismissModeSwitchFailed} />
 
-              {!restricted && (
-                <ConfigOptionSwitchFailedNotice
-                  failure={state.configOptionSwitchFailed}
-                  configOptions={state.configOptions}
-                  onDismiss={dismissConfigOptionSwitchFailed}
-                />
-              )}
+              <ConfigOptionSwitchFailedNotice
+                failure={state.configOptionSwitchFailed}
+                configOptions={state.configOptions}
+                onDismiss={dismissConfigOptionSwitchFailed}
+              />
 
-              {!restricted && (
-                <ContextPrimerBanner
-                  sessionId={sessionId}
-                  available={state.contextPrimerAvailable}
-                  onInsertPrimer={(text) =>
-                    setPrimerPrefill({
-                      id: `primer-${state.contextPrimerAvailable?.resetSeq ?? 0}-${Date.now()}`,
-                      text,
-                    })
-                  }
-                  onDismiss={dismissPrimer}
-                />
-              )}
+              <ContextPrimerBanner
+                sessionId={sessionId}
+                available={state.contextPrimerAvailable}
+                onInsertPrimer={(text) =>
+                  setPrimerPrefill({
+                    id: `primer-${state.contextPrimerAvailable?.resetSeq ?? 0}-${Date.now()}`,
+                    text,
+                  })
+                }
+                onDismiss={dismissPrimer}
+              />
 
-              {!restricted && (
-                <CompactionReminderBanner
-                  state={state}
-                  onCompact={() => sendPrompt("/compact")}
-                  onDismiss={dismissCompactionReminder}
-                />
-              )}
+              <CompactionReminderBanner
+                state={state}
+                onCompact={() => sendPrompt("/compact")}
+                onDismiss={dismissCompactionReminder}
+              />
 
               {composerCollapsible && (
                 <ChromeCollapseHandle
