@@ -163,6 +163,7 @@ struct ResumeTarget {
     stored_acp_session_id: Option<String>,
     source_profile: String,
     in_flight_turn: bool,
+    import_pending: bool,
     yolo_mode: bool,
     /// `Instance.command`: the resolved launch command (from
     /// `session.agent_command_override` / `--cmd-override`). Threaded
@@ -181,6 +182,7 @@ type RawTargetTuple = (
     String,
     Option<String>,
     String,
+    bool,
     bool,
     String,
 );
@@ -313,6 +315,7 @@ pub async fn reconcile_acp_workers(
                     i.project_path.clone(),
                     i.acp_session_id.clone(),
                     i.source_profile.clone(),
+                    i.import_pending == Some(true),
                     i.yolo_mode,
                     i.command.clone(),
                 )
@@ -366,6 +369,7 @@ pub async fn reconcile_acp_workers(
         project_path,
         stored_acp_session_id,
         source_profile,
+        import_pending,
         yolo_mode,
         command,
     ) in raw_targets
@@ -487,6 +491,7 @@ pub async fn reconcile_acp_workers(
             stored_acp_session_id,
             source_profile,
             in_flight_turn,
+            import_pending,
             yolo_mode,
             command,
         });
@@ -1311,6 +1316,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
         stored_acp_session_id,
         source_profile,
         in_flight_turn,
+        import_pending,
         yolo_mode,
         command,
     } = target;
@@ -1374,7 +1380,14 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
             };
             let attach_res = timeout(
                 Duration::from_secs(3),
-                supervisor.attach(id.clone(), cwd, vec![], in_flight_turn, sandbox_for_attach),
+                supervisor.attach(
+                    id.clone(),
+                    cwd,
+                    vec![],
+                    in_flight_turn,
+                    import_pending,
+                    sandbox_for_attach,
+                ),
             )
             .await;
             match attach_res {
@@ -1451,6 +1464,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
         stored_acp_session_id,
         source_profile,
         in_flight_turn,
+        import_pending,
         yolo_mode,
         command,
     };
@@ -1783,6 +1797,7 @@ async fn resume_target_for_session(
         stored_acp_session_id: inst.acp_session_id.clone(),
         source_profile: inst.source_profile.clone(),
         in_flight_turn: false,
+        import_pending: inst.import_pending == Some(true),
         yolo_mode: inst.yolo_mode,
         command: inst.command.clone(),
     })
@@ -2033,6 +2048,7 @@ mod tests {
             stored_acp_session_id: None,
             source_profile: "default".to_string(),
             in_flight_turn: false,
+            import_pending: false,
             yolo_mode: false,
             command: String::new(),
         };
@@ -2075,6 +2091,7 @@ mod tests {
             stored_acp_session_id: None,
             source_profile: "default".to_string(),
             in_flight_turn: false,
+            import_pending: false,
             yolo_mode: false,
             command: String::new(),
         };

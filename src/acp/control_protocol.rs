@@ -42,8 +42,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// is what keeps a mixed-version daemon/runner pair from misreading each
 /// other. v3 adds a daemon-owned replay token to `session/load`, binding the
 /// ordered replay fence to that exact request without manufacturing assistant
-/// transcript text.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 3;
+/// transcript text. v4 carries an unsettled load-replay identity across daemon
+/// reattach and requires an explicit settlement acknowledgement before the
+/// runner forgets it.
+pub const CONTROL_PROTOCOL_VERSION: u32 = 4;
 
 /// Hard cap on a single control frame. Phase A frames are tiny; reject
 /// anything larger as a framing error instead of allocating a huge
@@ -63,6 +65,8 @@ pub enum ControlBody {
     Hello {
         control_protocol_version: u32,
         session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending_history_replay: Option<PendingHistoryReplay>,
     },
     /// Runner's answer to [`ControlBody::Initialize`]: the raw ACP
     /// `initialize` result (an `InitializeResponse` serialized to JSON).
@@ -121,6 +125,18 @@ pub enum ControlBody {
     Prompt { request: serde_json::Value },
     /// Cancel the in-flight turn (maps to a `session/cancel` notification).
     Cancel,
+    /// Acknowledge durable import settlement after the daemon consumes the
+    /// exact replay barrier announced in [`ControlBody::Hello`].
+    HistoryReplaySettled { replay_token: String },
+    /// Resume delivery of the retained replay after the daemon has armed the
+    /// exact token announced by the runner.
+    ResumeHistoryReplay { replay_token: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingHistoryReplay {
+    pub acp_session_id: String,
+    pub replay_token: String,
 }
 
 /// Typed result of a runner-owned turn. Replaces Phase A's
@@ -206,6 +222,10 @@ mod tests {
         let body = ControlBody::Hello {
             control_protocol_version: CONTROL_PROTOCOL_VERSION,
             session_id: "abc-123".into(),
+            pending_history_replay: Some(PendingHistoryReplay {
+                acp_session_id: "acp-session".into(),
+                replay_token: "11111111-1111-4111-8111-111111111111".into(),
+            }),
         };
         assert_eq!(roundtrip(body.clone()), body);
     }
@@ -288,6 +308,7 @@ mod tests {
         let a = ControlBody::Hello {
             control_protocol_version: CONTROL_PROTOCOL_VERSION,
             session_id: "s".into(),
+            pending_history_replay: None,
         };
         let b = ControlBody::PromptCompleted {
             prompt_req_id: 1,

@@ -149,7 +149,7 @@ fn is_source_thread_id(value: &str) -> bool {
     canonical_codex_session_id(value.strip_prefix("maya-import-").unwrap_or(value))
 }
 
-fn is_managed_model(value: &str) -> bool {
+pub(crate) fn is_managed_model(value: &str) -> bool {
     matches!(
         value,
         "gpt-5.6-sol"
@@ -163,11 +163,11 @@ fn is_managed_model(value: &str) -> bool {
     )
 }
 
-fn is_managed_mode(value: &str) -> bool {
+pub(crate) fn is_managed_mode(value: &str) -> bool {
     matches!(value, "read-only" | "agent" | "agent-full-access")
 }
 
-fn is_managed_effort(value: &str) -> bool {
+pub(crate) fn is_managed_effort(value: &str) -> bool {
     matches!(value, "low" | "medium" | "high" | "xhigh" | "max" | "ultra")
 }
 

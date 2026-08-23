@@ -720,6 +720,9 @@ struct RunnerShared {
     /// the stdout reader reach the response even when the relay socket is
     /// full; the ordered replay is drained asynchronously afterward.
     load_replay_capture: Mutex<Option<ReplayCapture>>,
+    /// Unsettled imported replay retained across daemon detach/reattach. The
+    /// runner forgets it only after the daemon acknowledges the exact barrier.
+    history_replay: Mutex<Option<PendingHistoryReplayState>>,
     /// Monotonic JSON-RPC id allocator for the requests the runner issues
     /// to the agent on its own (`initialize`, `session/*`, `session/prompt`)
     /// now that it owns the client side of the protocol. On the v2 path the
@@ -801,6 +804,15 @@ struct ReplayCapture {
     lines: Vec<Vec<u8>>,
     bytes: usize,
     overflowed: bool,
+}
+
+struct PendingHistoryReplayState {
+    replay: Arc<[Vec<u8>]>,
+    next_line: usize,
+    acp_session_id: String,
+    replay_token: String,
+    running: bool,
+    barrier_delivered: bool,
 }
 
 impl ReplayCapture {
@@ -934,6 +946,7 @@ impl RunnerShared {
             main_attached: std::sync::atomic::AtomicBool::new(false),
             handshake: Mutex::new(RunnerHandshake::default()),
             load_replay_capture: Mutex::new(None),
+            history_replay: Mutex::new(None),
             next_req_id: AtomicI64::new(RUNNER_REQUEST_ID_BASE),
             pending_client_responses: Mutex::new(HashMap::new()),
             relay_session_news: Mutex::new(HashSet::new()),
@@ -1011,6 +1024,19 @@ impl RunnerShared {
         // a non-empty tracking set so idle traffic isn't re-parsed; the
         // response is forwarded to the daemon below either way.
         self.refresh_session_cache_from_relay(line).await;
+
+        // Preserve post-load traffic behind an unsettled imported replay. The
+        // dedicated replay task owns the live relay until its barrier lands;
+        // ordinary traffic is drained immediately afterward.
+        if self
+            .history_replay
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|replay| !replay.barrier_delivered)
+        {
+            return self.pending.lock().await.push_back(line.to_vec());
+        }
 
         let _delivery = self.relay_delivery.lock().await;
         let outbound = self.active_outbound.lock().await.take();
@@ -1141,24 +1167,28 @@ impl RunnerShared {
     /// pending ring into it so the reattaching daemon sees the gap's
     /// notifications.
     async fn install_outbound(
-        &self,
+        self: &Arc<Self>,
         mut out: tokio::net::unix::OwnedWriteHalf,
     ) -> Option<tokio::net::unix::OwnedWriteHalf> {
         let _delivery = self.relay_delivery.lock().await;
         let prev = self.active_outbound.lock().await.take();
-        loop {
-            let line = self.pending.lock().await.pop_front();
-            let Some(line) = line else {
-                break;
-            };
-            if !write_relay_line(&mut out, &line).await {
-                self.pending.lock().await.push_front(line);
-                return None;
+        let replay_pending = self.history_replay.lock().await.is_some();
+        if !replay_pending {
+            loop {
+                let line = self.pending.lock().await.pop_front();
+                let Some(line) = line else {
+                    break;
+                };
+                if !write_relay_line(&mut out, &line).await {
+                    self.pending.lock().await.push_front(line);
+                    return None;
+                }
             }
         }
         *self.active_outbound.lock().await = Some(out);
         self.main_attached
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(_delivery);
         prev
     }
 
@@ -1170,6 +1200,11 @@ impl RunnerShared {
         // completion left un-drained from a prior gap so only the current
         // gap's completion is ever replayed to the next resuming daemon.
         self.control.lock().await.pending = None;
+        if let Some(replay) = self.history_replay.lock().await.as_mut() {
+            replay.next_line = 0;
+            replay.running = false;
+            replay.barrier_delivered = false;
+        }
     }
 
     /// Peek a daemon to agent line: if it is a `session/prompt` request,
@@ -1251,6 +1286,12 @@ impl RunnerShared {
         let hello = ControlBody::Hello {
             control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
             session_id: session_id.to_string(),
+            pending_history_replay: self.history_replay.lock().await.as_ref().map(|replay| {
+                control_protocol::PendingHistoryReplay {
+                    acp_session_id: replay.acp_session_id.clone(),
+                    replay_token: replay.replay_token.clone(),
+                }
+            }),
         };
         let mut w = out.take().expect("write half present");
         if !write_control_frame(&mut w, &hello).await {
@@ -1405,7 +1446,8 @@ impl RunnerShared {
                     replay,
                     cached.0.clone(),
                     replay_token.expect("validated replay token"),
-                );
+                )
+                .await?;
             }
             return Ok(cached);
         }
@@ -1445,7 +1487,8 @@ impl RunnerShared {
                 replay,
                 cached.0.clone(),
                 replay_token.expect("validated replay token"),
-            );
+            )
+            .await?;
         }
         Ok(cached)
     }
@@ -1459,30 +1502,35 @@ impl RunnerShared {
     /// control socket. A slow daemon may therefore observe `SessionReady`
     /// before it has *processed* all replay, but it cannot process this marker
     /// until all preceding relay frames have been processed.
-    fn schedule_history_replay(
+    async fn schedule_history_replay(
         self: &Arc<Self>,
         replay: Arc<[Vec<u8>]>,
         acp_session_id: String,
         replay_token: String,
-    ) {
-        let shared = Arc::clone(self);
-        tokio::spawn(async move {
-            for line in replay.iter() {
-                if !shared.deliver_line(line).await {
-                    warn!(
-                        target: "acp.runner",
-                        "history replay paused before its barrier because the detached queue is full"
-                    );
-                    return;
-                }
+    ) -> Result<(), serde_json::Value> {
+        let mut pending = self.history_replay.lock().await;
+        if let Some(existing) = pending.as_ref() {
+            if existing.acp_session_id != acp_session_id || existing.replay_token != replay_token {
+                return Err(transport_error(
+                    "a different session/load replay remains unsettled",
+                ));
             }
-            shared
-                .emit_history_replay_barrier(&acp_session_id, &replay_token)
-                .await;
-        });
+        } else {
+            *pending = Some(PendingHistoryReplayState {
+                replay,
+                next_line: 0,
+                acp_session_id,
+                replay_token,
+                running: false,
+                barrier_delivered: false,
+            });
+        }
+        drop(pending);
+        self.resume_history_replay().await;
+        Ok(())
     }
 
-    async fn emit_history_replay_barrier(&self, acp_session_id: &str, replay_token: &str) {
+    fn history_replay_barrier(acp_session_id: &str, replay_token: &str) -> Option<Vec<u8>> {
         let marker = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "session/update",
@@ -1497,10 +1545,120 @@ impl RunnerShared {
             }
         });
         let Ok(mut line) = serde_json::to_vec(&marker) else {
-            return;
+            return None;
         };
         line.push(b'\n');
-        self.deliver_line(&line).await;
+        Some(line)
+    }
+
+    async fn deliver_replay_line(&self, line: &[u8]) -> bool {
+        let _delivery = self.relay_delivery.lock().await;
+        let outbound = self.active_outbound.lock().await.take();
+        let Some(mut out) = outbound else {
+            return false;
+        };
+        if write_relay_line(&mut out, line).await {
+            *self.active_outbound.lock().await = Some(out);
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn drain_pending_after_replay(&self) {
+        let _delivery = self.relay_delivery.lock().await;
+        let Some(mut out) = self.active_outbound.lock().await.take() else {
+            return;
+        };
+        loop {
+            let Some(line) = self.pending.lock().await.pop_front() else {
+                break;
+            };
+            if !write_relay_line(&mut out, &line).await {
+                self.pending.lock().await.push_front(line);
+                return;
+            }
+        }
+        *self.active_outbound.lock().await = Some(out);
+    }
+
+    async fn resume_history_replay(self: &Arc<Self>) {
+        {
+            let mut pending = self.history_replay.lock().await;
+            let Some(replay) = pending.as_mut() else {
+                return;
+            };
+            if replay.running || replay.barrier_delivered {
+                return;
+            }
+            replay.running = true;
+        }
+        let shared = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                let next = {
+                    let pending = shared.history_replay.lock().await;
+                    let Some(replay) = pending.as_ref() else {
+                        return;
+                    };
+                    if replay.next_line < replay.replay.len() {
+                        Some((
+                            replay.replay_token.clone(),
+                            replay.replay[replay.next_line].clone(),
+                            false,
+                        ))
+                    } else {
+                        Self::history_replay_barrier(&replay.acp_session_id, &replay.replay_token)
+                            .map(|line| (replay.replay_token.clone(), line, true))
+                    }
+                };
+                let Some((token, line, barrier)) = next else {
+                    if let Some(replay) = shared.history_replay.lock().await.as_mut() {
+                        replay.running = false;
+                    }
+                    return;
+                };
+                if !shared.deliver_replay_line(&line).await {
+                    if let Some(replay) = shared.history_replay.lock().await.as_mut() {
+                        if replay.replay_token == token {
+                            replay.running = false;
+                        }
+                    }
+                    return;
+                }
+                let done = {
+                    let mut pending = shared.history_replay.lock().await;
+                    let Some(replay) = pending.as_mut() else {
+                        return;
+                    };
+                    if replay.replay_token != token {
+                        return;
+                    }
+                    if barrier {
+                        replay.barrier_delivered = true;
+                        replay.running = false;
+                        true
+                    } else {
+                        replay.next_line += 1;
+                        false
+                    }
+                };
+                if done {
+                    shared.drain_pending_after_replay().await;
+                    return;
+                }
+            }
+        });
+    }
+
+    async fn settle_history_replay(&self, replay_token: &str) {
+        let mut pending = self.history_replay.lock().await;
+        if pending
+            .as_ref()
+            .is_some_and(|replay| replay.barrier_delivered && replay.replay_token == replay_token)
+        {
+            pending.take();
+        }
     }
 
     /// The ACP session id the runner established, if any.
@@ -1997,6 +2155,20 @@ async fn handle_control_connection(
                     shared.agent_cancel(&agent_stdin, &acp_session_id).await;
                 }
             }
+            ControlBody::HistoryReplaySettled { replay_token } => {
+                shared.settle_history_replay(&replay_token).await;
+            }
+            ControlBody::ResumeHistoryReplay { replay_token } => {
+                let matches = shared
+                    .history_replay
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|replay| replay.replay_token == replay_token);
+                if matches {
+                    shared.resume_history_replay().await;
+                }
+            }
             // Runner -> daemon frames should never arrive here; ignore.
             _ => {}
         }
@@ -2255,6 +2427,7 @@ mod tests {
             Some(ControlBody::Hello {
                 control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
                 session_id: "fixture-session".into(),
+                pending_history_replay: None,
             })
         );
         control_protocol::write_frame(
@@ -2485,7 +2658,7 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$AOE_TEST_RESPONSE_ID"
 
     #[tokio::test]
     async fn failed_relay_write_preserves_full_line_for_reattach() {
-        let shared = RunnerShared::new();
+        let shared = Arc::new(RunnerShared::new());
         let (closed_daemon, runner) = UnixStream::pair().expect("closed socket pair");
         let (_runner_read, runner_write) = runner.into_split();
         assert!(shared.install_outbound(runner_write).await.is_none());
@@ -2512,6 +2685,71 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$AOE_TEST_RESPONSE_ID"
         });
         assert!(shared.install_outbound(runner_write).await.is_none());
         assert_eq!(read.await.expect("reader task"), line);
+    }
+
+    #[tokio::test]
+    async fn unsettled_history_replay_restarts_in_order_after_daemon_reattach() {
+        const TOKEN: &str = "33333333-3333-4333-8333-333333333333";
+        let shared = Arc::new(RunnerShared::new());
+        let replay: Arc<[Vec<u8>]> = vec![b"first\n".to_vec(), b"second\n".to_vec()].into();
+
+        // A load may complete while no daemon owns the relay. The runner keeps
+        // the complete replay and its settlement token instead of moving the
+        // lines into the bounded ordinary-notification queue.
+        shared
+            .schedule_history_replay(replay, "stored-history".into(), TOKEN.into())
+            .await
+            .expect("retain replay");
+        tokio::task::yield_now().await;
+
+        // Reproduce a daemon dying after it requests replay but before the
+        // first relay write. Holding the production delivery lock makes that
+        // crash boundary deterministic.
+        let (first_daemon, first_runner) = UnixStream::pair().expect("first relay");
+        let (_first_read, first_write) = first_runner.into_split();
+        assert!(shared.install_outbound(first_write).await.is_none());
+        let delivery = shared.relay_delivery.lock().await;
+        shared.resume_history_replay().await;
+        shared.clear_outbound().await;
+        drop(first_daemon);
+        drop(delivery);
+        tokio::task::yield_now().await;
+
+        let (next_line, replay_token) = {
+            let pending = shared.history_replay.lock().await;
+            let pending = pending.as_ref().expect("unsettled replay survives detach");
+            (pending.next_line, pending.replay_token.clone())
+        };
+        assert_eq!(next_line, 0);
+        assert_eq!(replay_token, TOKEN);
+
+        let (second_daemon, second_runner) = UnixStream::pair().expect("replacement relay");
+        let (second_read, _second_write) = second_daemon.into_split();
+        let (_runner_read, runner_write) = second_runner.into_split();
+        assert!(shared.install_outbound(runner_write).await.is_none());
+        shared.resume_history_replay().await;
+
+        let mut reader = BufReader::new(second_read);
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+                .await
+                .expect("replay line timeout")
+                .expect("read replay line");
+            received.push(line);
+        }
+        assert_eq!(&received[..2], &["first\n", "second\n"]);
+        let barrier: serde_json::Value =
+            serde_json::from_str(&received[2]).expect("typed replay barrier");
+        assert_eq!(barrier["params"]["sessionId"], "stored-history");
+        assert_eq!(
+            barrier["params"]["update"]["_meta"][HISTORY_REPLAY_META_KEY],
+            TOKEN
+        );
+
+        shared.settle_history_replay(TOKEN).await;
+        assert!(shared.history_replay.lock().await.is_none());
     }
 
     /// Only `session/load` has a request-owned identity. A successful-looking

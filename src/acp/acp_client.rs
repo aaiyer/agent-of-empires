@@ -776,6 +776,7 @@ enum ConnectMode {
     Resume {
         acp_session_id: String,
         in_flight_turn: bool,
+        seed_history_replay: bool,
     },
 }
 
@@ -2287,6 +2288,7 @@ pub struct AcpClient {
     inbound: Option<mpsc::Receiver<Event>>,
     cmd_tx: Option<mpsc::Sender<ClientCmd>>,
     pending_responders: PendingResponders,
+    control_client: Option<Arc<DaemonControlClient>>,
     /// Hold the subprocess so it gets killed when the client is dropped.
     _child: Option<Arc<Mutex<tokio::process::Child>>>,
 }
@@ -2408,6 +2410,7 @@ impl AcpClient {
             inbound: Some(event_rx),
             cmd_tx: None,
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            control_client: None,
             _child: None,
         };
         (client, event_tx)
@@ -2428,6 +2431,7 @@ impl AcpClient {
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            control_client: None,
             _child: None,
         }
     }
@@ -2465,6 +2469,7 @@ impl AcpClient {
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            control_client: None,
             _child: None,
         };
         (client, event_tx, saw_delete)
@@ -2516,6 +2521,7 @@ impl AcpClient {
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            control_client: None,
             _child: None,
         };
         (client, event_tx, cmds)
@@ -2553,6 +2559,7 @@ impl AcpClient {
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            control_client: None,
             _child: None,
         };
         (client, event_tx)
@@ -2773,6 +2780,7 @@ impl AcpClient {
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
             pending_responders,
+            control_client: None,
             _child: Some(child),
         })
     }
@@ -2803,6 +2811,38 @@ impl AcpClient {
         default_mode: Option<String>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<Self, AcpError> {
+        let session_label = session_id.0.clone();
+        let guard = Arc::new(TerminalClaim::new());
+        let prompt_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seeded_resume = matches!(
+            &mode,
+            ConnectMode::Resume {
+                seed_history_replay: true,
+                ..
+            }
+        );
+        // An imported replay must learn and arm the runner's retained token
+        // before the main relay is attached, because attaching the relay is
+        // what resumes delivery.
+        let early_control = if seeded_resume {
+            Some(
+                connect_runner_control_v2(
+                    &socket_path,
+                    event_tx.clone(),
+                    session_label.clone(),
+                    guard.clone(),
+                    prompt_in_flight.clone(),
+                )
+                .await
+                .ok_or_else(|| {
+                    AcpError::Spawn(
+                        "imported replay runner has no compatible control channel".into(),
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
         // Poll for the runner to finish binding the socket. The runner
         // binds before it spawns the agent so this is usually fast (a
         // few ms) but bound the wait so a wedged runner returns a typed
@@ -2842,7 +2882,6 @@ impl AcpClient {
             sandbox: sandbox_handle,
         };
 
-        let session_label = session_id.0.clone();
         let pending_for_task = pending_responders.clone();
         let expected_agent = ExpectedAgent::from_command(&install_binary);
 
@@ -2855,18 +2894,19 @@ impl AcpClient {
         // older (v1) runner returns None: the task falls back to the
         // byte-relay handshake and, for a mid-flight resume, the resume-idle
         // watchdog (guard left None so it still fires).
-        let guard = Arc::new(TerminalClaim::new());
-        // Shared with the connection task so the control reader can hand idle
-        // ownership back when it surfaces a waiterless completion (#3190).
-        let prompt_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let control_client = connect_runner_control_v2(
-            &socket_path,
-            event_tx.clone(),
-            session_label.clone(),
-            guard.clone(),
-            prompt_in_flight.clone(),
-        )
-        .await;
+        let control_client = match early_control {
+            Some(control) => Some(control),
+            None => {
+                connect_runner_control_v2(
+                    &socket_path,
+                    event_tx.clone(),
+                    session_label.clone(),
+                    guard.clone(),
+                    prompt_in_flight.clone(),
+                )
+                .await
+            }
+        };
         let external_terminal_guard = control_client.as_ref().map(|_| guard);
         let external_prompt_in_flight = control_client.as_ref().map(|_| prompt_in_flight);
 
@@ -2876,6 +2916,7 @@ impl AcpClient {
         // an `acp_session` span so per-session log teeing (#1864) catches
         // events that do not set the `session` field explicitly.
         let conn_span = tracing::info_span!("acp_session", session = %session_label);
+        let retained_control_client = control_client.clone();
         tokio::spawn(
             run_connection_task(
                 transport,
@@ -2909,6 +2950,7 @@ impl AcpClient {
             inbound: Some(event_rx),
             cmd_tx: Some(cmd_tx),
             pending_responders,
+            control_client: retained_control_client,
             _child: None,
         })
     }
@@ -2941,17 +2983,20 @@ impl AcpClient {
         additional_dirs: Vec<PathBuf>,
         stored_acp_session_id: String,
         in_flight_turn: bool,
+        seed_history_replay: bool,
         session_id: AcpSessionId,
         sandbox: Option<(SessionSandbox, SandboxPathMap)>,
         agent_key: String,
         source_profile: Option<String>,
     ) -> Result<Self, AcpError> {
+        let expected_acp_session_id = stored_acp_session_id.clone();
         let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(16);
         let (event_tx, event_rx) = mpsc::channel::<Event>(64);
         let pending_responders: PendingResponders = Arc::new(Mutex::new(HashMap::new()));
         let mode = ConnectMode::Resume {
             acp_session_id: stored_acp_session_id,
             in_flight_turn,
+            seed_history_replay,
         };
         let profile = agent_profiles::resolve(&agent_key);
         // Resolve the binary name from the registry so the resume path
@@ -2967,7 +3012,7 @@ impl AcpClient {
             .get(&agent_key)
             .map(|spec| spec.command.clone())
             .unwrap_or_default();
-        Self::connect_via_socket(
+        let client = Self::connect_via_socket(
             socket_path,
             cwd,
             additional_dirs,
@@ -2990,7 +3035,13 @@ impl AcpClient {
             None,
             Vec::new(),
         )
-        .await
+        .await?;
+        if !seed_history_replay {
+            client
+                .acknowledge_history_replay(&expected_acp_session_id)
+                .await;
+        }
+        Ok(client)
     }
 
     /// Send a user message to the agent (ACP `session/prompt`). The
@@ -3285,6 +3336,23 @@ impl AcpClient {
         let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
         let _ = cmd_tx.send(ClientCmd::Shutdown).await;
         Ok(())
+    }
+
+    pub(crate) async fn acknowledge_history_replay(&self, acp_session_id: &str) {
+        let Some(control) = self.control_client.as_ref() else {
+            return;
+        };
+        let Some(pending) = control.pending_history_replay.as_ref() else {
+            return;
+        };
+        if pending.acp_session_id != acp_session_id {
+            return;
+        }
+        let _ = control
+            .send(ControlBody::HistoryReplaySettled {
+                replay_token: pending.replay_token.clone(),
+            })
+            .await;
     }
 
     /// Drain the next event the agent emitted. Returns None once the
@@ -4148,6 +4216,7 @@ struct DaemonControlClient {
     write: Mutex<tokio::net::unix::OwnedWriteHalf>,
     handshake_rx: Mutex<mpsc::Receiver<ControlBody>>,
     completion: Arc<std::sync::Mutex<Option<oneshot::Sender<control_protocol::PromptOutcome>>>>,
+    pending_history_replay: Option<control_protocol::PendingHistoryReplay>,
 }
 
 impl DaemonControlClient {
@@ -4272,13 +4341,18 @@ async fn connect_runner_control_v2(
     let dial = async {
         let stream = tokio::net::UnixStream::connect(&control_path).await.ok()?;
         let (mut read_half, mut write_half) = stream.into_split();
-        match control_protocol::read_frame(&mut read_half).await {
+        let pending_history_replay = match control_protocol::read_frame(&mut read_half).await {
             Ok(Some(ControlBody::Hello {
                 control_protocol_version,
-                ..
-            })) if control_protocol_version == control_protocol::CONTROL_PROTOCOL_VERSION => {}
+                session_id,
+                pending_history_replay,
+            })) if control_protocol_version == control_protocol::CONTROL_PROTOCOL_VERSION
+                && session_id == session_label =>
+            {
+                pending_history_replay
+            }
             _ => return None,
-        }
+        };
         control_protocol::write_frame(
             &mut write_half,
             &ControlBody::Attach {
@@ -4287,19 +4361,20 @@ async fn connect_runner_control_v2(
         )
         .await
         .ok()?;
-        Some((read_half, write_half))
+        Some((read_half, write_half, pending_history_replay))
     };
-    let (mut read_half, write_half) = match tokio::time::timeout(bound, dial).await {
-        Ok(Some(halves)) => halves,
-        _ => {
-            debug!(
-                target: "acp.protocol",
-                session = %session_label,
-                "no usable v2 runner control socket; using byte-relay handshake + watchdog"
-            );
-            return None;
-        }
-    };
+    let (mut read_half, write_half, pending_history_replay) =
+        match tokio::time::timeout(bound, dial).await {
+            Ok(Some(halves)) => halves,
+            _ => {
+                debug!(
+                    target: "acp.protocol",
+                    session = %session_label,
+                    "no usable v2 runner control socket; using byte-relay handshake + watchdog"
+                );
+                return None;
+            }
+        };
 
     info!(
         target: "acp.protocol",
@@ -4397,6 +4472,7 @@ async fn connect_runner_control_v2(
         write: Mutex::new(write_half),
         handshake_rx: Mutex::new(hs_rx),
         completion,
+        pending_history_replay,
     }))
 }
 
@@ -4806,7 +4882,7 @@ struct ArmedHistoryReplay {
     acp_session_id: String,
     replay_token: String,
     settle_import: bool,
-    completion: oneshot::Sender<()>,
+    completion: Option<oneshot::Sender<()>>,
 }
 
 fn history_replay_token(update: &SessionUpdate) -> Option<&str> {
@@ -6830,7 +6906,9 @@ async fn run_connection_task<W, R>(
                                 })
                                 .await;
                         }
-                        let _ = settled.completion.send(());
+                        if let Some(completion) = settled.completion {
+                            let _ = completion.send(());
+                        }
                         return Ok(());
                     }
                     last_event_at
@@ -7370,6 +7448,7 @@ async fn run_connection_task<W, R>(
                 ConnectMode::Resume {
                     acp_session_id: stored,
                     in_flight_turn: _,
+                    seed_history_replay,
                 } => {
                     // INVARIANT: Resume mode MUST NOT send `session/new`
                     // or `session/load`. This is the load-bearing trick
@@ -7401,11 +7480,43 @@ async fn run_connection_task<W, R>(
                     // crash. The server-side listener treats a same-id
                     // Assigned as a no-op, so this doesn't rewrite
                     // sessions.json.
-                    let _ = event_tx_for_block
-                        .send(Event::AcpSessionAssigned {
-                            acp_session_id: stored.clone(),
-                        })
-                        .await;
+                    if seed_history_replay {
+                        let pending = control_client
+                            .as_ref()
+                            .and_then(|control| control.pending_history_replay.as_ref())
+                            .filter(|pending| pending.acp_session_id == stored)
+                            .ok_or_else(|| {
+                                acp_internal_error(format!(
+                                    "runner has no unsettled replay for imported session `{stored}`"
+                                ))
+                            })?;
+                        let replay_token = pending.replay_token.clone();
+                        *seeded_replay_barrier_for_block
+                            .lock()
+                            .expect("history replay barrier mutex poisoned") =
+                            Some(ArmedHistoryReplay {
+                                acp_session_id: stored.clone(),
+                                replay_token: replay_token.clone(),
+                                settle_import: true,
+                                completion: None,
+                            });
+                        control_client
+                            .as_ref()
+                            .expect("seeded resume requires control")
+                            .send(ControlBody::ResumeHistoryReplay { replay_token })
+                            .await
+                            .map_err(|error| {
+                                acp_internal_error(format!(
+                                    "resume imported replay control failed: {error}"
+                                ))
+                            })?;
+                    } else {
+                        let _ = event_tx_for_block
+                            .send(Event::AcpSessionAssigned {
+                                acp_session_id: stored.clone(),
+                            })
+                            .await;
+                    }
                     SessionId::from(stored)
                 }
                 ConnectMode::Fresh {
@@ -7620,7 +7731,7 @@ async fn run_connection_task<W, R>(
                                             acp_session_id: stored.clone(),
                                             replay_token: token.clone(),
                                             settle_import: seed_history_replay,
-                                            completion: tx,
+                                            completion: Some(tx),
                                         });
                                     (Some(token), Some(rx))
                                 } else {
@@ -12586,7 +12697,7 @@ done
             acp_session_id: "stored-history".into(),
             replay_token: TOKEN.into(),
             settle_import: true,
-            completion: tx,
+            completion: Some(tx),
         }));
 
         assert!(
@@ -16670,6 +16781,7 @@ done
                 &ControlBody::Hello {
                     control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
                     session_id: "s".into(),
+                    pending_history_replay: None,
                 },
             )
             .await
@@ -16741,6 +16853,7 @@ done
                 &ControlBody::Hello {
                     control_protocol_version: 999,
                     session_id: "s".into(),
+                    pending_history_replay: None,
                 },
             )
             .await;

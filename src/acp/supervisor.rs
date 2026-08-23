@@ -1540,13 +1540,15 @@ impl<S: BroadcastSink> Supervisor<S> {
                 || cwd != std::path::Path::new(crate::server::maya_restricted::PROJECT_PATH)
                 || !additional_dirs.is_empty()
                 || !provider_env.is_empty()
-                || model.is_some()
-                || effort.is_some()
+                || !maya_restricted_selectors_allowed(
+                    model.as_deref(),
+                    effort.as_deref(),
+                    acp_mode_id.as_deref(),
+                )
                 || sandbox_info.is_some()
                 || fork_from.is_some()
                 || source_profile.as_deref() != Some(crate::server::maya_restricted::PROFILE_NAME)
-                || yolo_mode
-                || acp_mode_id.is_some())
+                || yolo_mode)
         {
             return Err(SupervisorError::InvalidAgentCommand(
                 "Maya restricted sessions require the fixed Codex agent and repository".into(),
@@ -1879,7 +1881,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             drop(client);
             return Err(SupervisorError::SpawnCancelled(session_id));
         }
-        let drain_task = self.start_drain_task(session_id.clone(), inbound);
+        let drain_task = self.start_drain_task(session_id.clone(), inbound, Arc::clone(&client));
         let client_for_mode = (acp_mode_id.is_some() || yolo_mode).then(|| Arc::clone(&client));
         workers.insert(
             session_id.clone(),
@@ -1942,6 +1944,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         session_id: String,
         initial_inbound: mpsc::Receiver<Event>,
+        settle_client: Arc<AcpClient>,
     ) -> JoinHandle<()> {
         let sink = Arc::clone(&self.sink);
         let workers = Arc::clone(&self.workers);
@@ -2065,6 +2068,11 @@ impl<S: BroadcastSink> Supervisor<S> {
                         }
                         let seq = next_seq(&next_seqs, &session_id);
                         sink.publish(&session_id, seq, &event);
+                        if let Event::AcpSessionAssigned { acp_session_id } = &event {
+                            settle_client
+                                .acknowledge_history_replay(acp_session_id)
+                                .await;
+                        }
                     }
 
                     // Channel closed: the agent's connection task ended.
@@ -2966,6 +2974,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         cwd: PathBuf,
         additional_dirs: Vec<PathBuf>,
         in_flight_turn: bool,
+        seed_history_replay: bool,
         sandbox: Option<SandboxInfo>,
     ) -> Result<(), SupervisorError> {
         // Reserve a `pending_resumes` slot for the duration of the
@@ -3071,6 +3080,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         };
 
         let acp_session_id = AcpSessionId(session_id.clone());
+        if seed_history_replay {
+            self.sink.clear_session_events(&session_id);
+        }
         // Reattach: read the original profile from the persisted
         // `WorkerRecord` so `terminal/create` env resolution stays on the
         // session's actual profile across daemon restarts. Legacy records
@@ -3103,6 +3115,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             additional_dirs,
             stored_acp_session_id,
             in_flight_turn,
+            seed_history_replay,
             acp_session_id,
             sandbox_resources,
             attach_agent_key,
@@ -3136,7 +3149,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             drop(client);
             return Err(SupervisorError::SpawnCancelled(session_id));
         }
-        let drain_task = self.start_drain_task(session_id.clone(), inbound);
+        let drain_task = self.start_drain_task(session_id.clone(), inbound, Arc::clone(&client));
         workers.insert(
             session_id.clone(),
             WorkerHandle {
@@ -3375,6 +3388,16 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
         restart_pending
     }
+}
+
+fn maya_restricted_selectors_allowed(
+    model: Option<&str>,
+    effort: Option<&str>,
+    mode: Option<&str>,
+) -> bool {
+    model.is_none_or(crate::server::maya_restricted::is_managed_model)
+        && effort.is_none_or(crate::server::maya_restricted::is_managed_effort)
+        && mode.is_none_or(crate::server::maya_restricted::is_managed_mode)
 }
 
 /// SIGTERM the per-session runner if its registry entry has a live PID,
@@ -4075,6 +4098,7 @@ cursor-acp-bridge = "agent acp"
                     tmp.path().to_path_buf(),
                     vec![],
                     false,
+                    false,
                     None,
                 )
                 .await;
@@ -4095,6 +4119,7 @@ cursor-acp-bridge = "agent acp"
                     "s-policy".into(),
                     tmp.path().to_path_buf(),
                     vec![],
+                    false,
                     false,
                     None,
                 )
@@ -4146,6 +4171,7 @@ cursor-acp-bridge = "agent acp"
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn spawn_unknown_agent_errors_cleanly() {
         let sink = VecSink::new();
         let sup = Supervisor::new(sink);
@@ -4912,14 +4938,15 @@ cursor-acp-bridge = "agent acp"
         let sup = Supervisor::new(sink.clone());
 
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Event>(16);
-        let drain = sup.start_drain_task("s-rl".into(), inbound_rx);
+        let (client, _client_tx) = AcpClient::fake_for_test(AcpSessionId("s-rl".into()));
+        let client = Arc::new(client);
+        let drain = sup.start_drain_task("s-rl".into(), inbound_rx, Arc::clone(&client));
         {
             let mut workers = sup.workers.lock().await;
-            let (client, _client_tx) = AcpClient::fake_for_test(AcpSessionId("s-rl".into()));
             workers.insert(
                 "s-rl".into(),
                 WorkerHandle {
-                    client: Arc::new(client),
+                    client,
                     // Drain task installed above owns the only handle we
                     // care about; this field is just a placeholder so
                     // the WorkerHandle compiles.
@@ -5523,6 +5550,27 @@ cursor-acp-bridge = "agent acp"
             SupervisorError::Acp(AcpError::ResetFailed(message))
                 if message.contains("server-assigned Codex identity")
         ));
+    }
+
+    #[test]
+    fn maya_restricted_respawn_accepts_only_managed_persisted_selectors() {
+        assert!(maya_restricted_selectors_allowed(
+            Some("gpt-5.6-sol"),
+            Some("max"),
+            Some("agent-full-access"),
+        ));
+        assert!(maya_restricted_selectors_allowed(None, None, None));
+        for selectors in [
+            (Some("caller-model"), Some("max"), Some("agent")),
+            (Some("gpt-5.6-sol"), Some("caller-effort"), Some("agent")),
+            (Some("gpt-5.6-sol"), Some("max"), Some("caller-mode")),
+        ] {
+            assert!(!maya_restricted_selectors_allowed(
+                selectors.0,
+                selectors.1,
+                selectors.2,
+            ));
+        }
     }
 
     /// A rejected driven reset keeps the existing ACP conversation, so
