@@ -164,7 +164,8 @@ async fn attach_in_flight_synthesizes_reattach_idle_stopped() {
         std::env::temp_dir(),
         vec![],
         "test-acp-session-id".into(),
-        true, // in_flight_turn
+        true,  // in_flight_turn
+        false, // ordinary attach: no imported-history replay
         AcpSessionId("midturn-true".into()),
         None,
         "claude".into(),
@@ -202,6 +203,7 @@ async fn attach_idle_session_does_not_synthesize_stopped() {
         vec![],
         "test-acp-session-id".into(),
         false, // NOT in flight
+        false, // ordinary attach: no imported-history replay
         AcpSessionId("midturn-false".into()),
         None,
         "claude".into(),
@@ -248,7 +250,8 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
         std::env::temp_dir(),
         vec![],
         session_id.into(),
-        true, // in_flight_turn
+        true,  // in_flight_turn
+        false, // ordinary attach: no imported-history replay
         AcpSessionId("midturn-disarm".into()),
         None,
         "claude".into(),
@@ -293,6 +296,7 @@ async fn socket_transport_round_trips_prompt_via_attach() {
         vec![],
         preseed.into(),
         false, // not in flight; this is a fresh round-trip
+        false, // ordinary attach: no imported-history replay
         AcpSessionId("roundtrip".into()),
         None,
         "claude".into(),

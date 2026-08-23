@@ -215,12 +215,25 @@ pub trait BroadcastSink: Send + Sync + 'static {
         self.publish(session_id, seq, event);
         true
     }
+    /// Persist and expose imported-history terminal settlement as one unit.
+    /// Durable sinks override this with an atomic store commit.
+    fn publish_history_settlement(
+        &self,
+        session_id: &str,
+        terminal: (u64, &Event),
+        assignment: (u64, &Event),
+    ) -> bool {
+        self.publish_persisted(session_id, terminal.0, terminal.1)
+            && self.publish_persisted(session_id, assignment.0, assignment.1)
+    }
     /// Drop all stored events for a session. Used by the import path to clear
     /// any partial replay from a prior failed attempt before re-seeding, run
     /// only after the worker slot is reserved so a duplicate spawn that hits
     /// `AlreadyRunning` can't wipe a live worker's transcript. Default no-op
     /// for test sinks without an event store. See #2276.
-    fn clear_session_events(&self, _session_id: &str) {}
+    fn clear_session_events(&self, _session_id: &str) -> bool {
+        true
+    }
     /// Approval nonces from `ApprovalRequested` events on disk with no
     /// matching `ApprovalResolved`. Used by `Supervisor::attach` to
     /// cancel approvals whose responder died with the previous daemon.
@@ -611,6 +624,89 @@ fn resolve_mcp_layers(
         );
     }
     crate::acp::mcp_config::project_servers_to_acp(merged.into_iter().map(|s| s.def).collect())
+}
+
+/// Refresh mutable host configuration for an ordinary crash respawn.
+/// Maya-restricted workers are deployment-bound: neither configured MCP
+/// servers nor host hooks may cross that boundary on a later launch.
+async fn refresh_respawn_host_config(config: &mut SpawnConfig, session_id: &str) {
+    if config.maya_restricted {
+        config.mcp_servers.clear();
+        config.host_environment.clear();
+        return;
+    }
+
+    let mcp_agent = config.agent_key.clone();
+    let mcp_session = session_id.to_string();
+    let mcp_profile = config.source_profile.clone();
+    let mcp_cwd = config.cwd.clone();
+    config.mcp_servers = tokio::task::spawn_blocking(move || {
+        resolve_mcp_layers(&mcp_agent, &mcp_session, mcp_profile.as_deref(), &mcp_cwd)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        warn!(
+            target: "acp.mcp",
+            session = %session_id,
+            error = %e,
+            "MCP re-resolution on respawn failed; forwarding no servers"
+        );
+        Vec::new()
+    });
+
+    if config.sandbox_info.is_some() {
+        return;
+    }
+    let profile_for_hook = config.source_profile.clone().unwrap_or_default();
+    let cwd_for_hook = config.cwd.clone();
+    let session_for_hook = session_id.to_string();
+    let tool_for_hook = config.tool.clone();
+    let minted = tokio::task::spawn_blocking(move || {
+        let commands = crate::session::repo_config::resolve_before_session_hooks(&profile_for_hook);
+        if commands.is_empty() {
+            return Ok(Vec::new());
+        }
+        let hook_env: Vec<(&'static str, String)> = vec![
+            ("AOE_SESSION_ID", session_for_hook),
+            ("AOE_PROFILE", profile_for_hook.clone()),
+            ("AOE_TOOL", tool_for_hook),
+            (
+                "AOE_PROJECT_PATH",
+                cwd_for_hook.to_string_lossy().to_string(),
+            ),
+        ];
+        crate::session::repo_config::run_before_session_hooks(
+            &commands,
+            &cwd_for_hook,
+            &hook_env,
+            &[],
+        )
+    })
+    .await;
+    match minted {
+        Ok(Ok(pairs)) => {
+            for (key, value) in pairs {
+                config.host_environment.retain(|(k, _)| k != &key);
+                config.host_environment.push((key, value));
+            }
+        }
+        Ok(Err(e)) => {
+            warn!(
+                target: "acp.supervisor",
+                session = %session_id,
+                error = %e,
+                "before_session hook failed on respawn; reusing the environment from the prior launch"
+            );
+        }
+        Err(e) => {
+            warn!(
+                target: "acp.supervisor",
+                session = %session_id,
+                error = %e,
+                "before_session hook task failed on respawn; reusing the environment from the prior launch"
+            );
+        }
+    }
 }
 
 /// Overlay an instance command override onto a resolved `AgentSpec`.
@@ -1816,8 +1912,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         // spawn reservation is held, rather than in the REST handler, so a
         // duplicate import spawn that bails with AlreadyRunning can't wipe a
         // live worker's stored transcript. See #2276.
-        if seed_history_replay {
-            self.sink.clear_session_events(&session_id);
+        if seed_history_replay && !self.sink.clear_session_events(&session_id) {
+            return Err(SupervisorError::Acp(AcpError::Spawn(
+                "could not clear partial imported replay".into(),
+            )));
         }
 
         let acp_session_id = AcpSessionId(session_id.clone());
@@ -1980,6 +2078,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                     // different ACP backend via `/acp/switch-agent`. See
                     // #1281.
                     let mut rate_limited = false;
+                    let mut history_replay_terminal = None;
                     while let Some(event) = inbound.recv().await {
                         if let Event::Stopped { reason } = &event {
                             if reason == "agent_unresponsive"
@@ -1995,6 +2094,21 @@ impl<S: BroadcastSink> Supervisor<S> {
                                 rate_limited = true;
                             }
                         }
+                        // Imported replay completion is a two-record durable
+                        // boundary. Buffer its terminal until the following
+                        // assignment can be committed with it, so neither
+                        // completion event is observable alone.
+                        if !publish_worker_event(
+                            sink.as_ref(),
+                            &next_seqs,
+                            &session_id,
+                            &event,
+                            &mut history_replay_terminal,
+                        ) {
+                            agent_unresponsive = true;
+                            break;
+                        }
+
                         // Mirror the agent-assigned id into the cached
                         // spawn_config so a subsequent crash respawn picks
                         // up the latest id and calls session/load instead
@@ -2015,14 +2129,6 @@ impl<S: BroadcastSink> Supervisor<S> {
                                         );
                                         spawn_config.stored_acp_session_id =
                                             Some(acp_session_id.clone());
-                                        // Import replay is one-shot: only the
-                                        // first successful session/load needs
-                                        // it. Clear it so an automatic respawn
-                                        // (crash/drain) suppresses replay against
-                                        // the now-populated event store instead
-                                        // of duplicating the transcript. See
-                                        // #2276.
-                                        spawn_config.seed_history_replay = false;
                                     }
                                 }
                                 // Mirror into the on-disk registry so a fresh
@@ -2065,8 +2171,6 @@ impl<S: BroadcastSink> Supervisor<S> {
                             }
                             _ => {}
                         }
-                        let seq = next_seq(&next_seqs, &session_id);
-                        sink.publish(&session_id, seq, &event);
                     }
 
                     // Channel closed: the agent's connection task ended.
@@ -2271,103 +2375,22 @@ impl<S: BroadcastSink> Supervisor<S> {
 
                     tokio::time::sleep(RESPAWN_BACKOFF).await;
 
-                    // Re-resolve the MCP layers rather than reusing the list
-                    // cached at first spawn: edits to the agent's native config,
-                    // `<app_dir>/mcp.json`, the per-profile `mcp.json`, or the
-                    // trusted project-local `.mcp.json` made since then are
-                    // forwarded on `session/load` too, so a respawn must pick them
-                    // up. The project-local trust gate runs here as well, so an
-                    // edited `.mcp.json` is re-locked until the repo is re-trusted.
-                    let mcp_agent = respawn_config.agent_key.clone();
-                    let mcp_session = session_id.clone();
-                    let mcp_profile = respawn_config.source_profile.clone();
-                    let mcp_cwd = respawn_config.cwd.clone();
-                    respawn_config.mcp_servers = tokio::task::spawn_blocking(move || {
-                        resolve_mcp_layers(
-                            &mcp_agent,
-                            &mcp_session,
-                            mcp_profile.as_deref(),
-                            &mcp_cwd,
-                        )
-                    })
-                    .await
-                    .unwrap_or_else(|e| {
+                    if respawn_config.seed_history_replay && !sink.clear_session_events(&session_id)
+                    {
                         warn!(
-                            target: "acp.mcp",
+                            target: "acp.supervisor",
                             session = %session_id,
-                            error = %e,
-                            "MCP re-resolution on respawn failed; forwarding no servers"
+                            "could not clear partial imported replay; parking for a safe retry"
                         );
-                        Vec::new()
-                    });
-
-                    // Re-run `host_hooks.before_session` before the respawn, the
-                    // same way `spawn_inner` runs it on first spawn: a
-                    // non-sandboxed worker respawns often (crash, cancel
-                    // watchdog, transport break), and reusing the value minted
-                    // at the original spawn would defeat the hook's whole
-                    // purpose of refreshing a short-lived value (e.g. a rotated
-                    // token) on every launch. Sandboxed agents keep using
-                    // `sandbox.environment`, resolved once at container
-                    // bring-up, so this is skipped for them.
-                    if respawn_config.sandbox_info.is_none() {
-                        let profile_for_hook =
-                            respawn_config.source_profile.clone().unwrap_or_default();
-                        let cwd_for_hook = respawn_config.cwd.clone();
-                        let session_for_hook = session_id.clone();
-                        let tool_for_hook = respawn_config.tool.clone();
-                        let minted = tokio::task::spawn_blocking(move || {
-                            let commands =
-                                crate::session::repo_config::resolve_before_session_hooks(
-                                    &profile_for_hook,
-                                );
-                            if commands.is_empty() {
-                                return Ok(Vec::new());
-                            }
-                            let hook_env: Vec<(&'static str, String)> = vec![
-                                ("AOE_SESSION_ID", session_for_hook),
-                                ("AOE_PROFILE", profile_for_hook.clone()),
-                                ("AOE_TOOL", tool_for_hook),
-                                (
-                                    "AOE_PROJECT_PATH",
-                                    cwd_for_hook.to_string_lossy().to_string(),
-                                ),
-                            ];
-                            crate::session::repo_config::run_before_session_hooks(
-                                &commands,
-                                &cwd_for_hook,
-                                &hook_env,
-                                &[],
-                            )
-                        })
-                        .await;
-                        match minted {
-                            Ok(Ok(pairs)) => {
-                                for (key, value) in pairs {
-                                    respawn_config.host_environment.retain(|(k, _)| k != &key);
-                                    respawn_config.host_environment.push((key, value));
-                                }
-                            }
-                            Ok(Err(e)) => {
-                                warn!(
-                                    target: "acp.supervisor",
-                                    session = %session_id,
-                                    error = %e,
-                                    "before_session hook failed on respawn; reusing the \
-                                     environment from the prior launch"
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    target: "acp.supervisor",
-                                    session = %session_id,
-                                    error = %e,
-                                    "before_session hook task failed on respawn; reusing the \
-                                     environment from the prior launch"
-                                );
-                            }
-                        }
+                        let mut guard = workers.lock().await;
+                        guard.remove(&session_id);
+                        return;
                     }
+
+                    // Ordinary profiles re-resolve their mutable host inputs.
+                    // Maya-restricted respawns keep their deployment-bound empty
+                    // MCP and host-hook surfaces.
+                    refresh_respawn_host_config(&mut respawn_config, &session_id).await;
 
                     let acp_session_id = AcpSessionId(session_id.clone());
                     let mut new_client =
@@ -2569,7 +2592,22 @@ impl<S: BroadcastSink> Supervisor<S> {
         let Ok(client) = self.client_for_session(session_id).await else {
             return false;
         };
-        client.acknowledge_history_replay(acp_session_id).await
+        if !client.acknowledge_history_replay(acp_session_id).await {
+            return false;
+        }
+        let mut workers = self.workers.lock().await;
+        if let Some(handle) = workers.get_mut(session_id) {
+            if let WorkerKind::Runner { spawn_config } = &mut handle.kind {
+                if spawn_config.stored_acp_session_id.as_deref() == Some(acp_session_id) {
+                    // The server calls this only after sessions.json durably
+                    // clears import_pending. Until then an ordinary worker
+                    // crash must clear and replay again, not silently resume a
+                    // transcript whose settlement marker never committed.
+                    spawn_config.seed_history_replay = false;
+                }
+            }
+        }
+        true
     }
 
     /// Send a user prompt (with optional attachments) to a running
@@ -3084,8 +3122,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         };
 
         let acp_session_id = AcpSessionId(session_id.clone());
-        if seed_history_replay {
-            self.sink.clear_session_events(&session_id);
+        if seed_history_replay && !self.sink.clear_session_events(&session_id) {
+            return Err(SupervisorError::Acp(AcpError::Spawn(
+                "could not clear partial imported replay".into(),
+            )));
         }
         // Reattach: read the original profile from the persisted
         // `WorkerRecord` so `terminal/create` env resolution stays on the
@@ -3538,6 +3578,48 @@ fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     })
 }
 
+/// Persist one worker event, keeping imported-history settlement recoverable.
+/// The terminal and its immediately following assignment are the two commit
+/// records for a seeded replay. If either write fails, discard the partial
+/// imported transcript and force the caller to restart the worker while its
+/// `seed_history_replay` authority is still set.
+fn publish_worker_event<S: BroadcastSink>(
+    sink: &S,
+    next_seqs: &SeqMap,
+    session_id: &str,
+    event: &Event,
+    history_replay_terminal: &mut Option<(u64, Event)>,
+) -> bool {
+    let is_history_terminal = matches!(
+        event,
+        Event::Stopped { reason } if reason == "history_replay_complete"
+    );
+    if is_history_terminal {
+        let seq = next_seq(next_seqs, session_id);
+        *history_replay_terminal = Some((seq, event.clone()));
+        return true;
+    }
+    if let Some((terminal_seq, terminal)) = history_replay_terminal.take() {
+        if !matches!(event, Event::AcpSessionAssigned { .. }) {
+            let _ = sink.clear_session_events(session_id);
+            return false;
+        }
+        let assignment_seq = next_seq(next_seqs, session_id);
+        if !sink.publish_history_settlement(
+            session_id,
+            (terminal_seq, &terminal),
+            (assignment_seq, event),
+        ) {
+            let _ = sink.clear_session_events(session_id);
+            return false;
+        }
+        return true;
+    }
+    let seq = next_seq(next_seqs, session_id);
+    sink.publish(session_id, seq, event);
+    true
+}
+
 /// A `BroadcastSink` impl backed by a tokio broadcast channel. The
 /// AppState in the server module wires this so structured view events flow
 /// straight into the existing WebSocket fanout, and snapshots them
@@ -3580,10 +3662,53 @@ impl BroadcastSink for ChannelSink {
         let _ = self.publish_persisted(session_id, seq, event);
     }
 
-    fn clear_session_events(&self, session_id: &str) {
-        self.event_store.delete_session(session_id);
-        // The cached fold is a projection of the log we just deleted.
-        self.control_cache.forget(session_id);
+    fn clear_session_events(&self, session_id: &str) -> bool {
+        match self.event_store.try_delete_session(session_id) {
+            Ok(()) => {
+                // The cached fold is a projection of the log we just deleted.
+                self.control_cache.forget(session_id);
+                true
+            }
+            Err(error) => {
+                warn!(
+                    target: "acp.event_store",
+                    session = %session_id,
+                    %error,
+                    "failed to clear imported replay"
+                );
+                false
+            }
+        }
+    }
+
+    fn publish_history_settlement(
+        &self,
+        session_id: &str,
+        terminal: (u64, &Event),
+        assignment: (u64, &Event),
+    ) -> bool {
+        if let Err(error) = self.event_store.record_batch(
+            session_id,
+            &[(terminal.0, terminal.1), (assignment.0, assignment.1)],
+        ) {
+            warn!(
+                target: "acp.event_store",
+                session = %session_id,
+                %error,
+                "imported-history settlement write failed"
+            );
+            self.control_cache.forget(session_id);
+            return false;
+        }
+        for (seq, event) in [terminal, assignment] {
+            self.control_cache.apply_if_cached(session_id, seq, event);
+            let _ = self.tx.send(crate::server::AcpBroadcastFrame {
+                session_id: session_id.to_string(),
+                seq,
+                event: Arc::new(event.clone()),
+            });
+        }
+        true
     }
 
     fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
@@ -3870,6 +3995,96 @@ mod tests {
         }
         fn unresolved_elicitation_nonces(&self, _session_id: &str) -> Vec<Nonce> {
             self.stale_elicitation_nonces.lock().unwrap().clone()
+        }
+    }
+
+    struct FailingSettlementSink {
+        calls: std::sync::atomic::AtomicUsize,
+        fail_at: usize,
+        events: std::sync::Mutex<Vec<Event>>,
+    }
+
+    impl BroadcastSink for FailingSettlementSink {
+        fn publish(&self, _session_id: &str, _seq: u64, event: &Event) {
+            self.events.lock().unwrap().push(event.clone());
+        }
+
+        fn publish_history_settlement(
+            &self,
+            session_id: &str,
+            terminal: (u64, &Event),
+            assignment: (u64, &Event),
+        ) -> bool {
+            let mut staged = Vec::new();
+            for (_, event) in [terminal, assignment] {
+                let call = self
+                    .calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                if call == self.fail_at {
+                    return false;
+                }
+                staged.push(event.clone());
+            }
+            for event in staged {
+                self.publish(session_id, 0, &event);
+            }
+            true
+        }
+
+        fn clear_session_events(&self, _session_id: &str) -> bool {
+            self.events.lock().unwrap().clear();
+            true
+        }
+    }
+
+    #[test]
+    fn imported_replay_retries_terminal_or_assignment_write_as_one_transcript() {
+        let replay = [
+            Event::AgentMessageChunk {
+                text: "imported answer".into(),
+            },
+            Event::Stopped {
+                reason: "history_replay_complete".into(),
+            },
+            Event::AcpSessionAssigned {
+                acp_session_id: "11111111-1111-4111-8111-111111111111".into(),
+            },
+        ];
+        for fail_at in [1, 2] {
+            let sink = FailingSettlementSink {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail_at,
+                events: std::sync::Mutex::new(Vec::new()),
+            };
+            let seqs = std::sync::Mutex::new(HashMap::new());
+            let mut first_terminal = None;
+            assert!(replay.iter().any(|event| {
+                !publish_worker_event(&sink, &seqs, "imported", event, &mut first_terminal)
+            }));
+            assert!(
+                sink.events.lock().unwrap().is_empty(),
+                "failed settlement must discard its partial transcript"
+            );
+
+            let mut retry_terminal = None;
+            for event in &replay {
+                assert!(publish_worker_event(
+                    &sink,
+                    &seqs,
+                    "imported",
+                    event,
+                    &mut retry_terminal,
+                ));
+            }
+            let settled = sink.events.lock().unwrap();
+            assert_eq!(settled.len(), replay.len());
+            assert!(matches!(settled[0], Event::AgentMessageChunk { .. }));
+            assert!(matches!(
+                &settled[1],
+                Event::Stopped { reason } if reason == "history_replay_complete"
+            ));
+            assert!(matches!(settled[2], Event::AcpSessionAssigned { .. }));
         }
     }
 
@@ -4412,6 +4627,115 @@ cursor-acp-bridge = "agent acp"
             "from-project",
             "trusted project-local must win the name collision, got {val}"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn maya_restricted_ordinary_crash_respawn_keeps_host_inputs_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var_os("HOME");
+        let original_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+        let app_dir = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("mcp.json"),
+            r#"{"mcpServers":{"must-not-respawn":{"command":"false"}}}"#,
+        )
+        .unwrap();
+        let hook_marker = tmp.path().join("host-hook-ran");
+        std::fs::write(
+            app_dir.join("config.toml"),
+            format!(
+                "[host_hooks]\nbefore_session = [\"touch {}\"]\n",
+                hook_marker.display()
+            ),
+        )
+        .unwrap();
+
+        let socket_path = app_dir.join("maya-respawn.sock");
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            "maya-respawn".into(),
+            std::process::id(),
+            socket_path.clone(),
+            "maya-codex-acp".into(),
+            "codex".into(),
+            tmp.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            Some("11111111-1111-4111-8111-111111111111".into()),
+            Some(crate::server::maya_restricted::PROFILE_NAME.into()),
+        );
+        crate::process::worker_registry::save(&record).unwrap();
+        let poisoned_mcp = resolve_mcp_layers("codex", "maya-respawn", None, tmp.path());
+        assert!(
+            !poisoned_mcp.is_empty(),
+            "fixture must expose configured MCP"
+        );
+        let config = SpawnConfig {
+            agent_key: "codex".into(),
+            tool: "codex".into(),
+            spec: crate::server::maya_restricted::codex_agent_spec(),
+            cwd: tmp.path().to_path_buf(),
+            additional_dirs: vec![],
+            provider_env: vec![],
+            host_environment: vec![("POISONED_HOST_ENV".into(), "1".into())],
+            default_effort: None,
+            default_mode: None,
+            socket_path: Some(socket_path),
+            stored_acp_session_id: Some("11111111-1111-4111-8111-111111111111".into()),
+            maya_restricted: true,
+            fork_from: None,
+            seed_history_replay: false,
+            artifact_dir: None,
+            sandbox_info: None,
+            source_profile: Some(crate::server::maya_restricted::PROFILE_NAME.into()),
+            mcp_servers: poisoned_mcp,
+        };
+        let sup = Supervisor::new(VecSink::new());
+        {
+            let mut workers = sup.workers.lock().await;
+            let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("maya-respawn".into()));
+            workers.insert(
+                "maya-respawn".into(),
+                WorkerHandle {
+                    client: Arc::new(client),
+                    drain_task: tokio::spawn(async {}),
+                    restart_history: vec![],
+                    kind: WorkerKind::Runner {
+                        spawn_config: Box::new(config),
+                    },
+                },
+            );
+        }
+
+        let RestartDecision::Respawn(mut respawn) =
+            restart_decision(&sup.workers, "maya-respawn").await
+        else {
+            panic!("ordinary crash must select respawn")
+        };
+        refresh_respawn_host_config(&mut respawn, "maya-respawn").await;
+        assert!(respawn.mcp_servers.is_empty());
+        assert!(respawn.host_environment.is_empty());
+        assert!(
+            !hook_marker.exists(),
+            "restricted respawn executed host hook"
+        );
+        crate::process::worker_registry::delete("maya-respawn").ok();
+        unsafe {
+            match original_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_xdg {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
     }
 
     /// Watchdog: after MAX_RESPAWNS_IN_WINDOW respawn attempts inside

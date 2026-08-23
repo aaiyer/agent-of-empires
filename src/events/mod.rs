@@ -829,38 +829,49 @@ pub fn prune_pending_attachments_older_than(
 /// Drop every event and attachment for `topic`. Returns the number of event
 /// rows deleted.
 pub fn delete_topic(conn: &Connection, schema: &Schema, topic: &str) -> usize {
-    let deleted = match conn.execute(
-        &format!(
-            "DELETE FROM {} WHERE session_id = ?1",
-            schema.events_table()
-        ),
-        params![topic],
-    ) {
-        Ok(n) => n,
-        Err(e) => {
-            warn!(target: "events", "delete {topic}: {e}");
+    match try_delete_topic(conn, schema, topic) {
+        Ok(deleted) => deleted,
+        Err(error) => {
+            warn!(target: "events", "delete {topic}: {error}");
             0
         }
-    };
-    if let Err(e) = conn.execute(
+    }
+}
+
+/// Fallible whole-topic deletion for recovery paths that must not proceed
+/// until the prior durable event state is known to be absent.
+pub fn try_delete_topic(conn: &Connection, schema: &Schema, topic: &str) -> Result<usize> {
+    let tx = conn
+        .unchecked_transaction()
+        .with_context(|| format!("begin deletion for {topic}"))?;
+    let deleted = tx
+        .execute(
+            &format!(
+                "DELETE FROM {} WHERE session_id = ?1",
+                schema.events_table()
+            ),
+            params![topic],
+        )
+        .with_context(|| format!("delete events for {topic}"))?;
+    tx.execute(
         &format!(
             "DELETE FROM {} WHERE session_id = ?1",
             schema.attachments_table()
         ),
         params![topic],
-    ) {
-        warn!(target: "events", "delete attachments {topic}: {e}");
-    }
-    if let Err(e) = conn.execute(
+    )
+    .with_context(|| format!("delete attachments for {topic}"))?;
+    tx.execute(
         &format!(
             "DELETE FROM {} WHERE session_id = ?1",
             schema.pending_attachments_table()
         ),
         params![topic],
-    ) {
-        warn!(target: "events", "delete pending attachments {topic}: {e}");
-    }
-    deleted
+    )
+    .with_context(|| format!("delete pending attachments for {topic}"))?;
+    tx.commit()
+        .with_context(|| format!("commit deletion for {topic}"))?;
+    Ok(deleted)
 }
 
 #[cfg(test)]

@@ -262,6 +262,42 @@ impl EventStore {
         Ok(())
     }
 
+    /// Append a group of events as one durable visibility boundary.
+    ///
+    /// Imported-history settlement uses this for its terminal marker and
+    /// agent-session assignment: neither row may survive unless both rows do.
+    pub fn record_batch(&self, session_id: &str, records: &[(u64, &Event)]) -> Result<()> {
+        let encoded = records
+            .iter()
+            .map(|(seq, event)| {
+                serde_json::to_string(event)
+                    .with_context(|| format!("serialise event for {session_id}@{seq}"))
+                    .map(|json| (*seq, json))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let tx = conn
+            .transaction()
+            .with_context(|| format!("begin event batch for {session_id}"))?;
+        for (seq, json) in &encoded {
+            events::insert_event(&tx, &self.schema, session_id, *seq, json, now_ms)?;
+        }
+        events::prune_retention(
+            &tx,
+            &self.schema,
+            session_id,
+            self.max_events_per_session,
+            NON_SUBSTANTIVE_EVENT_DISCRIMINANTS,
+        );
+        tx.commit()
+            .with_context(|| format!("commit event batch for {session_id}"))?;
+        Ok(())
+    }
+
     /// Test-only: record an event with an explicit `created_at` (ms epoch)
     /// so recency-sensitive probes (e.g. the background-agent staleness bound
     /// in `has_in_flight_turn`) can be exercised deterministically.
@@ -1826,19 +1862,26 @@ impl EventStore {
     /// deleted or its view is switched away from structured view, so the
     /// next acp_enable starts fresh from seq=1.
     pub fn delete_session(&self, session_id: &str) {
+        let _ = self.try_delete_session(session_id);
+    }
+
+    /// Fallible form used by imported-history recovery, where replay cannot
+    /// safely restart until the partial transcript is durably gone.
+    pub fn try_delete_session(&self, session_id: &str) -> Result<()> {
         let conn = match self.conn.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
         // Cascades to attachment blobs so a deleted session leaves no
         // orphaned bytes behind.
-        let deleted = events::delete_topic(&conn, &self.schema, session_id);
+        let deleted = events::try_delete_topic(&conn, &self.schema, session_id)?;
         debug!(
             target: "acp.event_store",
             session = %session_id,
             deleted,
             "deleted session events"
         );
+        Ok(())
     }
 }
 
@@ -2028,6 +2071,48 @@ mod tests {
             prompt_id: None,
             text: text.into(),
             attachments: vec![],
+        }
+    }
+
+    #[test]
+    fn imported_settlement_batch_rolls_back_first_or_second_write_failure() {
+        let terminal = Event::Stopped {
+            reason: "history_replay_complete".into(),
+        };
+        let assignment = Event::AcpSessionAssigned {
+            acp_session_id: "11111111-1111-4111-8111-111111111111".into(),
+        };
+        for fail_seq in [1, 2] {
+            let (_tmp, store) = open_store(1000);
+            {
+                let conn = store.conn.lock().unwrap();
+                conn.execute_batch(&format!(
+                    "CREATE TRIGGER fail_import_settlement
+                     BEFORE INSERT ON {}
+                     WHEN NEW.session_id = 'imported' AND NEW.seq = {fail_seq}
+                     BEGIN SELECT RAISE(FAIL, 'injected settlement failure'); END;",
+                    store.schema.events_table()
+                ))
+                .unwrap();
+            }
+
+            assert!(store
+                .record_batch("imported", &[(1, &terminal), (2, &assignment)])
+                .is_err());
+            assert!(
+                store.replay_from("imported", 0).is_empty(),
+                "failed write {fail_seq} left a partial settlement"
+            );
+
+            {
+                let conn = store.conn.lock().unwrap();
+                conn.execute_batch("DROP TRIGGER fail_import_settlement")
+                    .unwrap();
+            }
+            store
+                .record_batch("imported", &[(1, &terminal), (2, &assignment)])
+                .unwrap();
+            assert_eq!(store.replay_from("imported", 0).len(), 2);
         }
     }
 
