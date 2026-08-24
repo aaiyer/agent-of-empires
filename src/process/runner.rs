@@ -351,7 +351,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     // Fan-out task: reads agent stdout and either forwards to the
     // currently-attached daemon or buffers in the ring. Single owner of
     // the read half of the agent's stdout pipe.
-    let agent_stdout_task = tokio::spawn(fanout_agent_stdout(
+    let mut agent_stdout_task = tokio::spawn(fanout_agent_stdout(
         agent_stdout,
         Arc::clone(&shared),
         args.session_id.clone(),
@@ -527,6 +527,27 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
                 }
                 self_terminate_agent_tree(reason, &session_id, our_pid, &mut agent_child).await;
             }
+        }
+        fanout = &mut agent_stdout_task => {
+            match fanout {
+                Ok(Ok(())) => info!(
+                    target: "acp.runner",
+                    session = %session_id,
+                    "agent stdout ended; runner shutting down"
+                ),
+                Ok(Err(error)) => warn!(
+                    target: "acp.runner",
+                    session = %session_id,
+                    "agent stdout fanout failed: {error}; runner shutting down"
+                ),
+                Err(error) => warn!(
+                    target: "acp.runner",
+                    session = %session_id,
+                    "agent stdout fanout task failed: {error}; runner shutting down"
+                ),
+            }
+            let _ = agent_child.start_kill();
+            let _ = agent_child.wait().await;
         }
         _ = accept_loop => {
             warn!(target: "acp.runner", session = %session_id, "accept loop exited unexpectedly");
@@ -1661,6 +1682,7 @@ impl RunnerShared {
     }
 
     async fn settle_history_replay(&self, replay_token: &str) {
+        let _delivery = self.relay_delivery.lock().await;
         let mut pending = self.history_replay.lock().await;
         if pending
             .as_ref()
@@ -1985,7 +2007,7 @@ async fn fanout_agent_stdout(
     stdout: tokio::process::ChildStdout,
     shared: Arc<RunnerShared>,
     session_id: String,
-) {
+) -> Result<()> {
     let mut reader = BufReader::with_capacity(STDOUT_READ_BUF, stdout);
     let mut line = Vec::with_capacity(4096);
     loop {
@@ -1994,7 +2016,7 @@ async fn fanout_agent_stdout(
         match read_frame_bounded(&mut reader, &mut line).await {
             Ok(0) => {
                 debug!(target: "acp.runner", session = %session_id, "agent stdout EOF");
-                break;
+                return Ok(());
             }
             Ok(_) => {
                 if !shared.deliver_line(&line).await {
@@ -2003,12 +2025,12 @@ async fn fanout_agent_stdout(
                         session = %session_id,
                         "relay delivery exhausted; leaving imported replay unsettled"
                     );
-                    break;
+                    return Err(anyhow!("relay delivery exhausted"));
                 }
             }
             Err(e) => {
                 warn!(target: "acp.runner", session = %session_id, "stdout read error: {e}");
-                break;
+                return Err(e.into());
             }
         }
     }
@@ -2465,7 +2487,10 @@ mod tests {
         drop(daemon_read);
         drop(daemon_write);
         handler.await.expect("control handler");
-        fanout.await.expect("agent stdout fanout");
+        fanout
+            .await
+            .expect("agent stdout fanout task")
+            .expect("agent stdout fanout");
         child.wait().await.expect("fixture exits");
         (outcome, shared)
     }
@@ -2644,7 +2669,10 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$AOE_TEST_RESPONSE_ID"
         drop(control_write);
         relay_handler.await.expect("relay handler");
         control_handler.await.expect("control handler");
-        fanout.await.expect("stdout fanout");
+        fanout
+            .await
+            .expect("stdout fanout task")
+            .expect("stdout fanout");
         child.wait().await.expect("fixture exits");
     }
 
@@ -2704,7 +2732,47 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$AOE_TEST_RESPONSE_ID"
     }
 
     #[tokio::test]
-    async fn pending_exhaustion_leaves_history_replay_unsettled_without_barrier() {
+    async fn settlement_ack_waits_for_visible_barrier_state() {
+        const TOKEN: &str = "66666666-6666-4666-8666-666666666666";
+        let shared = Arc::new(RunnerShared::new());
+        *shared.history_replay.lock().await = Some(PendingHistoryReplayState {
+            replay: vec![b"replay\n".to_vec()].into(),
+            next_line: 1,
+            acp_session_id: "stored-history".into(),
+            replay_token: TOKEN.into(),
+            running: true,
+            barrier_delivered: false,
+            failed: false,
+        });
+
+        // Barrier delivery holds this exact gate from socket visibility through
+        // its durable in-memory commit. An immediate acknowledgement must wait
+        // behind that commit instead of observing `barrier_delivered = false`
+        // and being discarded.
+        let delivery = shared.relay_delivery.lock().await;
+        let settle_shared = Arc::clone(&shared);
+        let mut settlement =
+            tokio::spawn(async move { settle_shared.settle_history_replay(TOKEN).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut settlement)
+                .await
+                .is_err(),
+            "settlement acknowledgement must serialize behind barrier delivery"
+        );
+        shared
+            .history_replay
+            .lock()
+            .await
+            .as_mut()
+            .expect("unsettled replay")
+            .barrier_delivered = true;
+        drop(delivery);
+        settlement.await.expect("settlement task");
+        assert!(shared.history_replay.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn fanout_exhaustion_leaves_no_barrier_and_allows_clean_runner_retry() {
         const TOKEN: &str = "55555555-5555-4555-8555-555555555555";
         let shared = Arc::new(RunnerShared::new());
         *shared.history_replay.lock().await = Some(PendingHistoryReplayState {
@@ -2721,7 +2789,21 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$AOE_TEST_RESPONSE_ID"
             .lock()
             .await
             .push_back(vec![b'x'; MAX_PENDING_BYTES]));
-        assert!(!shared.deliver_line(b"overflow\n").await);
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("printf 'overflow\\n'")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn overflow fixture");
+        let error = fanout_agent_stdout(
+            child.stdout.take().expect("overflow fixture stdout"),
+            Arc::clone(&shared),
+            "overflow-session".into(),
+        )
+        .await
+        .expect_err("bounded fanout exhaustion must terminate the runner path");
+        assert_eq!(error.to_string(), "relay delivery exhausted");
+        child.wait().await.expect("overflow fixture exits");
 
         let (daemon, runner) = UnixStream::pair().expect("relay");
         let (mut daemon_read, _daemon_write) = daemon.into_split();
@@ -2735,11 +2817,101 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$AOE_TEST_RESPONSE_ID"
         )
         .await
         .is_err());
-        let replay = shared.history_replay.lock().await;
-        let replay = replay.as_ref().expect("failed replay remains retryable");
-        assert!(replay.failed);
-        assert!(!replay.barrier_delivered);
-        assert_eq!(replay.next_line, 0);
+        {
+            let replay = shared.history_replay.lock().await;
+            let replay = replay.as_ref().expect("failed replay remains retryable");
+            assert!(replay.failed);
+            assert!(!replay.barrier_delivered);
+            assert_eq!(replay.next_line, 0);
+        }
+        drop(daemon_read);
+
+        // The main runner select treats the fanout error above as terminal.
+        // A replacement runner starts from clean state and can replay and
+        // settle the same imported load exactly once.
+        let retry = Arc::new(RunnerShared::new());
+        retry
+            .schedule_history_replay(
+                vec![b"replay\n".to_vec()].into(),
+                "stored-history".into(),
+                TOKEN.into(),
+            )
+            .await
+            .expect("schedule clean retry");
+        tokio::task::yield_now().await;
+        let (retry_daemon, retry_runner) = UnixStream::pair().expect("retry relay");
+        let (retry_read, _retry_write) = retry_daemon.into_split();
+        let (_runner_read, runner_write) = retry_runner.into_split();
+        assert!(retry.install_outbound(runner_write).await.is_none());
+        retry.resume_history_replay().await;
+        let mut reader = BufReader::new(retry_read);
+        let mut replay_line = String::new();
+        tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut replay_line))
+            .await
+            .expect("retried replay timeout")
+            .expect("read retried replay");
+        assert_eq!(replay_line, "replay\n");
+        let mut barrier_line = String::new();
+        tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut barrier_line))
+            .await
+            .expect("retried barrier timeout")
+            .expect("read retried barrier");
+        let barrier: serde_json::Value =
+            serde_json::from_str(&barrier_line).expect("typed retried barrier");
+        assert_eq!(
+            barrier["params"]["update"]["_meta"][HISTORY_REPLAY_META_KEY],
+            TOKEN
+        );
+        retry.settle_history_replay(TOKEN).await;
+        assert!(retry.history_replay.lock().await.is_none());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fanout_exhaustion_terminates_runner_and_cleans_registry_for_retry() {
+        const SESSION: &str = "77777777-7777-4777-8777-777777777777";
+        let home = tempfile::tempdir().expect("isolated runner home");
+        let _environment =
+            crate::session::test_support::EnvGuard::set(&[("XDG_CONFIG_HOME", home.path())]);
+        let socket = worker_registry::socket_path_for(SESSION).expect("runner socket");
+        let overflow = format!(
+            "{{ dd if=/dev/zero bs=1048576 count=63 2>/dev/null; \
+             dd if=/dev/zero bs=1048575 count=1 2>/dev/null; \
+             printf '\\n'; }} | tr '\\000' x; printf 'overflow\\n'; IFS= read -r ignored"
+        );
+        let args = AcpRunnerArgs {
+            socket: socket.clone(),
+            session_id: SESSION.into(),
+            agent_name: "bounded-overflow-fixture".into(),
+            agent_key: "fixture".into(),
+            cwd: home.path().to_path_buf(),
+            model: None,
+            additional_dirs: Vec::new(),
+            provider_env_keys: Vec::new(),
+            stored_acp_session_id: None,
+            source_profile: String::new(),
+            agent_argv: vec!["sh".into(), "-c".into(), overflow],
+        };
+
+        tokio::time::timeout(Duration::from_secs(20), run(args.clone()))
+            .await
+            .expect("runner must terminate after fanout exhaustion")
+            .expect("runner teardown succeeds");
+        assert!(!socket.exists(), "runner relay socket must be removed");
+        assert!(
+            !worker_registry::record_path(SESSION)
+                .expect("runner record")
+                .exists(),
+            "runner registry must be removed"
+        );
+
+        let mut retry = args;
+        retry.agent_argv = vec!["sh".into(), "-c".into(), "exit 0".into()];
+        tokio::time::timeout(Duration::from_secs(5), run(retry))
+            .await
+            .expect("fresh runner must reuse the cleaned identity")
+            .expect("fresh runner exits cleanly");
+        assert!(!socket.exists(), "retry relay socket must also be removed");
     }
 
     #[tokio::test]
