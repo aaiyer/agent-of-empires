@@ -10,6 +10,13 @@ use std::fs;
 use super::config::Config;
 use super::get_profile_dir;
 
+pub const MAYA_PROFILE_NAME: &str = "maya";
+pub const MAYA_TERMINAL_COMMAND: &str =
+    "/usr/bin/sudo -n -H -u maya-aoe-terminal -- /bin/bash --login";
+pub const MAYA_TERMINAL_HOME: &str = "/maya-data/aoe/terminal";
+pub const MAYA_TERMINAL_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+pub const MAYA_TERMINAL_SHELL: &str = "/bin/bash";
+
 /// Profile-specific settings, stored as a sparse override tree (#1692).
 ///
 /// Every override is a section table keyed by config-section name (e.g.

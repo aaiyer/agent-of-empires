@@ -173,6 +173,11 @@ impl PairedTerminal {
             return Ok(());
         }
         let config = crate::tmux::tmux_option_config(profile);
+        let maya_terminal = matches!(self.kind, TerminalKind::Host)
+            && profile == crate::session::profile_config::MAYA_PROFILE_NAME;
+        if maya_terminal && command.is_some() {
+            bail!("Maya host terminals reject caller-supplied commands");
+        }
 
         // Host terminals pin the pane's HOME/SHELL/PATH and launch the user's
         // login shell explicitly, so they never inherit a stale value from the
@@ -189,11 +194,28 @@ impl PairedTerminal {
         // only then so tmux never fails `new-session` on an unusable shell. The
         // pane's SHELL env and login command prefer that resolved path but fall
         // back to the raw name so a pane still launches when it cannot resolve.
-        let host_shell = matches!(self.kind, TerminalKind::Host).then(user_shell);
+        let host_shell = if maya_terminal {
+            Some(crate::session::profile_config::MAYA_TERMINAL_SHELL.to_string())
+        } else {
+            matches!(self.kind, TerminalKind::Host).then(user_shell)
+        };
         let default_shell = host_shell.as_deref().and_then(absolute_shell);
         let shell_for_pane = default_shell.as_deref().or(host_shell.as_deref());
-        let home = std::env::var("HOME").unwrap_or_default();
-        let path = std::env::var("PATH").unwrap_or_default();
+        let home = if maya_terminal {
+            crate::session::profile_config::MAYA_TERMINAL_HOME.to_string()
+        } else {
+            std::env::var("HOME").unwrap_or_default()
+        };
+        let path = if maya_terminal {
+            crate::session::profile_config::MAYA_TERMINAL_PATH.to_string()
+        } else {
+            std::env::var("PATH").unwrap_or_default()
+        };
+        let command = if maya_terminal {
+            Some(crate::session::profile_config::MAYA_TERMINAL_COMMAND)
+        } else {
+            command
+        };
         let (pinned_pairs, effective_cmd) = host_pane_inputs(shell_for_pane, command, &home, &path);
         // Host terminals also forward the inherited host env (DISPLAY, XDG_*,
         // DBUS, ... plus every other var under `session.inherit_host_environment`)
@@ -688,6 +710,31 @@ mod tests {
         // Env is still pinned, but an explicit command is not overridden.
         assert!(env.contains(&("SHELL".to_string(), "/bin/zsh".to_string())));
         assert_eq!(cmd.as_deref(), Some("htop"));
+    }
+
+    #[test]
+    fn maya_terminal_uses_its_dedicated_login_identity() {
+        let (env, command) = host_pane_inputs(
+            Some(crate::session::profile_config::MAYA_TERMINAL_SHELL),
+            Some(crate::session::profile_config::MAYA_TERMINAL_COMMAND),
+            crate::session::profile_config::MAYA_TERMINAL_HOME,
+            crate::session::profile_config::MAYA_TERMINAL_PATH,
+        );
+        assert_eq!(
+            env,
+            vec![
+                ("HOME".to_string(), "/maya-data/aoe/terminal".to_string(),),
+                (
+                    "PATH".to_string(),
+                    "/usr/local/bin:/usr/bin:/bin".to_string(),
+                ),
+                ("SHELL".to_string(), "/bin/bash".to_string()),
+            ]
+        );
+        assert_eq!(
+            command.as_deref(),
+            Some("/usr/bin/sudo -n -H -u maya-aoe-terminal -- /bin/bash --login")
+        );
     }
 
     #[test]

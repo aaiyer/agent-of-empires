@@ -14,7 +14,11 @@ use std::sync::Arc;
 
 use super::AppState;
 
-pub const PROFILE_NAME: &str = "maya";
+pub use crate::session::profile_config::{
+    MAYA_PROFILE_NAME as PROFILE_NAME, MAYA_TERMINAL_COMMAND as TERMINAL_COMMAND,
+    MAYA_TERMINAL_HOME as TERMINAL_HOME, MAYA_TERMINAL_PATH as TERMINAL_PATH,
+    MAYA_TERMINAL_SHELL as TERMINAL_SHELL,
+};
 pub const PROJECT_PATH: &str = "/home/aaiyer/maya/maya-main";
 pub const MAGIC_DNS_HOST: &str = "maya-devbox.tail564f89.ts.net";
 pub const MAGIC_DNS_ORIGIN: &str = "https://maya-devbox.tail564f89.ts.net";
