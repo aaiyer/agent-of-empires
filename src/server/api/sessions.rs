@@ -5215,6 +5215,9 @@ pub struct MayaImportSessionBody {
 
 #[derive(Serialize)]
 pub struct MayaImportSessionResponse {
+    schema: u8,
+    #[serde(rename = "type")]
+    kind: &'static str,
     session: SessionResponse,
     source_t3_thread_id: String,
     source_catalog_sha256: String,
@@ -5338,6 +5341,8 @@ pub async fn maya_import_session(
         return (
             StatusCode::OK,
             Json(MayaImportSessionResponse {
+                schema: 1,
+                kind: "maya_aoe_import_session_projection",
                 session: SessionResponse::from_instance(
                     &existing,
                     crate::claude_settings::read_tui_fullscreen(),
@@ -5405,6 +5410,8 @@ pub async fn maya_import_session(
         Ok((outcome, _)) => (
             StatusCode::CREATED,
             Json(MayaImportSessionResponse {
+                schema: 1,
+                kind: "maya_aoe_import_session_projection",
                 session: SessionResponse::from_instance(
                     &outcome.instance,
                     crate::claude_settings::read_tui_fullscreen(),
@@ -7975,6 +7982,23 @@ pub async fn serve_session_artifact(Path((id, path)): Path<(String, String)>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maya_import_response_carries_the_migration_projection_discriminator() {
+        let instance = Instance::new("Imported", crate::server::maya_restricted::PROJECT_PATH);
+        let response = MayaImportSessionResponse {
+            schema: 1,
+            kind: "maya_aoe_import_session_projection",
+            session: SessionResponse::from_instance(&instance, false),
+            source_t3_thread_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+            source_catalog_sha256: "a".repeat(64),
+            managed_codex_session_id: "11111111-1111-4111-8111-111111111111".into(),
+        };
+        let document = serde_json::to_value(response).expect("serialize import projection");
+        assert_eq!(document["schema"], 1);
+        assert_eq!(document["type"], "maya_aoe_import_session_projection");
+    }
+
     fn build_rename_test_state(
         persisted: Vec<Instance>,
         cached: Vec<Instance>,

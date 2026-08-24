@@ -1979,7 +1979,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             drop(client);
             return Err(SupervisorError::SpawnCancelled(session_id));
         }
-        let drain_task = self.start_drain_task(session_id.clone(), inbound);
+        let drain_task =
+            self.start_drain_task(session_id.clone(), inbound, config.seed_history_replay);
         let client_for_mode = (acp_mode_id.is_some() || yolo_mode).then(|| Arc::clone(&client));
         workers.insert(
             session_id.clone(),
@@ -2042,6 +2043,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         session_id: String,
         initial_inbound: mpsc::Receiver<Event>,
+        seed_history_replay: bool,
     ) -> JoinHandle<()> {
         let sink = Arc::clone(&self.sink);
         let workers = Arc::clone(&self.workers);
@@ -2079,6 +2081,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                     // #1281.
                     let mut rate_limited = false;
                     let mut history_replay_terminal = None;
+                    let mut seeded_replay_unsettled = seed_history_replay;
                     while let Some(event) = inbound.recv().await {
                         if let Event::Stopped { reason } = &event {
                             if reason == "agent_unresponsive"
@@ -2104,6 +2107,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                             &session_id,
                             &event,
                             &mut history_replay_terminal,
+                            &mut seeded_replay_unsettled,
                         ) {
                             agent_unresponsive = true;
                             break;
@@ -3193,7 +3197,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             drop(client);
             return Err(SupervisorError::SpawnCancelled(session_id));
         }
-        let drain_task = self.start_drain_task(session_id.clone(), inbound);
+        let drain_task = self.start_drain_task(session_id.clone(), inbound, seed_history_replay);
         workers.insert(
             session_id.clone(),
             WorkerHandle {
@@ -3589,6 +3593,7 @@ fn publish_worker_event<S: BroadcastSink>(
     session_id: &str,
     event: &Event,
     history_replay_terminal: &mut Option<(u64, Event)>,
+    seeded_replay_unsettled: &mut bool,
 ) -> bool {
     let is_history_terminal = matches!(
         event,
@@ -3613,11 +3618,20 @@ fn publish_worker_event<S: BroadcastSink>(
             let _ = sink.clear_session_events(session_id);
             return false;
         }
+        *seeded_replay_unsettled = false;
         return true;
     }
     let seq = next_seq(next_seqs, session_id);
-    sink.publish(session_id, seq, event);
-    true
+    if *seeded_replay_unsettled {
+        if !sink.publish_persisted(session_id, seq, event) {
+            let _ = sink.clear_session_events(session_id);
+            return false;
+        }
+        true
+    } else {
+        sink.publish(session_id, seq, event);
+        true
+    }
 }
 
 /// A `BroadcastSink` impl backed by a tokio broadcast channel. The
@@ -4038,6 +4052,47 @@ mod tests {
         }
     }
 
+    struct FailingReplayEventSink {
+        cleared: std::sync::atomic::AtomicBool,
+    }
+
+    impl BroadcastSink for FailingReplayEventSink {
+        fn publish(&self, _session_id: &str, _seq: u64, _event: &Event) {}
+
+        fn publish_persisted(&self, _session_id: &str, _seq: u64, _event: &Event) -> bool {
+            false
+        }
+
+        fn clear_session_events(&self, _session_id: &str) -> bool {
+            self.cleared
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+    }
+
+    #[test]
+    fn imported_replay_does_not_settle_after_nonterminal_write_failure() {
+        let sink = FailingReplayEventSink {
+            cleared: std::sync::atomic::AtomicBool::new(false),
+        };
+        let seqs = std::sync::Mutex::new(HashMap::new());
+        let mut terminal = None;
+        let mut unsettled = true;
+        assert!(!publish_worker_event(
+            &sink,
+            &seqs,
+            "imported",
+            &Event::AgentMessageChunk {
+                text: "imported answer".into(),
+            },
+            &mut terminal,
+            &mut unsettled,
+        ));
+        assert!(unsettled);
+        assert!(terminal.is_none());
+        assert!(sink.cleared.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
     #[test]
     fn imported_replay_retries_terminal_or_assignment_write_as_one_transcript() {
         let replay = [
@@ -4059,8 +4114,16 @@ mod tests {
             };
             let seqs = std::sync::Mutex::new(HashMap::new());
             let mut first_terminal = None;
+            let mut first_unsettled = true;
             assert!(replay.iter().any(|event| {
-                !publish_worker_event(&sink, &seqs, "imported", event, &mut first_terminal)
+                !publish_worker_event(
+                    &sink,
+                    &seqs,
+                    "imported",
+                    event,
+                    &mut first_terminal,
+                    &mut first_unsettled,
+                )
             }));
             assert!(
                 sink.events.lock().unwrap().is_empty(),
@@ -4068,6 +4131,7 @@ mod tests {
             );
 
             let mut retry_terminal = None;
+            let mut retry_unsettled = true;
             for event in &replay {
                 assert!(publish_worker_event(
                     &sink,
@@ -4075,8 +4139,10 @@ mod tests {
                     "imported",
                     event,
                     &mut retry_terminal,
+                    &mut retry_unsettled,
                 ));
             }
+            assert!(!retry_unsettled);
             let settled = sink.events.lock().unwrap();
             assert_eq!(settled.len(), replay.len());
             assert!(matches!(settled[0], Event::AgentMessageChunk { .. }));
@@ -5268,7 +5334,7 @@ cursor-acp-bridge = "agent acp"
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Event>(16);
         let (client, _client_tx) = AcpClient::fake_for_test(AcpSessionId("s-rl".into()));
         let client = Arc::new(client);
-        let drain = sup.start_drain_task("s-rl".into(), inbound_rx);
+        let drain = sup.start_drain_task("s-rl".into(), inbound_rx, false);
         {
             let mut workers = sup.workers.lock().await;
             workers.insert(

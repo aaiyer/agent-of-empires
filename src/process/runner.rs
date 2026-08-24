@@ -813,6 +813,7 @@ struct PendingHistoryReplayState {
     replay_token: String,
     running: bool,
     barrier_delivered: bool,
+    failed: bool,
 }
 
 impl ReplayCapture {
@@ -1036,7 +1037,14 @@ impl RunnerShared {
             .as_ref()
             .is_some_and(|replay| !replay.barrier_delivered)
         {
-            return self.pending.lock().await.push_back(line.to_vec());
+            let accepted = self.pending.lock().await.push_back(line.to_vec());
+            if !accepted {
+                if let Some(replay) = self.history_replay.lock().await.as_mut() {
+                    replay.failed = true;
+                    replay.running = false;
+                }
+            }
+            return accepted;
         }
 
         let outbound = self.active_outbound.lock().await.take();
@@ -1524,6 +1532,7 @@ impl RunnerShared {
                 replay_token,
                 running: false,
                 barrier_delivered: false,
+                failed: false,
             });
         }
         drop(pending);
@@ -1554,6 +1563,15 @@ impl RunnerShared {
 
     async fn deliver_replay_step(&self, token: &str, line: &[u8], barrier: bool) -> bool {
         let _delivery = self.relay_delivery.lock().await;
+        if self
+            .history_replay
+            .lock()
+            .await
+            .as_ref()
+            .is_none_or(|replay| replay.replay_token != token || replay.failed)
+        {
+            return false;
+        }
         let outbound = self.active_outbound.lock().await.take();
         let Some(mut out) = outbound else {
             return false;
@@ -1597,7 +1615,7 @@ impl RunnerShared {
             let Some(replay) = pending.as_mut() else {
                 return;
             };
-            if replay.running || replay.barrier_delivered {
+            if replay.running || replay.barrier_delivered || replay.failed {
                 return;
             }
             replay.running = true;
@@ -1979,7 +1997,14 @@ async fn fanout_agent_stdout(
                 break;
             }
             Ok(_) => {
-                shared.deliver_line(&line).await;
+                if !shared.deliver_line(&line).await {
+                    warn!(
+                        target: "acp.runner",
+                        session = %session_id,
+                        "relay delivery exhausted; leaving imported replay unsettled"
+                    );
+                    break;
+                }
             }
             Err(e) => {
                 warn!(target: "acp.runner", session = %session_id, "stdout read error: {e}");
@@ -2676,6 +2701,45 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$AOE_TEST_RESPONSE_ID"
         });
         assert!(shared.install_outbound(runner_write).await.is_none());
         assert_eq!(read.await.expect("reader task"), line);
+    }
+
+    #[tokio::test]
+    async fn pending_exhaustion_leaves_history_replay_unsettled_without_barrier() {
+        const TOKEN: &str = "55555555-5555-4555-8555-555555555555";
+        let shared = Arc::new(RunnerShared::new());
+        *shared.history_replay.lock().await = Some(PendingHistoryReplayState {
+            replay: vec![b"replay\n".to_vec()].into(),
+            next_line: 0,
+            acp_session_id: "stored-history".into(),
+            replay_token: TOKEN.into(),
+            running: false,
+            barrier_delivered: false,
+            failed: false,
+        });
+        assert!(shared
+            .pending
+            .lock()
+            .await
+            .push_back(vec![b'x'; MAX_PENDING_BYTES]));
+        assert!(!shared.deliver_line(b"overflow\n").await);
+
+        let (daemon, runner) = UnixStream::pair().expect("relay");
+        let (mut daemon_read, _daemon_write) = daemon.into_split();
+        let (_runner_read, runner_write) = runner.into_split();
+        assert!(shared.install_outbound(runner_write).await.is_none());
+        shared.resume_history_replay().await;
+        let mut byte = [0_u8; 1];
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            tokio::io::AsyncReadExt::read_exact(&mut daemon_read, &mut byte),
+        )
+        .await
+        .is_err());
+        let replay = shared.history_replay.lock().await;
+        let replay = replay.as_ref().expect("failed replay remains retryable");
+        assert!(replay.failed);
+        assert!(!replay.barrier_delivered);
+        assert_eq!(replay.next_line, 0);
     }
 
     #[tokio::test]
