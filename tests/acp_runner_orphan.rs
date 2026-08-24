@@ -21,6 +21,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
+
 /// App data dir for the debug binary under this test's env. The runner sees
 /// `XDG_CONFIG_HOME`, so macOS follows the same XDG path as Linux.
 fn app_dir(home: &Path, xdg: &Path) -> PathBuf {
@@ -54,6 +57,20 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct KillSessionOnDrop(Child);
+
+#[cfg(target_os = "linux")]
+impl Drop for KillSessionOnDrop {
+    fn drop(&mut self) {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-(self.0.id() as i32)),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = self.0.wait();
     }
 }
 
@@ -238,5 +255,125 @@ fn superseded_runner_exits_without_deleting_replacement_record() {
     assert!(
         record.exists(),
         "superseded runner deleted the replacement runner's registry record"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fanout_failure_kills_resistant_descendants_and_allows_same_session_relaunch() {
+    let scratch = Scratch::new("fanout");
+    let home = scratch.0.join("home");
+    let xdg = scratch.0.join("xdg");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg).unwrap();
+
+    let session_id = "sfanout1";
+    let workers = app_dir(&home, &xdg).join("acp-workers");
+    let socket = workers.join(format!("{session_id}.sock"));
+    let record = workers.join(format!("{session_id}.json"));
+    let descendant_marker = scratch.0.join("descendant.pid");
+    let descendant_ready = scratch.0.join("descendant.ready");
+    let script = format!(
+        "trap '' HUP INT TERM; \
+         (trap '' HUP INT TERM; : > '{}'; \
+          while :; do sleep 1; done) & \
+         descendant=$!; while ! test -f '{}'; do sleep 0.01; done; \
+         printf '%s\\n' \"$descendant\" > '{}'; \
+         {{ dd if=/dev/zero bs=1048576 count=63 2>/dev/null; \
+            dd if=/dev/zero bs=1048575 count=1 2>/dev/null; printf '\\n'; }} \
+          | tr '\\000' x; \
+         printf 'overflow\\n'; IFS= read -r ignored",
+        descendant_ready.display(),
+        descendant_ready.display(),
+        descendant_marker.display()
+    );
+    let bin = env!("CARGO_BIN_EXE_aoe");
+    let mut command = Command::new(bin);
+    command
+        .args([
+            "__acp-runner",
+            "--socket",
+            socket.to_str().unwrap(),
+            "--session-id",
+            session_id,
+            "--agent-name",
+            "fanout-failure-agent",
+            "--cwd",
+            home.to_str().unwrap(),
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg);
+    // SAFETY: `setsid` is async-signal-safe and the closure touches no shared
+    // memory. Production uses the same session-leader topology.
+    unsafe {
+        command.pre_exec(|| {
+            nix::unistd::setsid()
+                .map(|_| ())
+                .map_err(std::io::Error::other)
+        });
+    }
+    let mut runner = KillSessionOnDrop(command.spawn().expect("spawn session-owned runner"));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !record.exists() || !descendant_marker.exists() {
+        if let Ok(Some(status)) = runner.0.try_wait() {
+            panic!("runner exited before the fanout fixture was ready: {status}");
+        }
+        assert!(
+            Instant::now() <= deadline,
+            "runner or resistant descendant never became ready"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let descendant_pid = std::fs::read_to_string(&descendant_marker)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+
+    assert_exits_within(
+        &mut runner.0,
+        15,
+        "runner did not terminate after stdout fanout exhaustion",
+    );
+    assert_pid_gone_within(
+        descendant_pid,
+        5,
+        "signal-resistant adapter descendant survived fanout failure teardown",
+    );
+    assert!(
+        !socket.exists(),
+        "failed runner left its relay socket behind"
+    );
+    assert!(
+        !record.exists(),
+        "failed runner left its registry record behind"
+    );
+
+    let (mut retry, retry_record) = spawn_runner_and_wait_for_record(&home, &xdg, session_id);
+    assert!(
+        socket.exists(),
+        "same-session relaunch did not bind its relay"
+    );
+    assert!(
+        retry_record.exists(),
+        "same-session relaunch did not publish its record"
+    );
+    Command::new("kill")
+        .args(["-TERM", &retry.id().to_string()])
+        .status()
+        .expect("terminate same-session retry");
+    assert_exits_within(&mut retry, 10, "same-session retry did not stop cleanly");
+    assert!(
+        !socket.exists(),
+        "same-session retry left its relay socket behind"
+    );
+    assert!(
+        !record.exists(),
+        "same-session retry left its registry record behind"
     );
 }

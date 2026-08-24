@@ -118,6 +118,8 @@ enum WatchdogShutdown {
     Superseded,
     /// Detached past [`DETACHED_RETENTION`] with no daemon reattaching.
     DetachedRetentionExpired,
+    /// Agent stdout ended or failed, so the runner can no longer relay output.
+    StdoutFanoutEnded,
 }
 
 /// Bounds for relay data retained while a daemon is detached and for the
@@ -546,8 +548,12 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
                     "agent stdout fanout task failed: {error}; runner shutting down"
                 ),
             }
-            let _ = agent_child.start_kill();
-            let _ = agent_child.wait().await;
+            self_terminate_agent_tree(
+                WatchdogShutdown::StdoutFanoutEnded,
+                &session_id,
+                our_pid,
+                &mut agent_child,
+            ).await;
         }
         _ = accept_loop => {
             warn!(target: "acp.runner", session = %session_id, "accept loop exited unexpectedly");
@@ -640,7 +646,7 @@ async fn run_watchdog(
     }
 }
 
-/// Tear down the agent process tree after the watchdog flags abandonment.
+/// Tear down the agent process tree after a fatal runner condition.
 /// Politely SIGTERMs the agent, waits briefly, then SIGKILLs the whole
 /// process group (runner + node wrapper + `claude` grandchild) so nothing
 /// is left orphaned under PID 1.
@@ -654,7 +660,7 @@ async fn self_terminate_agent_tree(
         target: "acp.runner",
         session = %session_id,
         ?reason,
-        "runner abandoned; terminating agent tree"
+        "runner terminating agent tree"
     );
 
     // A superseded runner must NOT delete the registry/socket: those files
