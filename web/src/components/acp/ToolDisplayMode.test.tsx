@@ -35,9 +35,9 @@ import {
   useToolDisplayMode,
   type ToolDensity,
 } from "./ToolDisplayMode";
-import { ToolCard } from "./ToolCards";
+import { TodoGroupCard, ToolCard } from "./ToolCards";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
-import { fixtures, makeError } from "./__fixtures__/toolCalls";
+import { fixtures, makeCompletion, makeError, makeToolCall } from "./__fixtures__/toolCalls";
 
 const STORAGE_KEY = "aoe.acp.toolDensity.v1";
 
@@ -152,5 +152,34 @@ describe("tool-card density", () => {
       </Wrap>,
     );
     expect(container.textContent).toContain("boom");
+  });
+
+  it("collapses a grouped todo preview to its header", () => {
+    const items = ["one", "two", "three"].map((content, index) => {
+      const id = `todo-${index}`;
+      return {
+        tool: makeToolCall({
+          id,
+          name: "TodoWrite",
+          kind: "other",
+          args_preview: JSON.stringify({ todos: [{ content, status: "in_progress" }] }),
+        }),
+        result: makeCompletion({ id: `done-${id}`, toolCallId: id }),
+      };
+    });
+    const { container, rerender } = render(
+      <Wrap density="detailed" toolKey="claude">
+        <TodoGroupCard items={items} />
+      </Wrap>,
+    );
+    expect(container.textContent).toContain("three");
+
+    rerender(
+      <Wrap density="compact" toolKey="claude">
+        <TodoGroupCard items={items} />
+      </Wrap>,
+    );
+    expect(container.textContent).toContain("updated 3 times");
+    expect(container.textContent).not.toContain("three");
   });
 });

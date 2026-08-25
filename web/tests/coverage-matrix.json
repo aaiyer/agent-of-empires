@@ -2390,7 +2390,7 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/acp/ToolDisplayMode.test.tsx"],
-      "components": ["web/src/components/acp/ToolDisplayMode.tsx"]
+      "components": ["web/src/components/acp/ToolDisplayMode.tsx", "web/src/components/acp/ToolCards.tsx"]
     },
     {
       "id": "acp.queued-prompt-expand-bounds",

@@ -62,8 +62,8 @@ function getDefaults(): WebSettings {
     collapsedDiffDirs: [],
     sidebarSide: "left",
     sidebarCompact: false,
-    autoOpenDiffPane: true,
-    autoOpenTerminalPane: true,
+    autoOpenDiffPane: false,
+    autoOpenTerminalPane: false,
     autoOpenPluginPanes: false,
   };
 }

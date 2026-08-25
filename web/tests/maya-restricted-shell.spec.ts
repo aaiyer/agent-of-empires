@@ -65,12 +65,24 @@ test("Maya reuses the normal shell while gating authority controls", async ({ pa
   await expect(page.getByTestId("sidebar-context-menu-delete")).toBeVisible();
   await expect(page.getByTestId("sidebar-context-menu-switch-agent")).toHaveCount(0);
   await expect(page.getByTestId("sidebar-context-menu-fork")).toHaveCount(0);
-  await expect(page.getByLabel("Settings")).toHaveCount(0);
+  await expect(page.getByLabel("Settings")).toBeVisible();
 
   await page.getByRole("heading", { name: "empires" }).click();
   await expect(page.getByTestId("sidebar-context-menu")).toHaveCount(0);
   await row.click();
   await expect(page.getByPlaceholder(/Type @ for files, \/ for commands/)).toBeVisible();
+  const diffToggle = page.getByTestId("pane-toggle-diff");
+  const terminalToggle = page.getByTestId("pane-toggle-terminal");
+  await expect(diffToggle).toBeVisible();
+  await expect(terminalToggle).toBeVisible();
+  await diffToggle.click();
+  await expect(diffToggle).toHaveAttribute("aria-pressed", "true");
+  await page.getByLabel("Close diff").click();
+  await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
+  await terminalToggle.click();
+  await expect(terminalToggle).toHaveAttribute("aria-pressed", "true");
+  await page.getByLabel("Close terminal").click();
+  await expect(terminalToggle).toHaveAttribute("aria-pressed", "false");
   await page.getByLabel("New project session").first().click();
   const wizard = page.getByTestId("session-wizard");
   await expect(wizard).toBeVisible();

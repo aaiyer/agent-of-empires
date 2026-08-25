@@ -1261,7 +1261,7 @@ interface TodoGroupChild {
  *  turn stays auditable. See #1468. */
 export function TodoGroupCard({ items }: { items: TodoGroupChild[] }) {
   const profile = useAgentProfile();
-  const [open, setOpen] = useState(false);
+  const density = useToolDisplayMode();
   const snapshots = useMemo(
     () =>
       items
@@ -1280,22 +1280,23 @@ export function TodoGroupCard({ items }: { items: TodoGroupChild[] }) {
         ),
     [items, profile],
   );
-  if (snapshots.length === 0) return null;
 
   // The collapsed preview shows the latest *successful* snapshot, since
   // a TodoWrite that ended in tool_error (or was interrupted by a stop,
   // tool_stopped; see #1646) never became the live state. The header
   // still reflects the latest attempt so a failed trailing update
   // surfaces as an error rather than looking clean. See #1468.
-  const latestAttempt = snapshots[snapshots.length - 1]!;
+  const latestAttempt = snapshots.at(-1);
   const latestSuccessful =
     [...snapshots].reverse().find((s) => s.result?.kind !== "tool_error" && s.result?.kind !== "tool_stopped") ?? null;
   const previewSnapshot = latestSuccessful ?? latestAttempt;
-  const latestFailed = latestAttempt.result?.kind === "tool_error";
-  const latestStopped = latestAttempt.result?.kind === "tool_stopped";
-  const breakdown = todoBreakdown(todoCounts(previewSnapshot.todos));
+  const latestFailed = latestAttempt?.result?.kind === "tool_error";
+  const latestStopped = latestAttempt?.result?.kind === "tool_stopped";
   const running = snapshots.some((s) => !s.result);
   const status: Status = running ? "running" : latestFailed ? "err" : latestStopped ? "stopped" : "ok";
+  const [open, setOpen] = useToolCardExpansion(status, false);
+  if (!latestAttempt || !previewSnapshot) return null;
+  const breakdown = todoBreakdown(todoCounts(previewSnapshot.todos));
 
   const startedAt = snapshots
     .map((s) => s.tool.started_at)
@@ -1325,7 +1326,11 @@ export function TodoGroupCard({ items }: { items: TodoGroupChild[] }) {
       onToggle={() => setOpen((v) => !v)}
       startedAt={startedAt}
       endedAt={endedAt}
-      subBody={previewSnapshot.result?.kind === "tool_error" ? undefined : <TodoList todos={previewSnapshot.todos} />}
+      subBody={
+        density === "compact" || previewSnapshot.result?.kind === "tool_error" ? undefined : (
+          <TodoList todos={previewSnapshot.todos} />
+        )
+      }
       body={
         <div className="border-t border-surface-800 bg-surface-900/30 px-2 py-1">
           {snapshots.map((s) => (

@@ -12,6 +12,12 @@ import { mockTerminalApis } from "./helpers/terminal-mocks";
 const SESSION = "pinch-test";
 
 async function openSession(page: Page) {
+  await page.addInitScript(() => {
+    window.localStorage.setItem(
+      "aoe-web-settings",
+      JSON.stringify({ autoOpenDiffPane: true, autoOpenTerminalPane: true }),
+    );
+  });
   await mockTerminalApis(page);
   await page.setViewportSize({ width: 1280, height: 720 });
 }

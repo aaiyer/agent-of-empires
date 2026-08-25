@@ -2270,8 +2270,8 @@ function AppContent({
             for every view that cannot collapse. */}
         <CollapsibleRegion id="conversation-header" collapsed={headerCollapsible && headerCollapsed}>
           <TopBar
-            activeWorkspace={caps.mayaRestricted ? undefined : activeWorkspace}
-            activeSession={caps.mayaRestricted ? null : (activeSession ?? null)}
+            activeWorkspace={activeWorkspace}
+            activeSession={activeSession ?? null}
             onToggleSidebar={handleToggleSidebar}
             onOpenPalette={() => setShowPalette(true)}
             onToggleDiff={toggleDiff}
@@ -2485,7 +2485,7 @@ function AppContent({
           />
         )}
 
-        {!caps.mayaRestricted && activeWorkspace && activeSession && (
+        {activeWorkspace && activeSession && (
           <MobileRightPanelPicker
             open={pickerOpen && singlePane}
             active={rightPanelView}
