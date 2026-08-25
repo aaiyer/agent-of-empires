@@ -605,8 +605,9 @@ pub struct SpawnConfig {
     /// `session/new` and persisted on `Instance.acp_session_id`.
     /// When `Some`, the connection task prefers `session/resume` so an
     /// already-imported transcript is not replayed. Agents without that
-    /// capability fall back to `session/load`. Maya restricted mode never
-    /// replaces a stored identity through `session/new`.
+    /// capability fall back to `session/load`. Maya restricted mode uses
+    /// `session/load` and never replaces a stored identity through
+    /// `session/new`.
     pub stored_acp_session_id: Option<String>,
     /// Preserve stored ACP session identity in the server-authoritative Maya
     /// profile. A restricted spawn with a stored id may only resume that exact
@@ -636,7 +637,7 @@ pub struct SpawnConfig {
     /// which preserves pre-feature behavior.
     pub mcp_servers: Vec<McpServer>,
     /// When true and this spawn resumes via `session/load`, seed the event
-    /// store from the agent's history replay instead of suppressing it.
+    /// store from the agent's bounded recent history instead of suppressing it.
     /// Set for the first spawn of an imported Claude session whose store is
     /// empty; false for normal reattach (the transcript is already stored,
     /// so re-ingesting would duplicate-key panic). See #2276.
@@ -7761,7 +7762,11 @@ async fn run_connection_task<W, R>(
                             .await;
                     }
 
-                    if acp_session_id.is_none() && !seed_history_replay && resume_session_capable {
+                    if acp_session_id.is_none()
+                        && !seed_history_replay
+                        && !maya_restricted
+                        && resume_session_capable
+                    {
                         if let Some(stored) = stored_acp_session_id.clone() {
                             info!(
                                 target: "acp.protocol",
@@ -7820,19 +7825,6 @@ async fn run_connection_task<W, R>(
                                     }
                                     acp_session_id = Some(SessionId::from(stored));
                                 }
-                                Err(mut error) if maya_restricted => {
-                                    warn!(
-                                        target: "acp.protocol",
-                                        session = %session_label,
-                                        stored_id = %stored,
-                                        "session/resume failed for Maya restricted session; refusing session/load and session/new fallback: {error}"
-                                    );
-                                    error.message = format!(
-                                        "Maya restricted session/resume failed for stored session `{stored}`; refusing session/load and session/new fallback: {}",
-                                        error.message
-                                    );
-                                    return Err(error);
-                                }
                                 Err(error) => warn!(
                                     target: "acp.protocol",
                                     session = %session_label,
@@ -7882,7 +7874,10 @@ async fn run_connection_task<W, R>(
                                 suppress_for_block.store(true, Ordering::Relaxed);
                             }
                             let (replay_token, replay_completion) =
-                                if control_client.is_some() {
+                                if let Some(control) = control_client
+                                    .as_ref()
+                                    .filter(|_| seed_history_replay)
+                                {
                                     // Bind settlement to this exact load and
                                     // session. The runner drains replay on the
                                     // main relay, then emits a typed ACP metadata
@@ -7898,9 +7893,7 @@ async fn run_connection_task<W, R>(
                                             settle_import: seed_history_replay,
                                             completion: Some(tx),
                                         });
-                                    control_client
-                                        .as_ref()
-                                        .expect("runner control is present")
+                                    control
                                         .arm_history_replay(stored.clone(), token.clone())
                                         .await;
                                     (Some(token), Some(rx))
@@ -13006,11 +12999,11 @@ done
         );
     }
 
-    /// Restricted resume success keeps the exact stored authority without
-    /// requesting or buffering the transcript again.
+    /// Restricted load success keeps the exact stored authority while its
+    /// duplicate transcript is suppressed as it streams.
     #[cfg(unix)]
     #[tokio::test]
-    async fn maya_restricted_resume_success_retains_exact_stored_id() {
+    async fn maya_restricted_load_retains_exact_stored_id() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let (script, capture) = write_history_replay_fake_agent(tmp.path());
         let mut config = history_replay_spawn_config(&script, tmp.path(), false);
@@ -13031,11 +13024,11 @@ done
                 })
                 .collect::<Vec<_>>(),
             vec!["stored-history"],
-            "restricted resume success must retain only the exact stored id; events: {events:?}"
+            "restricted load success must retain only the exact stored id; events: {events:?}"
         );
         let wire = std::fs::read_to_string(capture).expect("read history replay capture");
-        assert_eq!(wire.matches("\"method\":\"session/load\"").count(), 0);
-        assert_eq!(wire.matches("\"method\":\"session/resume\"").count(), 1);
+        assert_eq!(wire.matches("\"method\":\"session/load\"").count(), 1);
+        assert_eq!(wire.matches("\"method\":\"session/resume\"").count(), 0);
         assert_eq!(wire.matches("\"method\":\"session/new\"").count(), 0);
     }
 

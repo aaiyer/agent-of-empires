@@ -122,13 +122,10 @@ enum WatchdogShutdown {
     StdoutFanoutEnded,
 }
 
-/// Bounds for relay data retained while a daemon is detached and for the
-/// transcript emitted during one `session/load`. Imported history must never
-/// be silently truncated: capture fails before publication when either bound
-/// is exceeded, while the detached queue is sized to contain one complete
-/// accepted replay plus ordinary notifications.
-const MAX_REPLAY_LINES: usize = 65_536;
-const MAX_REPLAY_BYTES: usize = 32 * 1024 * 1024;
+/// Bounds for the recent transcript tail retained during a first import.
+/// Ordinary `session/load` notifications stream directly to the daemon.
+const MAX_REPLAY_LINES: usize = 8_192;
+const MAX_REPLAY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 
 /// Deadline for one relay socket write. A dead peer can otherwise fill the
@@ -742,10 +739,9 @@ struct RunnerShared {
     /// through the control channel; replayed verbatim on every later
     /// attach so the agent is handshaken exactly once.
     handshake: Mutex<RunnerHandshake>,
-    /// `session/update` notifications emitted before the first
-    /// `session/load` response. Capturing only this request-owned window lets
-    /// the stdout reader reach the response even when the relay socket is
-    /// full; the ordered replay is drained asynchronously afterward.
+    /// `session/update` notifications emitted during a first-import
+    /// `session/load`. The bounded tail is drained asynchronously afterward;
+    /// ordinary loads leave this unset and stream directly to the daemon.
     load_replay_capture: Mutex<Option<ReplayCapture>>,
     /// Unsettled imported replay retained across daemon detach/reattach. The
     /// runner forgets it only after the daemon acknowledges the exact barrier.
@@ -787,9 +783,8 @@ struct RunnerHandshake {
     /// Cached `(acp_session_id, raw session response result)` once the
     /// session is established.
     session: Option<(String, serde_json::Value)>,
-    /// Exact relay frames captured during the established `session/load`.
-    /// Retained across daemon reattach so a crash before durable import
-    /// settlement can replay the complete prefix instead of a truncated tail.
+    /// Recent relay frames captured during a first-import `session/load`.
+    /// Retained across daemon reattach until durable import settlement.
     load_replay: Arc<[Vec<u8>]>,
 }
 
@@ -828,9 +823,8 @@ impl PendingLines {
 
 #[derive(Default)]
 struct ReplayCapture {
-    lines: Vec<Vec<u8>>,
+    lines: VecDeque<Vec<u8>>,
     bytes: usize,
-    overflowed: bool,
 }
 
 struct PendingHistoryReplayState {
@@ -845,15 +839,22 @@ struct PendingHistoryReplayState {
 
 impl ReplayCapture {
     fn push(&mut self, line: &[u8]) {
-        if self.overflowed
-            || self.lines.len() >= MAX_REPLAY_LINES
-            || self.bytes.saturating_add(line.len()) > MAX_REPLAY_BYTES
-        {
-            self.overflowed = true;
+        if line.len() > MAX_REPLAY_BYTES {
+            self.lines.clear();
+            self.bytes = 0;
             return;
         }
+
+        while self.lines.len() >= MAX_REPLAY_LINES
+            || self.bytes.saturating_add(line.len()) > MAX_REPLAY_BYTES
+        {
+            let Some(discarded) = self.lines.pop_front() else {
+                break;
+            };
+            self.bytes -= discarded.len();
+        }
         self.bytes += line.len();
-        self.lines.push(line.to_vec());
+        self.lines.push_back(line.to_vec());
     }
 }
 
@@ -1004,7 +1005,7 @@ impl RunnerShared {
             let mut capture = self.load_replay_capture.lock().await;
             if let Some(capture) = capture.as_mut() {
                 capture.push(line);
-                return !capture.overflowed;
+                return true;
             }
         }
 
@@ -1463,10 +1464,13 @@ impl RunnerShared {
         request: serde_json::Value,
         replay_token: Option<String>,
     ) -> Result<(String, serde_json::Value), serde_json::Value> {
-        if method == "session/load" && !replay_token.as_deref().is_some_and(canonical_replay_token)
+        if method == "session/load"
+            && replay_token
+                .as_deref()
+                .is_some_and(|token| !canonical_replay_token(token))
         {
             return Err(transport_error(
-                "session/load requires a canonical daemon-owned replay token",
+                "session/load replay token must be canonical",
             ));
         }
         let cached = {
@@ -1478,22 +1482,21 @@ impl RunnerShared {
         };
         if let Some((cached, replay)) = cached {
             if method == "session/load" {
-                self.schedule_history_replay(
-                    replay,
-                    cached.0.clone(),
-                    replay_token.expect("validated replay token"),
-                )
-                .await?;
+                if let Some(replay_token) = replay_token {
+                    self.schedule_history_replay(replay, cached.0.clone(), replay_token)
+                        .await?;
+                }
             }
             return Ok(cached);
         }
-        if method == "session/load" {
+        let capture_replay = method == "session/load" && replay_token.is_some();
+        if capture_replay {
             *self.load_replay_capture.lock().await = Some(ReplayCapture::default());
         }
         let response = self
             .agent_request(agent_stdin, method, request.clone())
             .await;
-        let capture = if method == "session/load" {
+        let capture = if capture_replay {
             self.load_replay_capture
                 .lock()
                 .await
@@ -1502,12 +1505,7 @@ impl RunnerShared {
         } else {
             ReplayCapture::default()
         };
-        if capture.overflowed {
-            return Err(transport_error(
-                "session/load replay exceeds the bounded runner capture",
-            ));
-        }
-        let replay: Arc<[Vec<u8>]> = capture.lines.into();
+        let replay: Arc<[Vec<u8>]> = capture.lines.into_iter().collect::<Vec<_>>().into();
         let response = response
             .ok_or_else(|| transport_error(&format!("agent closed before answering {method}")))?;
         let result = handshake_result(&response)?;
@@ -1519,12 +1517,10 @@ impl RunnerShared {
             handshake.load_replay = Arc::clone(&replay);
         }
         if method == "session/load" {
-            self.schedule_history_replay(
-                replay,
-                cached.0.clone(),
-                replay_token.expect("validated replay token"),
-            )
-            .await?;
+            if let Some(replay_token) = replay_token {
+                self.schedule_history_replay(replay, cached.0.clone(), replay_token)
+                    .await?;
+            }
         }
         Ok(cached)
     }
@@ -1537,7 +1533,7 @@ impl RunnerShared {
     /// the same relay writer before `SessionReady` is emitted on the separate
     /// control socket. A slow daemon may therefore observe `SessionReady`
     /// before it has *processed* all replay, but it cannot process this marker
-    /// until all preceding relay frames have been processed.
+    /// until the retained tail has been processed.
     async fn schedule_history_replay(
         self: &Arc<Self>,
         replay: Arc<[Vec<u8>]>,
@@ -2529,10 +2525,75 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn session_load_without_replay_token_streams_updates() {
+        let update = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "stored",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "history"}
+                }
+            }
+        });
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": RUNNER_REQUEST_ID_BASE,
+            "result": {}
+        });
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("IFS= read -r ignored; printf '%s\\n' \"$AOE_TEST_OUTPUT\"")
+            .env("AOE_TEST_OUTPUT", format!("{update}\n{response}"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn streaming load fixture");
+        let agent_stdin = Mutex::new(child.stdin.take().expect("fixture stdin"));
+        let shared = Arc::new(RunnerShared::new());
+        let (daemon, runner) = UnixStream::pair().expect("relay socket pair");
+        let (daemon_read, _daemon_write) = daemon.into_split();
+        let (_runner_read, runner_write) = runner.into_split();
+        assert!(shared.install_outbound(runner_write).await.is_none());
+        let fanout = tokio::spawn(fanout_agent_stdout(
+            child.stdout.take().expect("fixture stdout"),
+            Arc::clone(&shared),
+            "fixture-session".into(),
+        ));
+
+        let established = shared
+            .run_or_replay_session(
+                &agent_stdin,
+                "session/load",
+                serde_json::json!({"sessionId": "stored"}),
+                None,
+            )
+            .await
+            .expect("streaming session/load succeeds");
+        assert_eq!(established.0, "stored");
+        let mut line = String::new();
+        BufReader::new(daemon_read)
+            .read_line(&mut line)
+            .await
+            .expect("read streamed history update");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).expect("valid history update"),
+            update
+        );
+
+        fanout
+            .await
+            .expect("agent stdout fanout task")
+            .expect("agent stdout fanout");
+        child.wait().await.expect("fixture exits");
+    }
+
     /// Regression for the production two-socket race: control-channel
     /// `SessionReady` can be consumed before a slow daemon has reduced the
     /// relay's replay notifications. The replay settlement must therefore
-    /// ride the relay itself, after the complete replay prefix, rather than be
+    /// ride the relay itself, after the retained replay tail, rather than be
     /// inferred from `SessionReady` on the sibling socket.
     #[tokio::test]
     async fn session_load_barrier_follows_large_replay_on_main_relay() {
@@ -2667,7 +2728,7 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$AOE_TEST_RESPONSE_ID"
         );
         assert_eq!(
             barrier["params"]["update"]["_meta"][HISTORY_REPLAY_META_KEY], REPLAY_TOKEN,
-            "settlement must be the session-bound last frame in the replay prefix"
+            "settlement must be the session-bound last frame in the replay tail"
         );
 
         drop(relay_write);
@@ -2683,13 +2744,22 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$AOE_TEST_RESPONSE_ID"
     }
 
     #[test]
-    fn replay_capture_rejects_overflow_without_truncating_a_prefix() {
+    fn replay_capture_retains_only_the_bounded_tail() {
         let mut capture = ReplayCapture::default();
-        let line = vec![b'x'; MAX_REPLAY_BYTES + 1];
-        capture.push(&line);
-        assert!(capture.overflowed);
-        assert!(capture.lines.is_empty());
-        assert_eq!(capture.bytes, 0);
+        for value in 0..=MAX_REPLAY_LINES {
+            capture.push(&value.to_le_bytes());
+        }
+        assert_eq!(capture.lines.len(), MAX_REPLAY_LINES);
+        assert_eq!(capture.lines.front(), Some(&1usize.to_le_bytes().to_vec()));
+        assert_eq!(
+            capture.lines.back(),
+            Some(&MAX_REPLAY_LINES.to_le_bytes().to_vec())
+        );
+
+        capture.push(&vec![b'x'; MAX_REPLAY_BYTES]);
+        capture.push(b"latest");
+        assert_eq!(capture.lines, VecDeque::from([b"latest".to_vec()]));
+        assert_eq!(capture.bytes, b"latest".len());
     }
 
     #[tokio::test(start_paused = true)]
@@ -2927,7 +2997,7 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$AOE_TEST_RESPONSE_ID"
         let replay: Arc<[Vec<u8>]> = vec![b"first\n".to_vec(), b"second\n".to_vec()].into();
 
         // A load may complete while no daemon owns the relay. The runner keeps
-        // the complete replay and its settlement token instead of moving the
+        // the retained tail and its settlement token instead of moving the
         // lines into the bounded ordinary-notification queue.
         shared
             .schedule_history_replay(replay, "stored-history".into(), TOKEN.into())
