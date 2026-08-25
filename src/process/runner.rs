@@ -1722,7 +1722,7 @@ impl RunnerShared {
             let hs = self.handshake.lock().await;
             match method.as_str() {
                 "initialize" => hs.initialized.clone()?,
-                "session/new" | "session/load" | "session/fork" => {
+                "session/new" | "session/load" | "session/resume" | "session/fork" => {
                     hs.session.as_ref().map(|(_, r)| r.clone())?
                 }
                 _ => return None,
@@ -1802,31 +1802,31 @@ fn handshake_result(response: &serde_json::Value) -> Result<serde_json::Value, s
 
 /// Resolve the session identity established by a successful session request.
 /// New and fork create an identity, so their response must provide it. Load
-/// reopens the identity named by the request; ACP's `LoadSessionResponse` does
-/// not contain a session id. Some agents include one as an extension, which is
-/// accepted only when it agrees with the requested identity.
+/// Load and resume reopen the identity named by the request; their responses
+/// do not contain a session id. Some agents include one as an extension, which
+/// is accepted only when it agrees with the requested identity.
 fn established_session_id(
     method: &str,
     request: &serde_json::Value,
     result: &serde_json::Value,
 ) -> Result<String, serde_json::Value> {
     match method {
-        "session/load" => {
+        "session/load" | "session/resume" => {
             let requested = request
                 .get("sessionId")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| transport_error("session/load request missing sessionId"))?;
-            let result = result
-                .as_object()
-                .ok_or_else(|| transport_error("session/load response result was not an object"))?;
+                .ok_or_else(|| transport_error(&format!("{method} request missing sessionId")))?;
+            let result = result.as_object().ok_or_else(|| {
+                transport_error(&format!("{method} response result was not an object"))
+            })?;
             if let Some(returned) = result.get("sessionId") {
                 let returned = returned.as_str().ok_or_else(|| {
-                    transport_error("session/load response sessionId was not a string")
+                    transport_error(&format!("{method} response sessionId was not a string"))
                 })?;
                 if returned != requested {
-                    return Err(transport_error(
-                        "session/load response sessionId did not match request",
-                    ));
+                    return Err(transport_error(&format!(
+                        "{method} response sessionId did not match request"
+                    )));
                 }
             }
             Ok(requested.to_string())
@@ -3198,9 +3198,9 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$AOE_TEST_RESPONSE_ID"
             ),
             (
                 "session/resume",
+                serde_json::json!({"sessionId": "existing-id"}),
                 serde_json::json!({}),
-                serde_json::json!({}),
-                Err("unsupported session establishment method session/resume"),
+                Ok("existing-id"),
             ),
         ];
 

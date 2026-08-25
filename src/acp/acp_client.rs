@@ -29,11 +29,12 @@ use agent_client_protocol::schema::v1::{
     LoadSessionResponse, McpServer, MessageId, NewSessionResponse, PermissionOptionKind,
     PromptRequest, PromptResponse, ReadTextFileRequest, ReadTextFileResponse,
     ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigValueId, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TerminalId,
-    TerminalOutputRequest, TerminalOutputResponse, TextContent, WaitForTerminalExitRequest,
-    WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
+    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionResponse,
+    SelectedPermissionOutcome, SessionConfigId, SessionConfigValueId, SessionId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    StopReason, TerminalId, TerminalOutputRequest, TerminalOutputResponse, TextContent,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
@@ -214,6 +215,56 @@ impl agent_client_protocol::JsonRpcMessage for ExactLoadSessionRequest {
 
 impl agent_client_protocol::JsonRpcRequest for ExactLoadSessionRequest {
     type Response = LoadSessionResponse;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExactResumeSessionRequest {
+    cwd: PathBuf,
+    additional_directories: Vec<PathBuf>,
+    mcp_servers: Vec<McpServer>,
+    session_id: SessionId,
+}
+
+impl ExactResumeSessionRequest {
+    fn new(session_id: String, cwd: PathBuf, mcp_servers: Vec<McpServer>) -> Self {
+        Self {
+            cwd,
+            additional_directories: Vec::new(),
+            mcp_servers,
+            session_id: SessionId::from(session_id),
+        }
+    }
+}
+
+impl agent_client_protocol::JsonRpcMessage for ExactResumeSessionRequest {
+    fn matches_method(method: &str) -> bool {
+        method == "session/resume"
+    }
+
+    fn method(&self) -> &str {
+        "session/resume"
+    }
+
+    fn to_untyped_message(
+        &self,
+    ) -> Result<agent_client_protocol::UntypedMessage, agent_client_protocol::Error> {
+        agent_client_protocol::UntypedMessage::new(self.method(), self)
+    }
+
+    fn parse_message(
+        method: &str,
+        params: &impl serde::Serialize,
+    ) -> Result<Self, agent_client_protocol::Error> {
+        if !Self::matches_method(method) {
+            return Err(agent_client_protocol::Error::method_not_found());
+        }
+        agent_client_protocol::util::json_cast_params(params)
+    }
+}
+
+impl agent_client_protocol::JsonRpcRequest for ExactResumeSessionRequest {
+    type Response = ResumeSessionResponse;
 }
 
 /// Boxed payload for `AcpError::IncompatibleAgent`. Carries the
@@ -536,8 +587,9 @@ pub struct SpawnConfig {
     pub host_environment: Vec<(String, String)>,
     /// Optional reasoning effort to apply through the adapter's
     /// `thought_level` config option after the handshake, on a fresh session
-    /// (`session/new`, `session/fork`) and on a resumed one (`session/load`)
-    /// alike, so a session's pinned effort survives a worker respawn.
+    /// (`session/new`, `session/fork`) and on a resumed one (`session/resume`
+    /// or `session/load`) alike, so a session's pinned effort survives a
+    /// worker respawn.
     pub default_effort: Option<String>,
     /// Optional default mode to apply on fresh ACP sessions through the
     /// adapter's `category:"mode"` config option. Applied strictly: a value
@@ -551,12 +603,10 @@ pub struct SpawnConfig {
     pub socket_path: Option<PathBuf>,
     /// ACP session id from a previous run, captured during the last
     /// `session/new` and persisted on `Instance.acp_session_id`.
-    /// When `Some` and the agent advertises
-    /// `agent_capabilities.load_session = true`, the connection task
-    /// sends `LoadSessionRequest` instead of `NewSessionRequest`. On
-    /// load failure the task falls back to `session/new` and emits a
-    /// `SessionContextReset` event, except in Maya restricted mode, where a
-    /// stored id is resume-only and any load failure stops the spawn.
+    /// When `Some`, the connection task prefers `session/resume` so an
+    /// already-imported transcript is not replayed. Agents without that
+    /// capability fall back to `session/load`. Maya restricted mode never
+    /// replaces a stored identity through `session/new`.
     pub stored_acp_session_id: Option<String>,
     /// Preserve stored ACP session identity in the server-authoritative Maya
     /// profile. A restricted spawn with a stored id may only resume that exact
@@ -579,11 +629,11 @@ pub struct SpawnConfig {
     /// structured view sandbox env mirrors the tmux view. `None` for
     /// non-sandboxed sessions.
     pub source_profile: Option<String>,
-    /// MCP servers to forward to the agent on `session/new` and
-    /// `session/load`, resolved from the global `<app_dir>/mcp.json` by the
-    /// supervisor. Capability gating (dropping `http`/`sse` the agent did not
-    /// advertise) happens later, against the `initialize` response. Empty when
-    /// no config file exists, which preserves pre-feature behavior.
+    /// MCP servers to forward when establishing a session, resolved from the
+    /// global `<app_dir>/mcp.json` by the supervisor. Capability gating
+    /// (dropping `http`/`sse` the agent did not advertise) happens later,
+    /// against the `initialize` response. Empty when no config file exists,
+    /// which preserves pre-feature behavior.
     pub mcp_servers: Vec<McpServer>,
     /// When true and this spawn resumes via `session/load`, seed the event
     /// store from the agent's history replay instead of suppressing it.
@@ -7375,6 +7425,11 @@ async fn run_connection_task<W, R>(
             }
 
             let load_session_capable = init.agent_capabilities.load_session;
+            let resume_session_capable = init
+                .agent_capabilities
+                .session_capabilities
+                .resume
+                .is_some();
             // Surface the agent's prompt capabilities to the structured view so
             // the web composer can gate the attachment button on the
             // current agent, and the server prompt handler can reject
@@ -7421,13 +7476,14 @@ async fn run_connection_task<W, R>(
                 target: "acp.protocol",
                 session = %session_label,
                 load_session_capable,
+                resume_session_capable,
                 ?mode,
                 "initialize handshake complete"
             );
 
             // Signal handshake-ready now: the ACP `initialize` handshake (what
-            // the spawn timeout actually bounds) is done. session/new and
-            // session/load run below and stream their results as events; for a
+            // the spawn timeout actually bounds) is done. Session establishment
+            // runs below and streams its results as events; for a
             // resumed/imported session the adapter replays the whole transcript
             // before answering session/load, which can take far longer than the
             // handshake timeout. Firing ready here keeps that replay out of the
@@ -7447,16 +7503,15 @@ async fn run_connection_task<W, R>(
             let mut mode_config_option_id: Option<String> = None;
             // Thought-level (reasoning effort) option id, captured from whichever
             // establish call ran so `default_effort` can be applied once after
-            // the match. Captured in all three Fresh branches, not just
-            // session/new: a respawn resumes via session/load, and applying the
+            // the match. Captured in all Fresh branches, not just session/new:
+            // a respawn resumes via session/resume or session/load, and applying the
             // effort only on a fresh session is what made a picked effort revert
             // on every respawn.
             let mut thought_level_config_option_id: Option<String> = None;
 
             // Drop any http/sse servers the agent did not advertise before they
-            // reach session/new or session/load; stdio is always kept. Computed
-            // once here so both the load-attempt and the fresh-session fallback
-            // forward the same gated list.
+            // reach session establishment; stdio is always kept. Computed once
+            // here so every establish attempt forwards the same gated list.
             let mcp_servers = mcp_config::filter_for_capabilities(
                 mcp_servers,
                 &init.agent_capabilities.mcp_capabilities,
@@ -7704,6 +7759,88 @@ async fn run_connection_task<W, R>(
                                 reason: "fork_unsupported_by_agent".to_string(),
                             })
                             .await;
+                    }
+
+                    if acp_session_id.is_none() && !seed_history_replay && resume_session_capable {
+                        if let Some(stored) = stored_acp_session_id.clone() {
+                            info!(
+                                target: "acp.protocol",
+                                session = %session_label,
+                                stored_id = %stored,
+                                "resuming session via session/resume without replay"
+                            );
+                            let req = ExactResumeSessionRequest::new(
+                                stored.clone(),
+                                agent_cwd.clone(),
+                                mcp_servers.clone(),
+                            );
+                            let resume_result = if let Some(control) = control_client.as_ref() {
+                                establish_session_v2::<ResumeSessionResponse>(
+                                    control,
+                                    "session/resume",
+                                    &req,
+                                    None,
+                                )
+                                .await
+                            } else {
+                                connection.send_request(req).block_task().await
+                            };
+                            match resume_result {
+                                Ok(resp) => {
+                                    info!(
+                                        target: "acp.protocol",
+                                        session = %session_label,
+                                        stored_id = %stored,
+                                        "session/resume succeeded"
+                                    );
+                                    available_mode_ids = resp.modes.as_ref().map(|modes| {
+                                        modes
+                                            .available_modes
+                                            .iter()
+                                            .map(|mode| mode.id.0.to_string())
+                                            .collect()
+                                    });
+                                    mode_config_option_id = resp
+                                        .config_options
+                                        .as_deref()
+                                        .and_then(mode_config_id)
+                                        .map(|id| id.0.to_string());
+                                    thought_level_config_option_id = resp
+                                        .config_options
+                                        .as_deref()
+                                        .and_then(thought_level_config_id)
+                                        .map(|id| id.0.to_string());
+                                    let _ = event_tx_for_block
+                                        .send(Event::AcpSessionAssigned {
+                                            acp_session_id: stored.clone(),
+                                        })
+                                        .await;
+                                    if let Some(event) = config_options_event(resp.config_options) {
+                                        let _ = event_tx_for_block.send(event).await;
+                                    }
+                                    acp_session_id = Some(SessionId::from(stored));
+                                }
+                                Err(mut error) if maya_restricted => {
+                                    warn!(
+                                        target: "acp.protocol",
+                                        session = %session_label,
+                                        stored_id = %stored,
+                                        "session/resume failed for Maya restricted session; refusing session/load and session/new fallback: {error}"
+                                    );
+                                    error.message = format!(
+                                        "Maya restricted session/resume failed for stored session `{stored}`; refusing session/load and session/new fallback: {}",
+                                        error.message
+                                    );
+                                    return Err(error);
+                                }
+                                Err(error) => warn!(
+                                    target: "acp.protocol",
+                                    session = %session_label,
+                                    stored_id = %stored,
+                                    "session/resume failed; falling back to session/load: {error}"
+                                ),
+                            }
+                        }
                     }
 
                     if acp_session_id.is_none()
@@ -8109,11 +8246,11 @@ async fn run_connection_task<W, R>(
             // Apply the session's reasoning effort ("thought level") once, after
             // whichever establish call ran. This sits outside the branches on
             // purpose: `Instance.acp_effort` is a pin the session carries across
-            // respawns, and a respawn resumes via session/load (or session/fork),
-            // so applying it only on session/new let a picked effort revert to the
-            // agent default on every restart. Resume captures no option id (it
-            // sends neither new nor load and the worker's session is still
-            // configured), so it skips. Strict like the mode default above: a
+            // respawns, and a respawn resumes via session/resume, session/load,
+            // or session/fork, so applying it only on session/new let a picked
+            // effort revert on every restart. A live-runner reconnect captures
+            // no option id because the worker's session is still configured, so
+            // it skips. Strict like the mode default above: a
             // stale value the agent no longer advertises is rejected and warned,
             // never failing the spawn.
             if let (Some(effort), Some(config_id)) = (
@@ -12567,11 +12704,14 @@ while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
   case $line in
     *'"method":"initialize"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}\n' "$id"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"resume":{}}}}}\n' "$id"
       ;;
     *'"method":"session/load"'*)
       printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"stored-history","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"old question"}}}}\n'
       printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"stored-history","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"old answer"}}}}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      ;;
+    *'"method":"session/resume"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
       ;;
   esac
@@ -12693,12 +12833,11 @@ done
         assert_eq!(wire.matches("\"method\":\"session/new\"").count(), 0);
     }
 
-    /// Ordinary reattach already owns a complete persisted transcript. It
-    /// suppresses replayed chunks and must not publish the import-only terminal
-    /// boundary, which could otherwise interfere with a real active turn.
+    /// Ordinary reattach already owns a complete persisted transcript, so an
+    /// agent advertising session/resume must receive no history replay at all.
     #[cfg(unix)]
     #[tokio::test]
-    async fn ordinary_history_load_suppresses_replay_without_synthetic_stop() {
+    async fn ordinary_history_resume_skips_replay_without_synthetic_stop() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let (script, capture) = write_history_replay_fake_agent(tmp.path());
         let config = history_replay_spawn_config(&script, tmp.path(), false);
@@ -12714,14 +12853,15 @@ done
                     | Event::AgentMessageChunk { .. }
                     | Event::Stopped { .. }
             )),
-            "ordinary load must suppress duplicate history and synthesize no terminal; events: {events:?}"
+            "ordinary resume must emit no duplicate history or terminal; events: {events:?}"
         );
         assert!(events.iter().any(
             |event| matches!(event, Event::AcpSessionAssigned { acp_session_id } if acp_session_id == "stored-history")
         ));
 
         let wire = std::fs::read_to_string(capture).expect("read history replay capture");
-        assert_eq!(wire.matches("\"method\":\"session/load\"").count(), 1);
+        assert_eq!(wire.matches("\"method\":\"session/load\"").count(), 0);
+        assert_eq!(wire.matches("\"method\":\"session/resume\"").count(), 1);
         assert_eq!(wire.matches("\"method\":\"session/new\"").count(), 0);
     }
 
@@ -12866,11 +13006,11 @@ done
         );
     }
 
-    /// Restricted resume success keeps the exact stored authority and follows
-    /// the same replay-suppression behavior as an ordinary reattach.
+    /// Restricted resume success keeps the exact stored authority without
+    /// requesting or buffering the transcript again.
     #[cfg(unix)]
     #[tokio::test]
-    async fn maya_restricted_load_success_retains_exact_stored_id() {
+    async fn maya_restricted_resume_success_retains_exact_stored_id() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let (script, capture) = write_history_replay_fake_agent(tmp.path());
         let mut config = history_replay_spawn_config(&script, tmp.path(), false);
@@ -12891,10 +13031,11 @@ done
                 })
                 .collect::<Vec<_>>(),
             vec!["stored-history"],
-            "restricted load success must retain only the exact stored id; events: {events:?}"
+            "restricted resume success must retain only the exact stored id; events: {events:?}"
         );
         let wire = std::fs::read_to_string(capture).expect("read history replay capture");
-        assert_eq!(wire.matches("\"method\":\"session/load\"").count(), 1);
+        assert_eq!(wire.matches("\"method\":\"session/load\"").count(), 0);
+        assert_eq!(wire.matches("\"method\":\"session/resume\"").count(), 1);
         assert_eq!(wire.matches("\"method\":\"session/new\"").count(), 0);
     }
 
@@ -13463,6 +13604,20 @@ done
         );
         assert_eq!(
             serde_json::to_value(load).expect("serialize session/load"),
+            serde_json::json!({
+                "cwd": crate::server::maya_restricted::PROJECT_PATH,
+                "additionalDirectories": [],
+                "mcpServers": [],
+                "sessionId": "stored-id",
+            })
+        );
+        let resume = ExactResumeSessionRequest::new(
+            "stored-id".into(),
+            std::path::PathBuf::from(crate::server::maya_restricted::PROJECT_PATH),
+            Vec::new(),
+        );
+        assert_eq!(
+            serde_json::to_value(resume).expect("serialize session/resume"),
             serde_json::json!({
                 "cwd": crate::server::maya_restricted::PROJECT_PATH,
                 "additionalDirectories": [],
