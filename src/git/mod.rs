@@ -36,7 +36,40 @@ pub use worktree::{GitWorktree, WorktreeEntry};
 pub(crate) fn open_repo_at(path: &Path) -> std::result::Result<git2::Repository, git2::Error> {
     git2::Repository::open_ext(
         path,
-        git2::RepositoryOpenFlags::NO_SEARCH,
+        git2::RepositoryOpenFlags::NO_SEARCH | git2::RepositoryOpenFlags::FROM_ENV,
         std::iter::empty::<&OsStr>(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::test_support::EnvGuard;
+    use std::fs;
+
+    #[test]
+    fn open_repo_at_uses_explicit_global_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_path = temp.path().join("repo");
+        git2::Repository::init(&repo_path).unwrap();
+        let service_config = temp.path().join("service.gitconfig");
+        fs::write(
+            &service_config,
+            "[maya]\n\tservice-boundary-test = expected\n",
+        )
+        .unwrap();
+        let _env = EnvGuard::set(&[
+            ("GIT_CONFIG_GLOBAL", service_config.as_os_str()),
+            ("GIT_CONFIG_NOSYSTEM", OsStr::new("1")),
+        ]);
+
+        let repo = open_repo_at(&repo_path).unwrap();
+        assert_eq!(
+            repo.config()
+                .unwrap()
+                .get_string("maya.service-boundary-test")
+                .unwrap(),
+            "expected"
+        );
+    }
 }
