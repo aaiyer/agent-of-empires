@@ -1538,9 +1538,9 @@ fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option<String> {
 ///   poller from tmux pane state or ACP overlay, not by an explicit user
 ///   action.
 /// - **passive status patch**: a minimal `PassiveStatusPatch` carrying
-///   the fields a passive-status writer touches (`status`,
-///   `idle_entered_at`, `last_accessed_at`), applied on disk via
-///   [`Instance::merge_passive_status_patch`].
+///   the `status` / `idle_entered_at` writes plus the monotone
+///   `last_accessed_at` carry-through (user-gesture-only since #3465),
+///   applied on disk via [`Instance::merge_passive_status_patch`].
 /// - **live status baseline**: the last `Status` a caller has actually
 ///   observed live for an in-memory `Instance`. Held on
 ///   `Instance::live_status_baseline` (`#[serde(skip)]`). `None` means
@@ -1974,6 +1974,26 @@ impl Instance {
         self.session_id_poller = previous.session_id_poller.clone();
         self.retroactive_capture_excludes = previous.retroactive_capture_excludes.clone();
     }
+    /// Carry every in-process field from a pre-move live row onto the
+    /// committed disk-derived candidate published by `HomeView`.
+    /// Adding a new `#[serde(skip)]` field requires deciding whether
+    /// `merge_runtime_from_reload`, this function, and
+    /// `server::merge_runtime_fields` must carry it.
+    pub(crate) fn merge_runtime_for_profile_move(&mut self, previous: &Self) {
+        self.merge_runtime_from_reload(previous);
+        self.live_status_baseline = previous.live_status_baseline;
+        self.ever_confirmed_present = previous.ever_confirmed_present;
+        self.unknown_since = previous.unknown_since;
+        self.pane_dead_observed = previous.pane_dead_observed;
+        self.force_fresh_next_launch = previous.force_fresh_next_launch;
+        self.pending_host_env = previous.pending_host_env.clone();
+        self.file_watch = previous.file_watch.clone();
+        if let (Some(reloaded_sandbox), Some(runtime_sandbox)) =
+            (self.sandbox_info.as_mut(), previous.sandbox_info.as_ref())
+        {
+            reloaded_sandbox.before_start_env = runtime_sandbox.before_start_env.clone();
+        }
+    }
 
     /// Splice TUI-mirrored, persisted fields from `src` onto `self`. Used by
     /// `HomeView::save` for fields the TUI is the canonical disk writer of
@@ -2036,6 +2056,18 @@ impl Instance {
                 .insert(self.tool.clone(), outgoing);
         }
         self.tool = new_tool.to_string();
+        // The alias is resolved per-tool, so the outgoing tool's answer cannot
+        // survive: kept, it points `resolved_agent` at the wrong built-in
+        // outright (a `codex-personal` -> `claude-personal` swap would keep
+        // detecting as codex); cleared, the row lands in the same
+        // empty-`detect_as` state a session built before its tool joined
+        // `[session.agent_detect_as]` does. Re-resolve against the same
+        // process-global registry `effective_detect_as` reads, so this stays a
+        // lookup rather than a config load, and the row ends up exactly as if
+        // it had been built on the new tool.
+        self.detect_as =
+            tmux::status_rules::effective_detect_as(&self.source_profile, new_tool, "")
+                .into_owned();
         // Consumed, not copied: the row owns exactly one live conversation per
         // agent, and leaving the entry behind would let a later swap restore an
         // id this session has since replaced.
@@ -2127,11 +2159,33 @@ impl Instance {
         self.last_accessed_at = Some(incoming);
     }
 
+    /// Merge the complete user-requested delta for a cross-profile move while
+    /// preserving unrelated fields refreshed by a peer after `pre` was read.
+    /// A tool change is one atomic state transition: the tool name and every
+    /// conversation field staged by `swap_tool` must travel together.
+    pub(crate) fn merge_profile_move_diff(&mut self, pre: &Self, post: &Self) {
+        self.merge_user_action_diff(pre, post);
+        if pre.tool != post.tool {
+            // Apply the requested transition to the freshly locked disk row.
+            // The TUI post snapshot can carry parked session ids captured
+            // before a poller or peer refreshed the durable conversation state.
+            self.swap_tool(&post.tool);
+        }
+        if pre.command != post.command {
+            self.command = post.command.clone();
+        }
+        if pre.extra_args != post.extra_args {
+            self.extra_args = post.extra_args.clone();
+        }
+    }
+
     /// Per-field-conditional splice: copy `post.X` onto `self.X` only when
     /// `pre.X != post.X`. Peer writes to fields the mutation did not touch
     /// survive even when the field is in the user-action set.
     /// `last_accessed_at` is monotone-max (no diff guard).
-    /// `source_profile` is excluded; cross-profile moves bypass this path.
+    /// `source_profile` is excluded from this splice. Same-profile actions call
+    /// this directly; cross-profile moves call it through
+    /// `merge_profile_move_diff` and assign `source_profile` separately.
     /// Post-splice rules enforce the same cross-field invariants the
     /// per-mutation methods enforce (archive XOR favorite, touch unarchives)
     /// so concurrent peer writes cannot violate them.
@@ -2188,9 +2242,9 @@ impl Instance {
         // user-action diff, so the value on disk is already authoritative here.
         // Assigning `post`'s copy would let a stale TUI snapshot clobber a
         // conversion a peer landed between the `pre` snapshot and this merge.
-        if pre.status != post.status {
-            self.status = post.status;
-        }
+        // `status` deliberately has no arm. It is runtime state, not user
+        // intent; copying it from a stale TUI snapshot could overwrite a
+        // lifecycle transition loaded under the storage lock.
         // Lifecycle ownership is intentionally never spliced from a TUI
         // snapshot. Only transition code holding the per-instance flock may
         // mutate the durable reservation and generation.
@@ -2254,8 +2308,8 @@ impl Instance {
     ///
     /// Cleared by `unarchive`, by `touch_last_accessed`, and by `favorite`
     /// and `pin`; not by `snooze`.
-    /// `merge_user_action_diff` mirrors those onto disk, and #3465 tracks a
-    /// status transition reaching that mirror without a user gesture.
+    /// `merge_user_action_diff` mirrors those onto disk; #3465 was a status
+    /// transition reaching that mirror without a user gesture.
     ///
     /// Mutual exclusion with `favorite`, `snooze`, and `pin`: archiving
     /// clears `favorited_at`, `snoozed_until`, and `pinned_at`. Archive
@@ -2609,6 +2663,32 @@ impl Instance {
     /// when `source_profile` was never populated (e.g. legacy callers).
     pub fn effective_profile(&self) -> String {
         super::config::effective_profile(&self.source_profile)
+    }
+
+    /// The `agent_detect_as` alias that actually applies to this session.
+    ///
+    /// `detect_as` is resolved once at session build and persisted, so it is
+    /// empty on a row created before its tool gained an
+    /// `[session.agent_detect_as]` entry. Treat the stored field as a cache
+    /// and let [`tmux::status_rules::effective_detect_as`] consult the live
+    /// registry when it is empty, the same way the pane detector, hook
+    /// reconciliation, and the status-change log line already do (#3398).
+    fn effective_detect_as(&self) -> std::borrow::Cow<'_, str> {
+        tmux::status_rules::effective_detect_as(&self.source_profile, &self.tool, &self.detect_as)
+    }
+
+    /// The built-in agent backing this session: its own tool when that names
+    /// one, else the agent its `agent_detect_as` alias points at.
+    ///
+    /// Every launch-time consumer resolves through here rather than reading
+    /// `detect_as` raw, because a miss is silent and permanent. `None` drops
+    /// the `AOE_PROFILE`/`AOE_INSTANCE_ID` prefix from the launch line
+    /// ([`status_hook_env_prefix`]) and skips hook install, so every hook the
+    /// agent does have bails on `[ -n "$AOE_INSTANCE_ID" ]` and the session
+    /// reports Idle forever with nothing logged.
+    fn resolved_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+        crate::agents::get_agent(&self.tool)
+            .or_else(|| crate::agents::get_agent(&self.effective_detect_as()))
     }
 
     /// Resolve the effective `environment` list for this session's profile,
@@ -3007,17 +3087,24 @@ impl Instance {
         }
 
         if let Some(stored) = self.agent_session_id.clone() {
-            if let Some(fresh) = self.capture_freshest_session_id() {
-                tracing::info!(
-                    target: "session.store",
-                    stale = %stored,
-                    fresh = %fresh,
-                    tool = %self.tool,
-                    "Replacing stored session id with fresher live observation"
-                );
-                self.agent_session_id = Some(fresh.clone());
-                return (Some(fresh), true);
-            }
+            // Rebinding rather than returning early runs the observation
+            // through the same empty-thread downgrade as the stored id below.
+            // The SessionStart hook fires before Claude writes any content, so
+            // the sidecar can legitimately name a thread with no transcript.
+            let stored = match self.capture_freshest_session_id() {
+                Some(fresh) => {
+                    tracing::info!(
+                        target: "session.store",
+                        stale = %stored,
+                        fresh = %fresh,
+                        tool = %self.tool,
+                        "Replacing stored session id with fresher live observation"
+                    );
+                    self.agent_session_id = Some(fresh.clone());
+                    fresh
+                }
+                None => stored,
+            };
             // A stored Claude sid with no transcript on disk is not resumable:
             // Claude minted the UUID at first launch but nothing was ever
             // written (an empty thread killed before the first prompt), so
@@ -3121,16 +3208,31 @@ impl Instance {
     }
 
     /// Full set of session IDs capture must skip for this instance: live tmux
-    /// ownership, cascade-cleared ids, and conversations same-project peers
-    /// parked while running another tool.
+    /// ownership, cascade-cleared ids, conversations same-project peers parked
+    /// while running another tool, and inactive peers that still own records
+    /// in a shared host store.
     fn retroactive_capture_exclusion_set(&self) -> HashSet<String> {
         super::capture::compose_exclusion_with_persisted_peers(
             &self.id,
             &self.project_path,
             &self.tool,
-            self.tool == "claude" || (self.tool == "codex" && !self.is_sandboxed()),
+            self.tool == "claude"
+                || (matches!(self.tool.as_str(), "codex" | "kimi") && !self.is_sandboxed()),
             &self.effective_profile(),
             &self.retroactive_capture_excludes,
+        )
+    }
+
+    /// Whether another AoE session shares this one's Kimi store, which makes
+    /// the session index useless for attributing a conversation to a pane.
+    /// Both own homes are supplied so a hook-minted `KIMI_CODE_HOME` still
+    /// counts static-profile siblings as sharing.
+    fn kimi_store_is_shared(&self) -> bool {
+        super::capture::kimi_store_is_shared(
+            &self.id,
+            &self.project_path,
+            &self.resolved_host_environment(),
+            &self.profile_host_environment(),
         )
     }
 
@@ -3288,18 +3390,35 @@ impl Instance {
                 }
             }
             "kimi" => {
-                // Kimi records sessions in `~/.kimi-code/session_index.jsonl`
-                // keyed by workDir. Host capture reads it directly; sandbox
-                // resume is a follow-up (the container's index is not read over
-                // `docker exec`), so a sandboxed Kimi session starts fresh on
-                // restart, mirroring Copilot.
+                // Kimi records sessions in `session_index.jsonl` under the
+                // resolved `KIMI_CODE_HOME`, keyed by workDir. Host capture
+                // reads it through the launched pane's environment; sandbox
+                // resume is a follow-up (the container's index is not read
+                // over `docker exec`), so a sandboxed Kimi session starts
+                // fresh on restart, mirroring Copilot.
                 if self.is_sandboxed() {
+                    None
+                } else if self.kimi_store_is_shared() {
+                    // A shared store names no pane: its newest same-workDir
+                    // record is as likely to be a co-located peer's
+                    // conversation as this one's, so the MRU scan is refused
+                    // entirely (#3516). An anchored sid keeps its value on
+                    // the freshest path; an id-less session starts fresh
+                    // rather than adopt a peer conversation. Sole-owner
+                    // stores keep the MRU retarget, which stays the
+                    // new-conversation promotion path (#2291).
                     None
                 } else {
                     let exclusion = self.retroactive_capture_exclusion_set();
                     // Retroactive recovery is unrestricted (no launch floor):
                     // resuming an older session on restart is the goal here.
-                    capture_kimi_session_id(&self.project_path, &exclusion, None).ok()
+                    capture_kimi_session_id(
+                        &self.project_path,
+                        &exclusion,
+                        None,
+                        &self.resolved_host_environment(),
+                    )
+                    .ok()
                 }
             }
             _ => None,
@@ -3521,7 +3640,11 @@ impl Instance {
                 return override_if_distinct(self.agent_session_id.as_deref(), authoritative);
             }
         }
-
+        // Kimi: a shared store refuses the MRU scan entirely inside
+        // try_retroactive_capture and surfaces here as None, so a Some from
+        // the call below implies the store was sole-owned and the fresher
+        // observation attributable. Execution reaches this line for every
+        // tool; the gating lives in the callee.
         let live = self.try_retroactive_capture()?;
         override_if_distinct(self.agent_session_id.as_deref(), live)
     }
@@ -3725,10 +3848,45 @@ impl Instance {
             .unwrap_or(false)
     }
 
-    /// `exists()` alone is insufficient: a pane can exist while its agent
-    /// has died. Used by recovery, status polling, and TUI reload.
-    pub fn has_live_tmux_pane(&self) -> bool {
-        self.tmux_env_session_name().is_some()
+    /// [`Self::tmux_env_session_name`] answered from a snapshot the caller
+    /// already holds, for passes that ask once per stored session.
+    pub(crate) fn tmux_env_session_name_in(
+        &self,
+        snapshot: &crate::tmux::LiveSessionSnapshot,
+    ) -> Option<String> {
+        crate::tmux::live_any_kind_name_for_id_in(snapshot, &self.id)
+    }
+
+    /// [`Self::tmux_env_session_name_in`] for a one-shot pass that cannot
+    /// retry: an unreachable tmux server is Unknown, not "no live pane", so
+    /// fall back to a fresh per-item probe rather than dropping the row.
+    ///
+    /// The startup hidden-env publication in `HomeView::new` is such a pass.
+    /// Nothing re-runs it on reload and a poller does not re-emit an unchanged
+    /// sid, so a row skipped there stays unpublished until an unrelated sid
+    /// change or a relaunch, weakening the ownership attribution
+    /// `build_exclusion_set` reads. Startup recovery treats the same
+    /// distinction the other way, skipping its whole pass on a failed probe
+    /// rather than reading it as "every pane is dead".
+    pub(crate) fn tmux_env_session_name_in_or_probe(
+        &self,
+        snapshot: &crate::tmux::LiveSessionSnapshot,
+    ) -> Option<String> {
+        match snapshot.names() {
+            Some(_) => self.tmux_env_session_name_in(snapshot),
+            None => self.tmux_env_session_name(),
+        }
+    }
+
+    /// Whether this instance has a live tmux pane, answered from a snapshot
+    /// the caller already holds. `exists()` alone is insufficient: a pane can
+    /// exist while its agent has died. Used by peer exclusion, poller repair,
+    /// and TUI reload.
+    pub(crate) fn has_live_tmux_pane_in(
+        &self,
+        snapshot: &crate::tmux::LiveSessionSnapshot,
+    ) -> bool {
+        self.tmux_env_session_name_in(snapshot).is_some()
     }
 
     pub fn start_container_terminal_with_size(&mut self, size: Option<(u16, u16)>) -> Result<()> {
@@ -3750,9 +3908,10 @@ impl Instance {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("sandbox_info missing for sandboxed session"))?;
 
+        let detect_as = self.effective_detect_as().into_owned();
         let managed_codex_home = container_config::managed_codex_home(
             &self.tool,
-            Some(&self.detect_as),
+            Some(detect_as.as_str()),
             &self.source_profile,
             &self.id,
         )?;
@@ -4321,8 +4480,7 @@ impl Instance {
         if self.tool == "omp" && !self.has_command_override() {
             reject_omp_secret_args(&super::config::quote_model_value_in_args(&self.extra_args))?;
         }
-        let agent = crate::agents::get_agent(&self.tool)
-            .or_else(|| crate::agents::get_agent(&self.detect_as));
+        let agent = self.resolved_agent();
         self.install_agent_status_hooks(agent);
         self.propagate_managed_skills();
 
@@ -4381,8 +4539,8 @@ impl Instance {
         if self.tool == "omp" && !self.has_command_override() {
             reject_omp_secret_args(&super::config::quote_model_value_in_args(&self.extra_args))?;
         }
-        let agent = crate::agents::get_agent(&self.tool)
-            .or_else(|| crate::agents::get_agent(&self.detect_as));
+        let agent = self.resolved_agent();
+        let detect_as = self.effective_detect_as().into_owned();
 
         let (cmd, is_existing, omp_capture_plan, launch_env) = if self.is_sandboxed() {
             let image = self
@@ -4453,7 +4611,7 @@ impl Instance {
                 .ok_or_else(|| anyhow::anyhow!("sandbox_info missing for sandboxed instance"))?;
             let managed_codex_home = container_config::managed_codex_home(
                 &self.tool,
-                Some(&self.detect_as),
+                Some(detect_as.as_str()),
                 &self.source_profile,
                 &self.id,
             )?;
@@ -5308,6 +5466,7 @@ impl Instance {
     }
 
     pub fn get_container_for_instance(&mut self) -> Result<containers::DockerContainer> {
+        let detect_as = self.effective_detect_as().into_owned();
         let image = self
             .sandbox_info
             .as_ref()
@@ -5329,13 +5488,13 @@ impl Instance {
                 &self.effective_profile(),
                 &self.id,
                 &self.tool,
-                Some(&self.detect_as),
+                Some(detect_as.as_str()),
             );
             self.backfill_container_workdir(&container);
             if self.is_yolo_mode() {
                 container_config::ensure_yolo_trust_config_for_active_agent(
                     &self.tool,
-                    Some(&self.detect_as),
+                    Some(detect_as.as_str()),
                     &self.source_profile,
                     &self.id,
                     &self.container_workdir(),
@@ -5352,14 +5511,14 @@ impl Instance {
                 &self.effective_profile(),
                 &self.id,
                 &self.tool,
-                Some(&self.detect_as),
+                Some(detect_as.as_str()),
             );
             container.start()?;
             self.backfill_container_workdir(&container);
             if self.is_yolo_mode() {
                 container_config::ensure_yolo_trust_config_for_active_agent(
                     &self.tool,
-                    Some(&self.detect_as),
+                    Some(detect_as.as_str()),
                     &self.source_profile,
                     &self.id,
                     &self.container_workdir(),
@@ -5442,6 +5601,7 @@ impl Instance {
     }
 
     fn build_container_config(&self) -> Result<crate::containers::ContainerConfig> {
+        let detect_as = self.effective_detect_as();
         let sandbox = self
             .sandbox_info
             .as_ref()
@@ -5458,8 +5618,7 @@ impl Instance {
             // Mirror the host path's agent resolution (a custom wrapper detected
             // as kiro carries kiro's sidecar via detect_as), and the sandbox's
             // own `resolve_active_agent`, which also falls back to detect_as.
-            crate::agents::get_agent(&self.tool)
-                .or_else(|| crate::agents::get_agent(&self.detect_as))
+            self.resolved_agent()
                 .and_then(|a| a.sidecar_hooks.as_ref())
                 .and_then(|s| s.selected_agent_hooks.as_ref())
                 .and_then(|sel| {
@@ -5471,7 +5630,7 @@ impl Instance {
         container_config::build_container_config(
             &self.project_path,
             sandbox,
-            container_config::ContainerAgentSelection::new(&self.tool, Some(&self.detect_as))
+            container_config::ContainerAgentSelection::new(&self.tool, Some(&detect_as))
                 .with_selected_agent(selected_agent.as_deref()),
             self.is_yolo_mode(),
             &self.id,
@@ -5805,9 +5964,10 @@ impl Instance {
                 ))
             }
             "kimi" => {
-                // Host-only, mirroring Copilot: the Kimi session index is read
-                // from the host `~/.kimi-code`. Sandboxed sessions have no
-                // poller and start fresh on restart (sandbox resume is a
+                // Host-only, mirroring Copilot: the Kimi session index is
+                // read from the host store under the launched pane's
+                // resolved environment. Sandboxed sessions have no poller
+                // and start fresh on restart (sandbox resume is a
                 // follow-up).
                 if self.is_sandboxed() {
                     return;
@@ -5818,6 +5978,7 @@ impl Instance {
                     self.id.clone(),
                     launch_time_ms,
                     extra_excludes,
+                    self.resolved_host_environment(),
                 ))
             }
             _ => return,
@@ -5862,14 +6023,17 @@ impl Instance {
     ///
     /// OMP pollers reload pane metadata on every tick, so a replacement binds
     /// to the durable generation that won any concurrent restart race.
-    pub(crate) fn repair_session_id_poller_if_needed(&mut self) -> bool {
+    pub(crate) fn repair_session_id_poller_if_needed(
+        &mut self,
+        snapshot: &crate::tmux::LiveSessionSnapshot,
+    ) -> bool {
         // Structured sessions have ACP workers rather than tmux panes. Their
         // lifecycle is reconciled by the daemon, so probing tmux here can only
         // fail and is especially costly from the native TUI's refresh loop.
         if self.is_structured()
             || !self.supports_session_poller()
             || self.session_id_poller_is_running()
-            || !self.has_live_tmux_pane()
+            || !self.has_live_tmux_pane_in(snapshot)
         {
             return false;
         }
@@ -6722,12 +6886,14 @@ impl Instance {
     /// Update status using pre-fetched pane metadata to avoid per-instance
     /// subprocess spawns. Falls back to subprocess calls if metadata is missing.
     ///
-    /// Restamps `idle_entered_at`/`last_accessed_at` only when the detected
-    /// status differs from [`Self::live_status_baseline`]. The baseline
-    /// invariant lives on the field itself; this method's job is the
-    /// guard shape (baseline vs. newly detected). Every call re-seeds the
-    /// baseline at exit, so the next call compares against a value this
-    /// method itself wrote.
+    /// Restamps `idle_entered_at` only when the detected status differs from
+    /// [`Self::live_status_baseline`]. `last_accessed_at` is deliberately not
+    /// written here (#3465): it is a user-gesture signal, and a poller stamp
+    /// that advanced it on disk let `merge_user_action_diff`'s touched arm
+    /// erase a concurrently archived row. The baseline invariant lives on the
+    /// field itself; this method's job is the guard shape (baseline vs. newly
+    /// detected). Every call re-seeds the baseline at exit, so the next call
+    /// compares against a value this method itself wrote.
     pub fn update_status_with_metadata(
         &mut self,
         metadata: Option<&tmux::PaneMetadata>,
@@ -6738,8 +6904,12 @@ impl Instance {
         if let Some(prev) = baseline {
             if prev != self.status {
                 self.log_status_transition(prev);
+                // last_accessed_at is deliberately NOT restamped here
+                // (#3465): a passive advance reaches disk through
+                // PassiveStatusPatch, and merge_user_action_diff's touched
+                // arm reads any advance as a peer touch, wiping concurrent
+                // archive/snooze/dormancy writes.
                 let now = Utc::now();
-                self.last_accessed_at = Some(now);
                 self.idle_entered_at = if self.status == Status::Idle {
                     Some(now)
                 } else {
@@ -7783,6 +7953,54 @@ mod tests {
             !contended.contains(&("opencode".to_string(), canon)),
             "a dead id-less peer must not force the live session to abstain"
         );
+    }
+
+    /// A one-shot pass must not read an unreachable snapshot as "no live
+    /// pane". The startup hidden-env publication is batched behind one
+    /// `LiveSessionSnapshot`, and nothing re-runs it, so collapsing Unknown
+    /// into Absent there would leave every row's `AOE_INSTANCE_ID` and
+    /// `AOE_CAPTURED_SESSION_ID` unpublished until an unrelated sid change or
+    /// a relaunch, and peer exclusion reads exactly those variables.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn one_shot_name_probes_when_the_snapshot_missed_tmux() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let inst = Instance::new("Refactor billing", "/tmp/aoe-test-one-shot-probe");
+        let live_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+
+        // A `tmux` that answers with one live session name, standing in for the
+        // probe that succeeds after the snapshot's own `list-sessions` failed.
+        // The pane-liveness check reads the same output and parses it as "not
+        // dead", which is what the real probe does for any answer but `1`.
+        let shim = temp.path().join("tmux");
+        std::fs::write(&shim, format!("#!/bin/sh\necho '{live_name}'\n")).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            temp.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _guard = EnvGuard::set(&[("PATH", path)]);
+
+        let missed = crate::tmux::LiveSessionSnapshot::from_parts(None, None);
+        assert_eq!(
+            inst.tmux_env_session_name_in(&missed),
+            None,
+            "the snapshot alone has nothing to answer an unreachable server with"
+        );
+        assert_eq!(
+            inst.tmux_env_session_name_in_or_probe(&missed).as_deref(),
+            Some(live_name.as_str()),
+            "a one-shot caller falls back to the per-item probe"
+        );
+
+        // A snapshot that did reach the server is authoritative: absent from
+        // its list means absent, with no probe behind it.
+        let observed = crate::tmux::LiveSessionSnapshot::from_parts(Some(Vec::new()), None);
+        assert_eq!(inst.tmux_env_session_name_in_or_probe(&observed), None);
     }
 
     /// Force the tmux session cache into a fresh "server reachable, but this
@@ -9415,6 +9633,66 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn test_merge_diff_passive_transition_stamp_does_not_wipe_concurrent_sink_state() {
+        // #3465: a passive status transition restamped last_accessed_at
+        // (update_status_with_metadata wrote Some(now) on every detected
+        // transition, with no user gesture behind it), and the stamp
+        // reached disk through PassiveStatusPatch while a user action was
+        // in flight. The writer's stale pre snapshot then made the
+        // deliberate touched arm read the advance as a peer touch and wipe
+        // sink state the user had just set. That arm is correct for real
+        // gestures (pinned by test_merge_diff_peer_touch_clears_tui_archive,
+        // the messaging-unarchives rule); the poller stamp was the lie.
+        //
+        // Driven through the real transition path: the
+        // update_status_with_metadata call below detects a genuine
+        // Idle -> Error flip (session forced Absent, see #2936), which on
+        // the pre-fix tree restamped last_accessed_at between the pre
+        // snapshot and the merge.
+        type SinkCase = (&'static str, fn(&mut Instance), fn(&Instance) -> bool);
+        let cases: &[SinkCase] = &[
+            // The issue's headline victim: a concurrent archive.
+            ("archived_at", |i| i.archive(), |i| i.archived_at.is_some()),
+            // Same touched arm, same wipe, for a concurrent snooze.
+            (
+                "snoozed_until",
+                |i| i.snooze(15),
+                |i| i.snoozed_until.is_some(),
+            ),
+        ];
+        let user_touch = Utc::now() - chrono::Duration::seconds(60);
+        for (field, seed_sink, sink_present) in cases {
+            // Snapshot the acting writer held before the poller tick.
+            let mut pre = Instance::new("s", "/tmp/x");
+            pre.live_status_baseline = Some(Status::Idle);
+            pre.status = Status::Idle;
+            pre.last_accessed_at = Some(user_touch);
+
+            // One passive poller tick observes Idle -> Error. On the
+            // pre-fix tree this restamped last_accessed_at on the row that
+            // lands on disk; post-fix it leaves the user-gesture stamp
+            // alone and only updates idle_entered_at bookkeeping.
+            let mut disk = pre.clone();
+            let _cache = force_session_absent();
+            disk.update_status_with_metadata(None, None);
+            assert_eq!(disk.status, Status::Error);
+
+            // The concurrent user action seeds the sink on the writer's
+            // post snapshot.
+            let mut post = pre.clone();
+            seed_sink(&mut post);
+
+            disk.merge_user_action_diff(&pre, &post);
+
+            assert!(
+                sink_present(&disk),
+                "passive transition must not wipe concurrent {field} (#3465)"
+            );
+        }
+    }
+
+    #[test]
     fn test_merge_diff_peer_archive_clears_concurrent_tui_snooze() {
         // The web/TUI/CLI contract treats pinned/archived/snoozed as
         // mutually exclusive (the sidebar tier comparator assumes a
@@ -9435,6 +9713,38 @@ mod tests {
         assert!(
             disk.snoozed_until.is_none(),
             "archive() invariant must clear a concurrent TUI snooze"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_merge_diff_passive_transition_stamp_does_not_wake_dormant_row() {
+        // Dormancy is the third field the touched arm wipes (#3465), with
+        // one structural difference from the archive/snooze cases: it is
+        // never spliced from post, so the wipe only hits a value already
+        // on the row. Seed it on the base instance, drive one passive
+        // poller tick through the real transition path (session forced
+        // Absent, see #2936), and confirm an unrelated user action does
+        // not wake the row just because the pre-fix tree restamped
+        // last_accessed_at in between.
+        let mut pre = Instance::new("s", "/tmp/x");
+        pre.live_status_baseline = Some(Status::Idle);
+        pre.status = Status::Idle;
+        pre.last_accessed_at = Some(Utc::now() - chrono::Duration::seconds(60));
+        pre.idle_dormant_since = Some(Utc::now() - chrono::Duration::hours(5));
+
+        let mut disk = pre.clone();
+        let _cache = force_session_absent();
+        disk.update_status_with_metadata(None, None);
+        assert_eq!(disk.status, Status::Error);
+
+        let mut post = pre.clone();
+        post.favorite();
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(
+            disk.idle_dormant_since.is_some(),
+            "a passive transition must not wake a dormant row (#3465)"
         );
     }
 
@@ -9475,21 +9785,28 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_diff_uses_self_not_post_for_touch_detection() {
+    fn test_merge_diff_preserves_runtime_state_and_peer_touch() {
         let mut pre = Instance::new("s", "/tmp/x");
         pre.last_accessed_at = Some(Utc::now() - chrono::Duration::seconds(60));
         pre.archived_at = Some(Utc::now() - chrono::Duration::seconds(120));
 
         let mut post = pre.clone();
         post.title = "renamed".into();
+        post.status = Status::Running;
 
         let mut disk = pre.clone();
         disk.touch_last_accessed();
+        disk.status = Status::Waiting;
 
         disk.merge_user_action_diff(&pre, &post);
 
         assert_eq!(disk.title, "renamed");
         assert!(disk.archived_at.is_none());
+        assert_eq!(
+            disk.status,
+            Status::Waiting,
+            "runtime status must remain authoritative"
+        );
     }
 
     #[test]
@@ -10181,29 +10498,33 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_update_status_with_metadata_restamps_on_genuine_transition() {
+    fn test_update_status_with_metadata_keeps_last_accessed_at_on_transition() {
         // Once a live baseline is established, a real status change still
-        // restamps normally (no regression from the #2690 fix).
+        // re-anchors idle_entered_at bookkeeping, but must NOT restamp
+        // last_accessed_at (#3465): the field is a user-gesture signal, and
+        // passive stamps reaching disk let merge_user_action_diff's touched
+        // arm wipe concurrently archived rows.
         let mut inst = Instance::new("test", "/tmp/test");
         inst.live_status_baseline = Some(Status::Idle);
         inst.status = Status::Idle;
         inst.idle_entered_at = Some(Utc::now() - chrono::Duration::hours(2));
-        inst.last_accessed_at = Some(Utc::now() - chrono::Duration::hours(2));
+        let user_touch = Some(Utc::now() - chrono::Duration::hours(2));
+        inst.last_accessed_at = user_touch;
 
         // Force detection to resolve to `Absent` -> Error deterministically
         // (see #2936; without this the outcome is schedule-dependent).
         let _cache = force_session_absent();
 
-        let before = Utc::now();
         inst.update_status_with_metadata(None, None);
-        let after = Utc::now();
 
         // Detection confirms the session Absent, resolving to Error: a
         // genuine transition away from the established Idle baseline.
         assert_eq!(inst.status, Status::Error);
         assert_eq!(inst.idle_entered_at, None);
-        let last_accessed = inst.last_accessed_at.expect("must be restamped");
-        assert!(last_accessed >= before && last_accessed <= after);
+        assert_eq!(
+            inst.last_accessed_at, user_touch,
+            "a passive transition must not fabricate a user-gesture stamp"
+        );
         assert_eq!(inst.live_status_baseline, Some(Status::Error));
     }
 
@@ -10250,10 +10571,11 @@ mod tests {
     }
 
     #[test]
-    fn test_update_status_with_metadata_twice_different_statuses_both_restamp() {
-        // Two back-to-back genuine transitions must both restamp, and the
-        // baseline must update between calls so the second comparison is
-        // against the first call's result, not the original value.
+    fn test_update_status_with_metadata_transitions_never_stamp_last_accessed_at() {
+        // Two back-to-back genuine transitions update the idle_entered_at
+        // bookkeeping and re-seed the baseline between calls, but neither
+        // may touch last_accessed_at (#3465): passive stamps wiped
+        // concurrent archives through merge_user_action_diff's touched arm.
         //
         // Archiving short-circuits update_status_with_metadata_inner before
         // it touches `status` (see the `is_archived()` guard), which lets
@@ -10263,35 +10585,27 @@ mod tests {
         inst.archive();
         inst.live_status_baseline = Some(Status::Idle);
         inst.status = Status::Running;
+        let user_touch = Some(Utc::now() - chrono::Duration::hours(2));
+        inst.last_accessed_at = user_touch;
 
-        let before1 = Utc::now();
         inst.update_status_with_metadata(None, None);
-        let after1 = Utc::now();
         assert_eq!(
             inst.status,
             Status::Running,
             "archived guard preserves status"
         );
         assert_eq!(inst.idle_entered_at, None, "non-idle transition clears it");
-        let first_stamp = inst
-            .last_accessed_at
-            .expect("first transition must restamp");
-        assert!(first_stamp >= before1 && first_stamp <= after1);
+        assert_eq!(inst.last_accessed_at, user_touch);
         assert_eq!(inst.live_status_baseline, Some(Status::Running));
 
         inst.status = Status::Idle;
-        let before2 = Utc::now();
         inst.update_status_with_metadata(None, None);
-        let after2 = Utc::now();
         assert_eq!(inst.status, Status::Idle);
-        let second_idle = inst
-            .idle_entered_at
-            .expect("second transition must restamp");
-        assert!(second_idle >= before2 && second_idle <= after2);
         assert!(
-            second_idle >= first_stamp,
-            "second restamp must not be older than the first"
+            inst.idle_entered_at.is_some(),
+            "entering Idle re-anchors idle_entered_at"
         );
+        assert_eq!(inst.last_accessed_at, user_touch);
         assert_eq!(inst.live_status_baseline, Some(Status::Idle));
     }
 
@@ -11781,6 +12095,87 @@ mod tests {
             status_hook_env_prefix("work", "abc123", crate::agents::get_agent("kimi")),
             "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
         );
+    }
+
+    /// Seed the process-global `agent_detect_as` registry for one profile
+    /// and return a guard that restores the profile's prior entries on drop:
+    /// `install_from_config` replaces the whole profile's state and the
+    /// registry outlives every test, so the caller must keep the returned
+    /// guard alive for the duration of its reads.
+    fn install_aliases(
+        profile: &str,
+        aliases: &[(&str, &str)],
+    ) -> crate::tmux::status_rules::ProfileRegistryGuard {
+        let guard = crate::tmux::status_rules::ProfileRegistryGuard::take(profile);
+        let mut config = crate::session::Config::default();
+        for (agent, target) in aliases {
+            config
+                .session
+                .agent_detect_as
+                .insert(agent.to_string(), target.to_string());
+        }
+        crate::tmux::status_rules::install_from_config(profile, &config);
+        guard
+    }
+
+    /// A custom-agent row whose stored `detect_as` is empty must still resolve
+    /// its built-in agent at launch. Without it `status_hook_env_prefix` drops
+    /// `AOE_INSTANCE_ID`, every hook in the agent's settings file bails on
+    /// `[ -n "$AOE_INSTANCE_ID" ]`, and the session reports Idle forever with
+    /// nothing logged. #3398 taught the read sites to consult the live
+    /// registry; this is the launch site.
+    #[test]
+    fn empty_detect_as_still_resolves_the_launch_agent() {
+        const PROFILE: &str = "detect-as-launch-path-test";
+        let _registry = install_aliases(PROFILE, &[("claude-personal", "claude")]);
+
+        let mut inst = Instance::new("orch", "/tmp/x");
+        inst.source_profile = PROFILE.to_string();
+        inst.tool = "claude-personal".to_string();
+        inst.command = "claude-personal".to_string();
+        inst.detect_as = String::new();
+
+        assert_eq!(
+            inst.resolved_agent().map(|a| a.name),
+            Some("claude"),
+            "empty detect_as must fall back to the live agent_detect_as registry"
+        );
+        assert_eq!(
+            status_hook_env_prefix(&inst.effective_profile(), "abc123", inst.resolved_agent()),
+            format!("AOE_PROFILE='{PROFILE}' AOE_INSTANCE_ID='abc123' "),
+        );
+    }
+
+    /// `swap_tool` re-resolves the alias for the incoming tool. The alias is
+    /// per-tool, so carrying the outgoing tool's value forward aims every
+    /// launch-time reader at the wrong built-in.
+    #[test]
+    fn swap_tool_reresolves_detect_as() {
+        const PROFILE: &str = "detect-as-swap-test";
+        let _registry = install_aliases(
+            PROFILE,
+            &[("claude-personal", "claude"), ("codex-personal", "codex")],
+        );
+
+        // (starting tool, stored alias, tool swapped to, expected alias)
+        let cases = [
+            // The reported row: created on a built-in (no alias to store),
+            // then swapped onto a custom agent.
+            ("claude", "", "claude-personal", "claude"),
+            // Custom to custom: the outgoing alias is actively wrong, not
+            // merely stale, so it cannot survive.
+            ("codex-personal", "codex", "claude-personal", "claude"),
+            // Custom back to a built-in: nothing to pin.
+            ("claude-personal", "claude", "codex", ""),
+        ];
+        for (tool, detect_as, new_tool, expected) in cases {
+            let mut inst = Instance::new("t", "/tmp/x");
+            inst.source_profile = PROFILE.to_string();
+            inst.tool = tool.to_string();
+            inst.detect_as = detect_as.to_string();
+            inst.swap_tool(new_tool);
+            assert_eq!(inst.detect_as, expected, "{tool} -> {new_tool}");
+        }
     }
 
     #[test]
@@ -13702,6 +14097,50 @@ mod tests {
                 assert_eq!(inst.agent_session_id.as_deref(), Some(live));
             }
 
+            /// The empty-thread downgrade must cover an id that arrived as a
+            /// live observation, not just one loaded from storage: SessionStart
+            /// fires before Claude writes any content, so the sidecar can name
+            /// a thread with no transcript, and `--resume` on it is a dead pane
+            /// on every restart.
+            #[test]
+            #[serial]
+            fn observed_sid_without_transcript_downgrades_to_fresh() {
+                let temp = tempdir().unwrap();
+                let _guard = claude_home_guard(&temp);
+
+                let project_path = "/tmp/aoe-test-observed-no-transcript";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                let stored = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+                let empty_thread = "11111111-2222-3333-4444-555555555555";
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{stored}.jsonl")),
+                    SystemTime::now() - Duration::from_secs(120),
+                );
+                // No .jsonl for `empty_thread`.
+
+                let mut inst = Instance::new("verify-observed-no-transcript", project_path);
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(stored.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let dir = super::write_sidecar(&inst.id, empty_thread);
+                let (sid, is_existing) = inst.acquire_session_id();
+                std::fs::remove_dir_all(&dir).ok();
+
+                assert_eq!(sid.as_deref(), Some(empty_thread));
+                assert!(
+                    !is_existing,
+                    "an observed sid with no transcript must launch as \
+                     --session-id, never --resume"
+                );
+            }
+
             // An empty Claude thread killed before its first prompt has a
             // stored sid but no transcript on disk. `claude --resume <sid>`
             // would fail for it every time (the "resume failed for sid ...;
@@ -14282,7 +14721,7 @@ mod tests {
 
             // Companion to the above: same setup but the peer carries the
             // default `Status::Idle` and is not archived, exercising the
-            // `!inst.has_live_tmux_pane()` branch on its own. The peer has
+            // `!inst.has_live_tmux_pane_in()` branch on its own. The peer has
             // never spawned a tmux pane in the test, so it counts as
             // pane-less even though its Status field does not flag it.
             #[test]
@@ -14318,7 +14757,7 @@ mod tests {
                 peer_inst.agent_session_id = Some(peer.to_string());
                 assert!(!peer_inst.is_archived());
                 assert!(matches!(peer_inst.status, Status::Idle));
-                assert!(!peer_inst.has_live_tmux_pane());
+                assert!(!peer_inst.has_live_tmux_pane_in(&crate::tmux::LiveSessionSnapshot::new()));
 
                 super::seed_disk_for_sidecar_test(profile, &peer_inst);
 
@@ -14676,6 +15115,454 @@ mod tests {
                 assert_eq!(sid.as_deref(), Some(stored));
                 assert!(is_existing);
                 assert_eq!(inst.agent_session_id.as_deref(), Some(stored));
+            }
+            //
+            // The per-tool bascule tests above run one instance against its
+            // store. Kimi's store is a single append-only
+            // `session_index.jsonl` keyed by workDir with no per-instance
+            // signal, so when two AoE sessions share one cwd the MRU pick can
+            // name either pane's conversation. These fixtures stage the mass
+            // recovery from #3516: every pane holds a stored sid, no peer has
+            // a live tmux pane yet, and the freshest record belongs to a
+            // sibling.
+
+            /// Stage two Kimi index records for one `workDir`, the "fresh"
+            /// one newer than the "stored" one. The recorded `sessionDir`
+            /// paths are regular files rather than directories so their
+            /// mtimes are deterministic through `File::set_times`; the
+            /// selector only stats whatever path the index records.
+            fn seed_kimi_index(home: &std::path::Path, project: &str, stored: &str, fresh: &str) {
+                let now = SystemTime::now();
+                let stored_dir = home.join("sessions").join("stored");
+                let fresh_dir = home.join("sessions").join("fresh");
+                fs::create_dir_all(stored_dir.parent().unwrap()).unwrap();
+                write_with_mtime(&stored_dir, "", now - Duration::from_secs(120));
+                write_with_mtime(&fresh_dir, "", now - Duration::from_secs(5));
+                fs::write(
+                    home.join("session_index.jsonl"),
+                    format!(
+                        "{{\"sessionId\":\"{stored}\",\"sessionDir\":\"{}\",\"workDir\":\"{project}\"}}\n\
+                         {{\"sessionId\":\"{fresh}\",\"sessionDir\":\"{}\",\"workDir\":\"{project}\"}}\n",
+                        stored_dir.display(),
+                        fresh_dir.display(),
+                    ),
+                )
+                .unwrap();
+            }
+
+            #[test]
+            #[serial]
+            fn acquire_kimi_respects_store_ownership() {
+                #[derive(Clone, Copy)]
+                enum PeerKind {
+                    None,
+                    CurrentKimi,
+                    ParkedKimi,
+                    ArchivedKimi,
+                    TrashedKimi,
+                    SandboxedKimi,
+                }
+
+                struct Case {
+                    label: &'static str,
+                    peer: PeerKind,
+                    cross_profile: bool,
+                    same_cwd: bool,
+                    fresh_sid: &'static str,
+                    expected: &'static str,
+                }
+
+                let cases = [
+                    Case {
+                        label: "same-profile-current",
+                        peer: PeerKind::CurrentKimi,
+                        cross_profile: false,
+                        same_cwd: true,
+                        fresh_sid: "kimi-peer-fresh",
+                        expected: "kimi-stored",
+                    },
+                    Case {
+                        label: "sole-owner",
+                        peer: PeerKind::None,
+                        cross_profile: false,
+                        same_cwd: true,
+                        fresh_sid: "kimi-fresh",
+                        expected: "kimi-fresh",
+                    },
+                    Case {
+                        label: "cross-profile-current",
+                        peer: PeerKind::CurrentKimi,
+                        cross_profile: true,
+                        same_cwd: true,
+                        fresh_sid: "kimi-peer-fresh",
+                        expected: "kimi-stored",
+                    },
+                    Case {
+                        label: "different-cwd",
+                        peer: PeerKind::CurrentKimi,
+                        cross_profile: false,
+                        same_cwd: false,
+                        fresh_sid: "kimi-fresh",
+                        expected: "kimi-fresh",
+                    },
+                    Case {
+                        label: "cross-profile-parked",
+                        peer: PeerKind::ParkedKimi,
+                        cross_profile: true,
+                        same_cwd: true,
+                        fresh_sid: "kimi-parked-peer",
+                        expected: "kimi-stored",
+                    },
+                    Case {
+                        label: "cross-profile-archived",
+                        peer: PeerKind::ArchivedKimi,
+                        cross_profile: true,
+                        same_cwd: true,
+                        fresh_sid: "kimi-archived-peer",
+                        expected: "kimi-stored",
+                    },
+                    Case {
+                        label: "cross-profile-trashed",
+                        peer: PeerKind::TrashedKimi,
+                        cross_profile: true,
+                        same_cwd: true,
+                        fresh_sid: "kimi-trashed-peer",
+                        expected: "kimi-stored",
+                    },
+                    Case {
+                        label: "sandbox-private",
+                        peer: PeerKind::SandboxedKimi,
+                        cross_profile: false,
+                        same_cwd: true,
+                        fresh_sid: "kimi-unrelated-host-fresh",
+                        expected: "kimi-unrelated-host-fresh",
+                    },
+                ];
+
+                for case in cases {
+                    let temp = tempdir().unwrap();
+                    let _home = isolate_app_dir_at(temp.path());
+                    let project = temp.path().join(format!("project-{}", case.label));
+                    let other_project = temp.path().join(format!("other-{}", case.label));
+                    fs::create_dir_all(&project).unwrap();
+                    fs::create_dir_all(&other_project).unwrap();
+                    let project = project.to_string_lossy().to_string();
+                    let other_project = other_project.to_string_lossy().to_string();
+                    let kimi_home = temp.path().join("kimi-home");
+                    fs::create_dir_all(&kimi_home).unwrap();
+                    let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", kimi_home.to_str().unwrap())]);
+                    seed_kimi_index(&kimi_home, &project, "kimi-stored", case.fresh_sid);
+
+                    let caller_profile = format!("kimi-owner-{}-caller", case.label);
+                    if !matches!(case.peer, PeerKind::None) {
+                        let peer_profile = if case.cross_profile {
+                            format!("kimi-owner-{}-peer", case.label)
+                        } else {
+                            caller_profile.clone()
+                        };
+                        let peer_path = if case.same_cwd {
+                            project.as_str()
+                        } else {
+                            other_project.as_str()
+                        };
+                        let mut peer = Instance::new("ownership-peer", peer_path);
+                        peer.source_profile = peer_profile.clone();
+                        match case.peer {
+                            PeerKind::None => unreachable!(),
+                            PeerKind::CurrentKimi => {
+                                peer.tool = "kimi".to_string();
+                                peer.agent_session_id = Some(case.fresh_sid.to_string());
+                            }
+                            PeerKind::ParkedKimi => {
+                                peer.tool = "claude".to_string();
+                                peer.prior_tool_session_ids.insert(
+                                    "kimi".to_string(),
+                                    crate::session::instance::PriorToolSession {
+                                        agent_session_id: Some(case.fresh_sid.to_string()),
+                                        acp_session_id: None,
+                                    },
+                                );
+                            }
+                            PeerKind::ArchivedKimi => {
+                                peer.tool = "kimi".to_string();
+                                peer.agent_session_id = Some(case.fresh_sid.to_string());
+                                peer.archive();
+                            }
+                            PeerKind::TrashedKimi => {
+                                peer.tool = "kimi".to_string();
+                                peer.agent_session_id = Some(case.fresh_sid.to_string());
+                                peer.trash();
+                            }
+                            PeerKind::SandboxedKimi => {
+                                peer.tool = "kimi".to_string();
+                                peer.agent_session_id = Some("kimi-sandbox-only".to_string());
+                                peer.sandbox_info = Some(crate::session::SandboxInfo {
+                                    enabled: true,
+                                    container_id: None,
+                                    image: "test-image".to_string(),
+                                    container_name: format!("aoe-test-{}", case.label),
+                                    extra_env: None,
+                                    custom_instruction: None,
+                                    container_workdir: None,
+                                    before_start_env: Vec::new(),
+                                });
+                            }
+                        }
+                        super::seed_disk_for_sidecar_test(&peer_profile, &peer);
+                    }
+
+                    let mut inst = Instance::new("ownership-caller", &project);
+                    inst.source_profile = caller_profile;
+                    inst.tool = "kimi".to_string();
+                    inst.agent_session_id = Some("kimi-stored".to_string());
+                    inst.resume_intent = ResumeIntent::Default;
+
+                    let (sid, is_existing) = inst.acquire_session_id();
+                    assert_eq!(sid.as_deref(), Some(case.expected), "{}", case.label);
+                    assert!(is_existing, "{}", case.label);
+                    assert_eq!(
+                        inst.agent_session_id.as_deref(),
+                        Some(case.expected),
+                        "{}",
+                        case.label
+                    );
+                }
+            }
+            #[test]
+            #[serial]
+            fn kimi_inactive_same_profile_sids_are_excluded() {
+                // Restorable inactive rows retain their Kimi conversation.
+                // The same-profile exclusion feeds both acquire and the live
+                // poller snapshot, while the cross-profile table above proves
+                // the all-profile ownership predicate independently.
+                for (label, peer_sid) in [
+                    ("trashed", "kimi-trashed-peer"),
+                    ("archived", "kimi-archived-peer"),
+                ] {
+                    let temp = tempdir().unwrap();
+                    let _home = isolate_app_dir_at(temp.path());
+                    let project = temp.path().join(format!("inactive-project-{label}"));
+                    fs::create_dir_all(&project).unwrap();
+                    let project = project.to_string_lossy().to_string();
+                    let kimi_home = temp.path().join("kimi-home");
+                    fs::create_dir_all(&kimi_home).unwrap();
+                    let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", kimi_home.to_str().unwrap())]);
+                    seed_kimi_index(&kimi_home, &project, "kimi-stored", peer_sid);
+
+                    let profile = format!("kimi-inactive-{label}");
+                    let mut peer = Instance::new("inactive-peer", &project);
+                    peer.source_profile = profile.clone();
+                    peer.tool = "kimi".to_string();
+                    peer.agent_session_id = Some(peer_sid.to_string());
+                    match label {
+                        "trashed" => peer.trash(),
+                        "archived" => peer.archive(),
+                        _ => unreachable!(),
+                    }
+                    super::seed_disk_for_sidecar_test(&profile, &peer);
+
+                    let mut inst = Instance::new("inactive-caller", &project);
+                    inst.source_profile = profile;
+                    inst.tool = "kimi".to_string();
+                    inst.agent_session_id = Some("kimi-stored".to_string());
+                    inst.resume_intent = ResumeIntent::Default;
+
+                    let exclusion = inst.retroactive_capture_exclusion_set();
+                    assert!(exclusion.contains(peer_sid), "{label} exclusion");
+                    let (sid, _is_existing) = inst.acquire_session_id();
+                    assert_eq!(sid.as_deref(), Some("kimi-stored"), "{label} anchor");
+                }
+            }
+
+            #[test]
+            #[serial]
+            fn kimi_var_form_homes_still_detect_shared_store() {
+                // Profiles spell homes in launch's environment grammar: a peer
+                // profile writing `KIMI_CODE_HOME=$KIMI_SHARED` resolves to
+                // the same physical store as the caller's ambient spelling,
+                // and must count as shared rather than compare as the literal
+                // text `$KIMI_SHARED` (#3516 review cycle).
+                let temp = tempdir().unwrap();
+                let _home = isolate_app_dir_at(temp.path());
+                let project = temp.path().join("var-project");
+                fs::create_dir_all(&project).unwrap();
+                let project = project.to_string_lossy().to_string();
+                let kimi_home = temp.path().join("kimi-home");
+                fs::create_dir_all(&kimi_home).unwrap();
+                let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", kimi_home.to_str().unwrap())]);
+                let _shared = EnvGuard::set(&[("KIMI_SHARED", kimi_home.to_str().unwrap())]);
+
+                let mut peer_config =
+                    crate::session::profile_config::load_profile_config("kimi-var-peer").unwrap();
+                peer_config.overrides.insert(
+                    "environment".to_string(),
+                    serde_json::json!(["KIMI_CODE_HOME=$KIMI_SHARED"]),
+                );
+                crate::session::profile_config::save_profile_config("kimi-var-peer", &peer_config)
+                    .unwrap();
+
+                seed_kimi_index(&kimi_home, &project, "kimi-stored", "kimi-peer-fresh");
+                let mut peer = Instance::new("var-peer", &project);
+                peer.source_profile = "kimi-var-peer".to_string();
+                peer.tool = "kimi".to_string();
+                peer.agent_session_id = Some("kimi-peer-fresh".to_string());
+                super::seed_disk_for_sidecar_test("kimi-var-peer", &peer);
+
+                let mut inst = Instance::new("var-caller", &project);
+                inst.source_profile = "kimi-var-caller".to_string();
+                inst.tool = "kimi".to_string();
+                inst.agent_session_id = Some("kimi-stored".to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, _is_existing) = inst.acquire_session_id();
+                assert_eq!(
+                    sid.as_deref(),
+                    Some("kimi-stored"),
+                    "a $VAR-spelled peer home resolving to the same store must count as shared"
+                );
+            }
+            #[test]
+            #[serial]
+            fn kimi_shared_store_refuses_id_less_retroactive_fill() {
+                // The shared-store refusal lives in try_retroactive_capture,
+                // so it also covers the id-less doors (recovery of a session
+                // that never captured, read-command self-heal): the scan is
+                // refused entirely, yielding a fresh start instead of an
+                // unattributable adoption, while a sole-owner store keeps
+                // filling from the index.
+                for (label, peer_state, expected) in [
+                    ("shared-unattributed", Some("unattributed"), None),
+                    ("shared-stopped-known", Some("stopped-known"), None),
+                    ("solo", None, Some("kimi-fresh")),
+                ] {
+                    let temp = tempdir().unwrap();
+                    let _home = isolate_app_dir_at(temp.path());
+                    let project = temp.path().join(format!("idless-project-{label}"));
+                    fs::create_dir_all(&project).unwrap();
+                    let project = project.to_string_lossy().to_string();
+                    let kimi_home = temp.path().join("kimi-home");
+                    fs::create_dir_all(&kimi_home).unwrap();
+                    let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", kimi_home.to_str().unwrap())]);
+                    let old_sid = if peer_state == Some("stopped-known") {
+                        "kimi-stale-peer"
+                    } else {
+                        "kimi-stored"
+                    };
+                    seed_kimi_index(&kimi_home, &project, old_sid, "kimi-fresh");
+
+                    if let Some(peer_state) = peer_state {
+                        let profile = format!("kimi-idless-{label}");
+                        let mut peer = Instance::new("idless-peer", &project);
+                        peer.source_profile = profile.clone();
+                        peer.tool = "kimi".to_string();
+                        if peer_state == "stopped-known" {
+                            peer.status = Status::Stopped;
+                            peer.agent_session_id = Some(old_sid.to_string());
+                        }
+                        super::seed_disk_for_sidecar_test(&profile, &peer);
+                    }
+
+                    let mut inst = Instance::new("idless-caller", &project);
+                    inst.tool = "kimi".to_string();
+
+                    assert_eq!(
+                        inst.try_retroactive_capture(),
+                        expected.map(str::to_string),
+                        "{label} store"
+                    );
+                }
+            }
+
+            #[test]
+            #[serial]
+            fn kimi_anchor_kept_when_profile_list_unreadable() {
+                // Fail-closed branch: an erroring profile walk must report
+                // shared, keeping the anchored sid rather than licensing the
+                // MRU retarget. Driven through the existing list_profiles
+                // injection seam.
+                let temp = tempdir().unwrap();
+                let _home = isolate_app_dir_at(temp.path());
+                let project = temp.path().join("failclosed-project");
+                fs::create_dir_all(&project).unwrap();
+                let project = project.to_string_lossy().to_string();
+                let kimi_home = temp.path().join("kimi-home");
+                fs::create_dir_all(&kimi_home).unwrap();
+                let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", kimi_home.to_str().unwrap())]);
+                seed_kimi_index(&kimi_home, &project, "kimi-stored", "kimi-peer-fresh");
+
+                let profile = "kimi-failclosed";
+                let mut peer = Instance::new("failclosed-peer", &project);
+                peer.source_profile = profile.to_string();
+                peer.tool = "kimi".to_string();
+                peer.agent_session_id = Some("kimi-peer-fresh".to_string());
+                super::seed_disk_for_sidecar_test(profile, &peer);
+
+                let mut inst = Instance::new("failclosed-caller", &project);
+                inst.source_profile = profile.to_string();
+                inst.tool = "kimi".to_string();
+                inst.agent_session_id = Some("kimi-stored".to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let _failure = crate::session::FailNextListProfilesGuard::new();
+                let (sid, _is_existing) = inst.acquire_session_id();
+                assert_eq!(
+                    sid.as_deref(),
+                    Some("kimi-stored"),
+                    "an unreadable profile list must count as shared"
+                );
+            }
+
+            #[test]
+            #[serial]
+            fn kimi_invalid_peer_config_fails_closed() {
+                let temp = tempdir().unwrap();
+                let _home = isolate_app_dir_at(temp.path());
+                let project = temp.path().join("invalid-config-project");
+                fs::create_dir_all(&project).unwrap();
+                let project = project.to_string_lossy().to_string();
+                let kimi_home = temp.path().join("kimi-home");
+                let ambient_home = temp.path().join("ambient-kimi-home");
+                fs::create_dir_all(&kimi_home).unwrap();
+                fs::create_dir_all(&ambient_home).unwrap();
+                let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", ambient_home.to_str().unwrap())]);
+                seed_kimi_index(&kimi_home, &project, "kimi-stored", "kimi-peer-fresh");
+
+                let caller_profile = "kimi-invalid-config-caller";
+                let mut caller_config =
+                    crate::session::profile_config::load_profile_config(caller_profile).unwrap();
+                caller_config.overrides.insert(
+                    "environment".to_string(),
+                    serde_json::json!([format!("KIMI_CODE_HOME={}", kimi_home.display())]),
+                );
+                crate::session::profile_config::save_profile_config(caller_profile, &caller_config)
+                    .unwrap();
+
+                let peer_profile = "kimi-invalid-config-peer";
+                let mut peer = Instance::new("invalid-config-peer", &project);
+                peer.source_profile = peer_profile.to_string();
+                peer.tool = "kimi".to_string();
+                peer.agent_session_id = Some("kimi-peer-fresh".to_string());
+                super::seed_disk_for_sidecar_test(peer_profile, &peer);
+                fs::write(
+                    crate::session::get_profile_dir_path(peer_profile)
+                        .unwrap()
+                        .join("config.toml"),
+                    "environment = [",
+                )
+                .unwrap();
+
+                let mut inst = Instance::new("invalid-config-caller", &project);
+                inst.source_profile = caller_profile.to_string();
+                inst.tool = "kimi".to_string();
+                inst.agent_session_id = Some("kimi-stored".to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, _is_existing) = inst.acquire_session_id();
+                assert_eq!(
+                    sid.as_deref(),
+                    Some("kimi-stored"),
+                    "invalid peer config must not license ambient-home MRU"
+                );
             }
         }
 
