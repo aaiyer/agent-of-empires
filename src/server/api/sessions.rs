@@ -4353,7 +4353,11 @@ async fn purge_session_artifacts(
         crate::session::deletion::PurgeReservation::Rejected(result) => {
             return match result.disposition {
                 crate::session::deletion::DeletionDisposition::AlreadyGone => {
-                    state.instances.write().await.retain(|row| row.id != id);
+                    remove_instance(
+                        &mut *state.instances.write().await,
+                        id,
+                        &state.mutation_epoch,
+                    );
                     state.instance_locks.write().await.remove(id);
                     Ok((true, result.messages))
                 }
@@ -4394,8 +4398,14 @@ async fn purge_session_artifacts(
             Err(result) => *result,
             Ok(committed) => {
                 // Remove the local mirror before awaiting ACP so the reconciler
-                // cannot surface a durable row that no longer exists.
-                state.instances.write().await.retain(|row| row.id != id);
+                // cannot surface a durable row that no longer exists. Bumps the
+                // epoch under the same lock: the ACP teardown below is slow, and
+                // a reload landing inside it would otherwise restore the row.
+                remove_instance(
+                    &mut *state.instances.write().await,
+                    id,
+                    &state.mutation_epoch,
+                );
 
                 // The worker may still use the worktree, so ACP teardown stays
                 // ahead of sidecar cleanup. The durable row is already gone.
@@ -4469,18 +4479,15 @@ async fn purge_session_artifacts(
     }
 
     {
-        let mut instances = state.instances.write().await;
-        instances.retain(|i| i.id != id);
         // The row is now gone from both disk and memory, so any reloader still
         // carrying a `sessions.json` snapshot that predates either removal must
-        // drop it rather than fold the deleted row back in. Bump while still
-        // holding the `instances` write lock: a reloader checks the epoch under
-        // that same lock, so the removal and the bump land as one step and a
-        // reload cannot slip between them. See invariant 8 on
-        // `reload_state_instances_from_disk`.
-        state
-            .delete_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // drop it rather than fold the deleted row back in. `remove_instance`
+        // bumps while still holding the `instances` write lock: a reloader
+        // checks the epoch under that same lock, so the removal and the bump
+        // land as one step and a reload cannot slip between them. See
+        // invariant 8 on `reload_state_instances_from_disk`.
+        let mut instances = state.instances.write().await;
+        remove_instance(&mut instances, id, &state.mutation_epoch);
     }
     state.instance_locks.write().await.remove(id);
     if let Some(entry) = recent_entry {
@@ -5207,24 +5214,6 @@ pub struct MayaRestrictedCreateBody {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MayaImportSessionBody {
-    source_t3_thread_id: String,
-    source_catalog_sha256: String,
-}
-
-#[derive(Serialize)]
-pub struct MayaImportSessionResponse {
-    schema: u8,
-    #[serde(rename = "type")]
-    kind: &'static str,
-    session: SessionResponse,
-    source_t3_thread_id: String,
-    source_catalog_sha256: String,
-    managed_codex_session_id: String,
-}
-
-#[derive(Deserialize)]
 #[serde(untagged)]
 pub enum CreateSessionRequestBody {
     MayaRestricted(MayaRestrictedCreateBody),
@@ -5275,164 +5264,6 @@ fn maya_restricted_create_body(body: MayaRestrictedCreateBody) -> CreateSessionB
         fork_from: None,
         callback_url: None,
         idempotency_key: None,
-    }
-}
-
-pub async fn maya_import_session(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<MayaImportSessionBody>,
-) -> impl IntoResponse {
-    if !state.maya_restricted {
-        return super::session_not_found();
-    }
-
-    let source_id = body.source_t3_thread_id;
-    let catalog_digest = body.source_catalog_sha256;
-    let source_for_load = source_id.clone();
-    let digest_for_load = catalog_digest.clone();
-    let binding = match tokio::task::spawn_blocking(move || {
-        crate::server::maya_restricted::load_import_binding(&source_for_load, &digest_for_load)
-    })
-    .await
-    {
-        Ok(Ok(binding)) => binding,
-        Ok(Err(error)) => {
-            tracing::warn!(target: "http.api.sessions", %error, "Maya import binding rejected");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "invalid_import_binding",
-                    "message": error.to_string(),
-                })),
-            )
-                .into_response();
-        }
-        Err(error) => {
-            tracing::error!(target: "http.api.sessions", %error, "Maya import binding task failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-
-    let idempotency_key = format!("maya-t3-import:{}", binding.source_t3_thread_id);
-    let lock = state.idempotency_lock(&idempotency_key).await;
-    let _guard = lock.lock_owned().await;
-    if let Some(existing) = {
-        let instances = state.instances.read().await;
-        find_by_idempotency_key(&instances, &idempotency_key).cloned()
-    } {
-        if !crate::server::maya_restricted::is_restricted_session(&existing)
-            || existing.acp_session_id.as_deref() != Some(binding.managed_codex_session_id.as_str())
-            || existing.maya_import_source.as_ref()
-                != Some(&crate::session::MayaImportSourceBinding {
-                    source_t3_thread_id: binding.source_t3_thread_id.clone(),
-                    source_catalog_sha256: catalog_digest.clone(),
-                    managed_codex_session_id: binding.managed_codex_session_id.clone(),
-                })
-        {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "import_binding_conflict",
-                    "message": "Existing import session does not match the authenticated binding",
-                })),
-            )
-                .into_response();
-        }
-        return (
-            StatusCode::OK,
-            Json(MayaImportSessionResponse {
-                schema: 1,
-                kind: "maya_aoe_import_session_projection",
-                session: SessionResponse::from_instance(
-                    &existing,
-                    crate::claude_settings::read_tui_fullscreen(),
-                ),
-                source_t3_thread_id: binding.source_t3_thread_id,
-                source_catalog_sha256: catalog_digest,
-                managed_codex_session_id: binding.managed_codex_session_id,
-            }),
-        )
-            .into_response();
-    }
-
-    let spec = crate::server::session_spawn::StructuredSessionSpec {
-        title: Some(binding.title),
-        path: crate::server::maya_restricted::PROJECT_PATH.into(),
-        group: String::new(),
-        tool: "codex".into(),
-        worktree_enabled: false,
-        worktree_branch: None,
-        create_new_branch: false,
-        base_branch: None,
-        sandbox: false,
-        sandbox_image: None,
-        yolo_mode: false,
-        extra_env: Vec::new(),
-        extra_args: String::new(),
-        command_override: String::new(),
-        extra_repo_paths: Vec::new(),
-        repo_base_branches: Vec::new(),
-        scratch: false,
-        trust_hooks: None,
-        custom_instruction: None,
-        callback_url: None,
-        idempotency_key: Some(idempotency_key),
-        maya_import_source: Some(crate::session::MayaImportSourceBinding {
-            source_t3_thread_id: binding.source_t3_thread_id.clone(),
-            source_catalog_sha256: catalog_digest.clone(),
-            managed_codex_session_id: binding.managed_codex_session_id.clone(),
-        }),
-        allow_hooks: false,
-        profile: crate::server::maya_restricted::PROFILE_NAME.into(),
-        created_by_plugin: None,
-        plugin_create_idempotency: None,
-        pending_initial_turn: None,
-        acp_mode_id: None,
-        #[cfg(feature = "serve")]
-        view: crate::session::View::Structured,
-        #[cfg(feature = "serve")]
-        agent_name: None,
-        #[cfg(feature = "serve")]
-        agent_model: None,
-        #[cfg(feature = "serve")]
-        agent_effort: None,
-        #[cfg(feature = "serve")]
-        import_acp_session_id: Some(binding.managed_codex_session_id.clone()),
-        #[cfg(feature = "serve")]
-        fork_seed: None,
-    };
-
-    match state
-        .session_service
-        .create_structured_session(spec, None, None, None)
-        .await
-    {
-        Ok((outcome, _)) => (
-            StatusCode::CREATED,
-            Json(MayaImportSessionResponse {
-                schema: 1,
-                kind: "maya_aoe_import_session_projection",
-                session: SessionResponse::from_instance(
-                    &outcome.instance,
-                    crate::claude_settings::read_tui_fullscreen(),
-                ),
-                source_t3_thread_id: binding.source_t3_thread_id,
-                source_catalog_sha256: catalog_digest,
-                managed_codex_session_id: binding.managed_codex_session_id,
-            }),
-        )
-            .into_response(),
-        Err(error) => {
-            tracing::error!(target: "http.api.sessions", %error, "Maya import create failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "import_create_failed",
-                    "message": error.to_string(),
-                })),
-            )
-                .into_response()
-        }
     }
 }
 
@@ -5564,6 +5395,35 @@ pub(crate) fn upsert_instance(
         *existing = instance;
     } else {
         instances.push(instance);
+    }
+}
+
+/// Remove `id` from the live registry, bumping `mutation_epoch` when a row was
+/// actually removed.
+///
+/// The delete path removes a row from `state.instances` in three places: the
+/// `AlreadyGone` short-circuit, the structured purge's early mirror removal
+/// (which then awaits ACP teardown before the handler finishes), and the final
+/// commit block. Every one of them has to bump, and has to bump while the
+/// caller still holds the `instances` write lock, because a reloader compares
+/// the epoch under that same lock. A removal that skips the bump leaves a
+/// window where a disk reload carrying a pre-delete snapshot rebuilds
+/// `state.instances` from it and puts the deleted row back, so
+/// `GET /api/sessions` lists a session the user just deleted.
+///
+/// Bumping only on an actual removal keeps the final commit block from
+/// spending an epoch when the early removal already took the row; if a stale
+/// reload DID restore it in between, the retain here finds it, removes it
+/// again, and bumps as it should.
+pub(crate) fn remove_instance(
+    instances: &mut Vec<crate::session::Instance>,
+    id: &str,
+    mutation_epoch: &std::sync::atomic::AtomicU64,
+) {
+    let before = instances.len();
+    instances.retain(|i| i.id != id);
+    if instances.len() != before {
+        mutation_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -6372,7 +6232,6 @@ pub async fn create_session(
         custom_instruction: body.custom_instruction,
         callback_url: body.callback_url,
         idempotency_key: body.idempotency_key,
-        maya_import_source: None,
         allow_hooks: !state.maya_restricted,
         profile,
         // Never decoded from the request body: only the plugin host path
@@ -7983,22 +7842,42 @@ pub async fn serve_session_artifact(Path((id, path)): Path<(String, String)>) ->
 mod tests {
     use super::*;
 
+    /// `remove_instance` is the only way a row leaves `state.instances` on the
+    /// delete path, so the epoch bump has to be tied to an actual removal
+    /// rather than to reaching the call. Bumping unconditionally would spend
+    /// an epoch on the final commit block after the structured purge's early
+    /// removal already took the row, dropping a reload that was perfectly
+    /// valid; not bumping at all leaves the window a stale reload uses to put
+    /// a deleted row back.
     #[test]
-    fn maya_import_response_carries_the_migration_projection_discriminator() {
-        let instance = Instance::new("Imported", crate::server::maya_restricted::PROJECT_PATH);
-        let response = MayaImportSessionResponse {
-            schema: 1,
-            kind: "maya_aoe_import_session_projection",
-            session: SessionResponse::from_instance(&instance, false),
-            source_t3_thread_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
-            source_catalog_sha256: "a".repeat(64),
-            managed_codex_session_id: "11111111-1111-4111-8111-111111111111".into(),
-        };
-        let document = serde_json::to_value(response).expect("serialize import projection");
-        assert_eq!(document["schema"], 1);
-        assert_eq!(document["type"], "maya_aoe_import_session_projection");
-    }
+    fn remove_instance_bumps_the_epoch_only_when_it_removes_a_row() {
+        let epoch = std::sync::atomic::AtomicU64::new(0);
+        let read = || epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let mut instances = vec![
+            Instance::new("keep", "/tmp/keep"),
+            Instance::new("doomed", "/tmp/doomed"),
+        ];
+        let doomed_id = instances[1].id.clone();
 
+        remove_instance(&mut instances, &doomed_id, &epoch);
+        assert_eq!(read(), 1, "a real removal bumps");
+        assert_eq!(
+            instances
+                .iter()
+                .map(|i| i.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep"]
+        );
+
+        // The structured purge reaches the final commit block after its early
+        // removal already took the row. Nothing left to remove, nothing to
+        // invalidate, so no epoch is spent.
+        remove_instance(&mut instances, &doomed_id, &epoch);
+        assert_eq!(read(), 1, "a no-op removal does not bump");
+
+        remove_instance(&mut instances, "never-existed", &epoch);
+        assert_eq!(read(), 1, "an unknown id does not bump");
+    }
     fn build_rename_test_state(
         persisted: Vec<Instance>,
         cached: Vec<Instance>,

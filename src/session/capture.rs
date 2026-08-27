@@ -128,6 +128,10 @@ pub(crate) fn encode_claude_project_path(project_path: &str) -> String {
 /// [`claude_home_for_host_environment`]).
 ///
 /// Used as a fallback when hooks don't fire (e.g. after `/clear` or `/new`).
+/// Both arms only ever yield an id with a transcript on disk: the dir scan by
+/// construction, and the `.claude.json` arm because it is gated on one. A
+/// freshly cleared thread is therefore declined until its first content lands,
+/// which is the one case this narrows.
 pub(crate) fn capture_claude_session_id(
     project_path: &str,
     known_session_id: Option<&str>,
@@ -160,7 +164,23 @@ pub(crate) fn capture_claude_session_id(
         let is_fresh = claude_json
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age <= Duration::from_secs(5 * 60));
-        if is_fresh && Uuid::parse_str(&id).is_ok() {
+        // `is_fresh` is the mtime of `.claude.json` itself, which any live
+        // Claude anywhere rewrites, so it says nothing about when *this*
+        // directory's `lastSessionId` was set and a value months old still
+        // reads as fresh. And unlike the dir scan above, which can only return
+        // ids it found as files, this slot can name a UUID no transcript was
+        // ever written for. Requiring the conversation to exist is what keeps
+        // `--resume` off an id Claude answers with "No conversation found",
+        // which leaves the pane dead on every restart from then on.
+        //
+        // The cost is the short window after `/clear` or `/new` where the slot
+        // names a thread Claude has not written to yet: the arm declines it,
+        // and the dir scan picks the new id up once content lands. Resuming it
+        // in that window would fail anyway.
+        if is_fresh
+            && Uuid::parse_str(&id).is_ok()
+            && !claude_host_transcript_confirmed_absent(&canonical.to_string_lossy(), &id, host_env)
+        {
             return Ok(id);
         }
     }
@@ -956,7 +976,22 @@ pub(crate) fn compose_exclusion(
     current_instance_id: &str,
     extra: &HashSet<String>,
 ) -> HashSet<String> {
-    let mut set = build_exclusion_set(current_instance_id);
+    compose_exclusion_in(
+        current_instance_id,
+        extra,
+        &crate::tmux::LiveSessionSnapshot::new(),
+    )
+}
+
+/// [`compose_exclusion`] against a snapshot the caller already holds, so a
+/// pass that also probes per-instance liveness observes tmux once instead of
+/// twice.
+fn compose_exclusion_in(
+    current_instance_id: &str,
+    extra: &HashSet<String>,
+    live: &crate::tmux::LiveSessionSnapshot,
+) -> HashSet<String> {
+    let mut set = build_exclusion_set(current_instance_id, live);
     set.extend(extra.iter().cloned());
     set
 }
@@ -971,16 +1006,17 @@ pub(crate) fn compose_exclusion(
 /// starts. Parked conversations are no longer published in the peer's tmux
 /// environment, so [`build_exclusion_set`] cannot see them. Without this set,
 /// another session can capture the parked conversation before its owner swaps
-/// back. Claude and host Codex additionally need stopped peer protection
-/// because their mtime fallbacks can select a transcript after the owning tmux
-/// pane disappears (#2355). Sandboxed Codex sessions have instance-private
-/// `CODEX_HOME` directories and do not share a transcript store (#3317).
+/// back. Claude, host Codex, and host Kimi additionally need inactive
+/// same-tool protection because their shared-store MRU scans can select a
+/// conversation after the owning pane disappears. Sandboxed Codex and Kimi
+/// omit that protection because their stores are instance-private or are not
+/// captured from the host (#3317).
 ///
-/// Scope: the host transcript directories are keyed by `$HOME`, not by AoE
-/// profile, but this helper only inspects `sessions.json` for the caller's
-/// effective profile. A stopped peer in a different profile against the same
-/// host `$HOME` will not be excluded; the residual gap is narrower than #2355's
-/// trigger and is left for a follow-up.
+/// Scope: host stores are keyed by each agent's effective home, not by AoE
+/// profile, but this helper inspects only `sessions.json` for the caller's
+/// effective profile. A stopped peer in another profile against the same
+/// agent home will not be excluded; callers needing global ownership must
+/// compose their own cross-profile check.
 pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
@@ -989,7 +1025,16 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
     profile: &str,
     retroactive_capture_excludes: &HashSet<String>,
 ) -> HashSet<String> {
-    let mut set = compose_exclusion(current_instance_id, retroactive_capture_excludes);
+    // One observation for the whole pass. Both halves consult tmux: the
+    // cross-instance scan needs the live session names, and the walk below
+    // visits every stored session sharing the project path, trashed ones
+    // included, so a per-instance liveness probe costs a fork each. A store of
+    // a few hundred sessions made that the dominant cost of the pass.
+    // `names() == None` (server unreachable) reads as "no live pane" here,
+    // which is what the per-item probe already did when its own
+    // `list-sessions` failed, and this pass re-runs.
+    let live = crate::tmux::LiveSessionSnapshot::new();
+    let mut set = compose_exclusion_in(current_instance_id, retroactive_capture_excludes, &live);
     let Ok(storage) = crate::session::storage::Storage::new_unwatched(profile) else {
         return set;
     };
@@ -1026,7 +1071,7 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
         }
         let should_exclude = matches!(inst.status, crate::session::Status::Stopped)
             || inst.is_archived()
-            || !inst.has_live_tmux_pane();
+            || !inst.has_live_tmux_pane_in(&live);
         if !should_exclude {
             continue;
         }
@@ -1049,18 +1094,17 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
 /// the resume-fallback cascade's just-crashed sid) should use
 /// [`compose_exclusion`] instead, which composes this function with the
 /// per-instance exclusion list.
-fn build_exclusion_set(current_instance_id: &str) -> HashSet<String> {
-    let output = match crate::tmux::tmux_command()
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return HashSet::new(),
+fn build_exclusion_set(
+    current_instance_id: &str,
+    live: &crate::tmux::LiveSessionSnapshot,
+) -> HashSet<String> {
+    let Some(names) = live.names() else {
+        return HashSet::new();
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let aoe_sessions: Vec<&str> = stdout
-        .lines()
+    let aoe_sessions: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
         .filter(|name| {
             name.starts_with(crate::tmux::SESSION_PREFIX)
                 && !name.starts_with(crate::tmux::TOOL_PREFIX)
@@ -2694,39 +2738,150 @@ fn select_kimi_session(
 
 /// Capture a Kimi Code session ID for `project_path`.
 ///
-/// Reads `~/.kimi-code/session_index.jsonl` (or
-/// `$KIMI_CODE_HOME/session_index.jsonl`) and returns the id of the most
-/// recently created session whose recorded `workDir` matches `project_path`,
-/// skipping any ids in `exclusion`. `launch_time_ms` gates live polling to
-/// sessions created after this run started (`None` for retroactive recovery).
-/// Kimi resumes the returned id with `kimi --session <id>`.
+/// Reads `session_index.jsonl` under the Kimi home resolved from
+/// `environment` and returns the id of the most recently created session
+/// whose recorded `workDir` matches `project_path`, skipping any ids in
+/// `exclusion`. `environment` must be the launched pane's host environment so
+/// the scan reads the same physical store Kimi writes (`KIMI_CODE_HOME`
+/// honored through launch's `$VAR` / bare-key grammar). `launch_time_ms`
+/// gates live polling to sessions created after this run started (`None` for
+/// retroactive recovery). Kimi resumes the returned id with `kimi --session
+/// <id>`.
 pub(crate) fn capture_kimi_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
     launch_time_ms: Option<f64>,
+    environment: &[String],
 ) -> Result<String> {
-    let home = resolve_agent_home(Some("KIMI_CODE_HOME"), ".kimi-code")?;
+    let home = kimi_home_for_environment(environment)
+        .ok_or_else(|| anyhow::anyhow!("could not resolve the Kimi home"))?;
     let sessions = read_kimi_session_index(&home.join("session_index.jsonl"))?;
     select_kimi_session(&sessions, project_path, exclusion, launch_time_ms)
 }
 
 /// Polling closure for Kimi Code session tracking. `launch_time_ms` floors the
 /// live poll so it never claims a conversation that predates this launch.
+/// `environment` is snapshotted from the instance at poller construction so
+/// every tick reads the store the launched pane writes.
 pub(crate) fn kimi_poll_fn(
     project_path: String,
     instance_id: String,
     launch_time_ms: f64,
     extra_excludes: HashSet<String>,
+    environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        capture_kimi_session_id(&project_path, &exclusion, Some(launch_time_ms))
-            .map_err(
-                |e| tracing::debug!(target: "session.capture", "Kimi poll capture failed: {}", e),
-            )
-            .ok()
-            .and_then(validated_session_id)
+        capture_kimi_session_id(
+            &project_path,
+            &exclusion,
+            Some(launch_time_ms),
+            &environment,
+        )
+        .map_err(|e| tracing::debug!(target: "session.capture", "Kimi poll capture failed: {}", e))
+        .ok()
+        .and_then(validated_session_id)
     }
+}
+
+/// Effective Kimi home for one environment list: `KIMI_CODE_HOME` resolved
+/// through the same `$VAR` / bare-key grammar launch applies
+/// ([`crate::session::environment::resolve_host_environment_value`]), else the
+/// ambient default resolution. An empty resolved value counts as unset; `None`
+/// when even the default cannot be resolved (the sharing predicate fails
+/// closed on `None`).
+fn kimi_home_for_environment(environment: &[String]) -> Option<PathBuf> {
+    crate::session::environment::resolve_host_environment_value(environment, "KIMI_CODE_HOME")
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+        .or_else(|| resolve_agent_home(Some("KIMI_CODE_HOME"), ".kimi-code").ok())
+        .filter(|home| !home.as_os_str().is_empty())
+}
+
+/// Whether another persisted host AoE session shares this one's Kimi store: a
+/// resolvable own home plus the same canonicalized project path. When true,
+/// the newest matching record in the session index cannot be attributed to
+/// this pane, so the acquire-time MRU scan behind
+/// [`capture_kimi_session_id`] must not run (#3516). The live poller still
+/// runs that scan on shared stores, bounded by its launch-time floor and the
+/// exclusion sets.
+///
+/// `own_resolved_environment` is the caller's
+/// [`Instance::resolved_host_environment`] and `own_profile_environment` its
+/// static profile list; the own side matches peers against either home so a
+/// hook that deterministically mints a different `KIMI_CODE_HOME` still
+/// counts its profile siblings as sharing. Peers are judged on their static
+/// profile list because minted pairs are runtime state that is deliberately
+/// not persisted.
+///
+/// The walk covers every AoE profile because the store is keyed by resolved
+/// home plus cwd, not by profile: two profiles resolving to one home share
+/// one store. It fails closed: an unreadable profile list, config, or store,
+/// or no resolvable own home all report shared, because ownership that cannot
+/// be proven must not license an MRU retarget. Current Kimi peers and peers
+/// with a parked Kimi conversation count even when stopped, pane-less,
+/// archived, or trashed: the former race during recovery and the latter
+/// remain restorable owners. Sandboxed peers are skipped because their Kimi
+/// stores are container-private.
+pub(crate) fn kimi_store_is_shared(
+    current_instance_id: &str,
+    current_project_path: &str,
+    own_resolved_environment: &[String],
+    own_profile_environment: &[String],
+) -> bool {
+    let canonical_current = canonicalize_or_raw(current_project_path);
+    let own_homes = [own_resolved_environment, own_profile_environment]
+        .iter()
+        .filter_map(|env| kimi_home_for_environment(env))
+        .map(|home| canonicalize_or_raw(home.to_string_lossy().as_ref()))
+        .collect::<Vec<_>>();
+    if own_homes.is_empty() {
+        return true;
+    }
+    let Ok(profiles) = crate::session::list_profiles() else {
+        return true;
+    };
+    for peer_profile in profiles {
+        // Judge the namespace before paying for the store read: a peer whose
+        // resolved home differs cannot share this store however many rows its
+        // sessions.json holds. A successful resolve idempotently reinstalls
+        // that profile's status rules; a failed resolve returns shared without
+        // installing fallback rules or clearing the prior registry state.
+        let Ok(peer_config) = super::profile_config::resolve_config(&peer_profile) else {
+            return true;
+        };
+        let Some(peer_home) = kimi_home_for_environment(&peer_config.environment) else {
+            return true;
+        };
+        let peer_home = canonicalize_or_raw(peer_home.to_string_lossy().as_ref());
+        if !own_homes.contains(&peer_home) {
+            continue;
+        }
+        let Ok(storage) = crate::session::storage::Storage::new_unwatched(&peer_profile) else {
+            return true;
+        };
+        let Ok(instances) = storage.load() else {
+            return true;
+        };
+        for inst in instances {
+            if inst.id == current_instance_id || inst.is_sandboxed() {
+                continue;
+            }
+            let owns_kimi = inst.tool == "kimi"
+                || inst
+                    .prior_tool_session_ids
+                    .get("kimi")
+                    .and_then(|prior| prior.agent_session_id.as_deref())
+                    .is_some_and(|sid| !sid.is_empty());
+            if !owns_kimi {
+                continue;
+            }
+            if canonicalize_or_raw(&inst.project_path) == canonical_current {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // ─── Hermes session capture ───────────────────────────────────────────────────
@@ -3093,6 +3248,114 @@ mod tests {
     use super::*;
     use crate::session::test_support::EnvGuard;
     use serial_test::serial;
+
+    /// Well before the 5-minute live-capture window, in the same absolute-epoch
+    /// form the other mtime-ordering tests in this module pin.
+    const STALE_JSONL_MTIME: u64 = 1_700_000_000;
+
+    /// Scaffold for the `.claude.json` fallback arm: a project dir whose only
+    /// jsonl is older than the 5-minute live-capture window, so
+    /// `capture_claude_session_id` falls past the dir scan, plus a
+    /// `.claude.json` naming `last_session_id` for that directory. Returns the
+    /// encoded transcript dir.
+    fn claude_json_fallback_home(
+        temp: &tempfile::TempDir,
+        project_path: &str,
+        stale_transcript: &str,
+        last_session_id: &str,
+    ) -> std::path::PathBuf {
+        let dir = temp
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(encode_claude_project_path(
+                &canonicalize_or_raw(project_path).to_string_lossy(),
+            ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let jsonl = dir.join(format!("{stale_transcript}.jsonl"));
+        std::fs::write(&jsonl, "").unwrap();
+        set_mtime_secs(&jsonl, STALE_JSONL_MTIME);
+
+        // Placed and keyed the way production reads it. `.claude.json` sits
+        // *inside* the config dir when `CLAUDE_CONFIG_DIR` selects it (#3410),
+        // which this fixture sets, and the `projects` key is canonicalized: on
+        // macOS `/tmp` is a symlink, so a raw key would miss and the reject
+        // case below would pass without ever reaching the gate.
+        std::fs::write(
+            temp.path().join(".claude").join(".claude.json"),
+            serde_json::json!({
+                "projects": {
+                    canonicalize_or_raw(project_path).to_string_lossy().to_string():
+                        { "lastSessionId": last_session_id }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn claude_json_env(temp: &tempfile::TempDir) -> EnvGuard {
+        EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("CLAUDE_CONFIG_DIR", temp.path().join(".claude")),
+        ])
+    }
+
+    /// `.claude.json`'s `lastSessionId` is one slot per *directory*, and the
+    /// freshness gate around it reads the mtime of `.claude.json` itself,
+    /// which any live Claude rewrites, so a months-old value still passes.
+    /// Handing that id out for `--resume` when no transcript backs it is a
+    /// guaranteed "No conversation found" and a dead pane on every restart.
+    #[test]
+    #[serial]
+    fn claude_json_fallback_rejects_sid_with_no_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_path = "/tmp/aoe-test-claude-json-phantom";
+        let _guard = claude_json_env(&temp);
+        claude_json_fallback_home(
+            &temp,
+            project_path,
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "11111111-2222-3333-4444-555555555555",
+        );
+
+        let err = capture_claude_session_id(project_path, None, &HashSet::new(), &[])
+            .expect_err("a lastSessionId with no transcript must not be captured");
+        assert!(
+            err.to_string().contains("No active Claude session found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Companion: the arm still works when the named conversation exists. Only
+    /// the phantom case is rejected, so a genuinely idle session in a
+    /// single-session directory is still recoverable through this path.
+    #[test]
+    #[serial]
+    fn claude_json_fallback_accepts_sid_with_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_path = "/tmp/aoe-test-claude-json-real";
+        let named = "11111111-2222-3333-4444-555555555555";
+        let _guard = claude_json_env(&temp);
+        let dir = claude_json_fallback_home(
+            &temp,
+            project_path,
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            named,
+        );
+        // Same stale mtime as the decoy, so the dir scan still falls through
+        // and this is reached via the `.claude.json` arm, not the scan.
+        let jsonl = dir.join(format!("{named}.jsonl"));
+        std::fs::write(&jsonl, "").unwrap();
+        set_mtime_secs(&jsonl, STALE_JSONL_MTIME);
+
+        assert_eq!(
+            capture_claude_session_id(project_path, None, &HashSet::new(), &[]).unwrap(),
+            named
+        );
+    }
 
     /// Pin a modification time so mtime ordering in tests never depends on the
     /// host filesystem's timestamp resolution. Opened read-only, which lets the
@@ -4521,7 +4784,10 @@ mod tests {
 
     #[test]
     fn test_build_exclusion_set_empty() {
-        let result = build_exclusion_set("nonexistent-instance-id-12345");
+        let result = build_exclusion_set(
+            "nonexistent-instance-id-12345",
+            &crate::tmux::LiveSessionSnapshot::new(),
+        );
         // The exclusion set should never contain our own instance ID
         // (it collects OTHER instances' captured session IDs).
         // On a machine with active AoE tmux sessions, the set may be
@@ -6006,6 +6272,16 @@ mod tests {
         let entries = vec![("a".to_string(), "/work/elsewhere".to_string())];
         let result = select_copilot_session(&entries, "/work/proj", &HashSet::new());
         assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_kimi_home_rejects_empty_ambient_fallback() {
+        let _env = EnvGuard::set(&[("KIMI_CODE_HOME", "")]);
+        assert!(
+            kimi_home_for_environment(&[]).is_none(),
+            "an explicitly empty ambient home must not become a relative store path"
+        );
     }
 
     #[test]

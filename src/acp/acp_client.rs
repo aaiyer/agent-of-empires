@@ -647,6 +647,12 @@ pub struct SpawnConfig {
     /// fixed container mount, so this host path is only used when
     /// `sandbox_info` is `None`. `None` disables the export. See #2587.
     pub artifact_dir: Option<PathBuf>,
+    /// Set when this launch runs an `agent_detect_as` wrapper's base
+    /// adapter instead of the wrapper itself (#3422): `(wrapper, base)`.
+    /// Watchdog respawns reuse a cloned `SpawnConfig`, so they re-emit the
+    /// same substitution warning the initial spawn logged, one line per
+    /// launch.
+    pub wrapper_substitution: Option<(String, String)>,
 }
 
 /// Params for the `_session/steering` extension request: apply a
@@ -3624,10 +3630,7 @@ fn path_copy_below_floor(command: &str, path: &std::path::Path) -> bool {
     let Some(raw) = probe_version_bounded(path) else {
         return false;
     };
-    raw.split_whitespace()
-        .filter_map(|tok| semver::Version::parse(tok.trim_start_matches('v')).ok())
-        .next()
-        .is_some_and(|found| found < min)
+    crate::acp::version_probe::whitespace_token_below_floor(&raw, min)
 }
 
 /// Run `<path> --version` with a deadline and return its stdout.
@@ -12326,6 +12329,7 @@ mod tests {
             container_workdir: None,
         };
         let config = SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
             spec: AgentSpec {
@@ -12401,6 +12405,7 @@ mod tests {
             container_workdir: None,
         };
         let config = SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
             spec: AgentSpec {
@@ -12494,6 +12499,7 @@ mod tests {
             container_workdir: None,
         };
         let config = SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "codex".into(),
             tool: "codex".into(),
             spec: AgentSpec {
@@ -12747,6 +12753,7 @@ done
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
+            wrapper_substitution: None,
         }
     }
 
@@ -13100,6 +13107,7 @@ done
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
+            wrapper_substitution: None,
         }
     }
 
@@ -13502,6 +13510,7 @@ done
     #[cfg(unix)]
     fn reset_fake_spawn_config(script: &std::path::Path, cwd: &std::path::Path) -> SpawnConfig {
         SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "codex".into(),
             tool: "codex".into(),
             spec: AgentSpec {
@@ -13662,6 +13671,7 @@ done
     /// old-session updates to the fresh conversation.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn reset_between_prompts_with_open_tool_is_refused() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let initial_update = serde_json::json!({
@@ -13703,6 +13713,7 @@ done
     /// tailer removes the agent from the between-prompt in-flight set.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn reset_between_prompts_with_background_agent_is_refused() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let transcript = tmp.path().join("background-agent.jsonl");
@@ -13756,6 +13767,7 @@ done
     /// abandoned request.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn reset_session_new_timeout_releases_the_connection_loop() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let (script, _capture) = write_reset_fake_agent(tmp.path(), 0, 1, 0);
@@ -13801,6 +13813,7 @@ done
     /// client and runner would disagree about the live session.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn reset_config_timeout_commits_and_releases_the_connection_loop() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let (script, capture) = write_reset_fake_agent(tmp.path(), 0, 0, 1);
@@ -13988,6 +14001,7 @@ done
     /// The success-only `SessionCleared` boundary must remain absent.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn reset_during_in_flight_prompt_is_refused_with_prompt_rejected() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         // 3s prompt delay: long enough to land the reset mid-turn, short
@@ -14190,8 +14204,10 @@ done
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn spawn_with_nonexistent_command_errors_cleanly() {
         let config = SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
             spec: AgentSpec {
@@ -14231,6 +14247,7 @@ done
         // Ensure the path truly does not exist.
         let _ = std::fs::remove_dir_all(&missing);
         let config = SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
             spec: AgentSpec {
@@ -16737,6 +16754,7 @@ done
     /// Build a minimal host (non-sandboxed) `SpawnConfig` for env tests.
     fn env_test_spawn_config(cwd: std::path::PathBuf) -> SpawnConfig {
         SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
             spec: AgentSpec {

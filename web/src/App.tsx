@@ -216,17 +216,18 @@ export default function App() {
     if (loginRequired === null || (loginRequired && !loginAuthenticated)) return;
     let cancelled = false;
     fetchAbout().then((about) => {
-      if (!cancelled) setDeploymentAbout(about);
+      if (cancelled) return;
+      setDeploymentAbout(about);
+      if (about && !about.maya_restricted) {
+        fetchSettings().then((settings) => {
+          if (!cancelled) applyAppSettings(settings);
+        });
+      }
     });
     return () => {
       cancelled = true;
     };
-  }, [loginAuthenticated, loginRequired]);
-
-  useEffect(() => {
-    if (!deploymentAbout || deploymentAbout.maya_restricted) return;
-    fetchSettings().then(applyAppSettings);
-  }, [applyAppSettings, deploymentAbout]);
+  }, [applyAppSettings, loginAuthenticated, loginRequired]);
 
   const handleTokenSuccess = () => {
     setTokenExpired(false);
@@ -800,7 +801,7 @@ function AppContent({
   const diffComments = useDiffComments(activeSessionId);
   const commentsEnabled = activeSession?.view === "structured";
   // Sending does not require a live worker: the diff-comments handler runs the
-  // same auto-wake as a plain composer prompt (touch_and_wake_if_sunk +
+  // same auto-wake as a plain composer prompt (touch_on_prompt_and_wake_if_sunk +
   // trigger_resume_background, #1748), so an archived / snoozed / idle-dormant
   // session respawns its worker on send instead of sinking the prompt. A
   // trashed session is the one exception: the reconciler never resumes it, so
@@ -1087,6 +1088,8 @@ function AppContent({
   // (decremented by exactly what each snapshot reported), so re-fires on
   // session switch are harmless. See #1882.
   useEffect(() => {
+    // This reacts to server/session authority, not a single user event.
+    // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
     if (!serverAboutLoaded || serverAbout?.read_only || caps.mayaRestricted) return;
     if (activeSession?.view !== "structured") return;
     reportTelemetrySeen("structured_view");

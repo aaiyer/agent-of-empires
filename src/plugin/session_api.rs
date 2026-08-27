@@ -456,7 +456,6 @@ async fn admit_and_create(
         // record below.
         callback_url: None,
         idempotency_key: None,
-        maya_import_source: None,
         allow_hooks: true,
         profile: deps.profile.clone(),
         created_by_plugin: None,

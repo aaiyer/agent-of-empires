@@ -193,6 +193,13 @@
       "components": ["web/src/components/MobileLiveTerminal.tsx"]
     },
     {
+      "id": "terminal.live-glyph-cell-width",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/live-glyph-columns.spec.ts", "src/lib/liveTermLines.test.ts"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx"]
+    },
+    {
       "id": "terminal.live-cursor-focus-fill",
       "kind": "vitest",
       "risk": "medium",
@@ -395,21 +402,6 @@
       "components": [
         "web/src/components/settings/StructuredWidgets.tsx",
         "web/src/components/settings/SchemaSection.tsx"
-      ]
-    },
-    {
-      "id": "settings.plugin-settings-page",
-      "kind": "vitest",
-      "risk": "medium",
-      "specs": [
-        "src/components/__tests__/SettingsView.pluginPages.test.tsx",
-        "src/components/__tests__/SettingsView.pluginPageRoute.test.tsx",
-        "src/components/plugin/__tests__/PluginSlots.test.tsx"
-      ],
-      "components": [
-        "web/src/components/SettingsView.tsx",
-        "web/src/components/plugin/PluginSlots.tsx",
-        "web/src/components/settings/PluginsSettings.tsx"
       ]
     },
     {
@@ -864,6 +856,13 @@
         "web/src/components/session-wizard/sessionNames.ts",
         "web/src/lib/types.ts"
       ]
+    },
+    {
+      "id": "wizard.agent-lifecycle",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/session-wizard/__tests__/AgentPickerEssentials.lifecycle.test.tsx"],
+      "components": ["web/src/components/session-wizard/steps/AgentPickerEssentials.tsx"]
     },
     {
       "id": "wizard.recent-projects",
@@ -1327,6 +1326,13 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/ios-callout-suppression.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sidebar.longpress-menu-persists",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/sidebar-longpress-menu-persists.spec.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
@@ -3663,13 +3669,6 @@
         "src/components/acp/Composer.pluginComposerActions.test.tsx"
       ],
       "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/acp/Composer.tsx"]
-    },
-    {
-      "id": "plugins.tool-card-badge",
-      "kind": "live-playwright",
-      "risk": "medium",
-      "specs": ["tests/live/plugin-tool-card-badge.spec.ts"],
-      "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/acp/ToolCards.tsx"]
     }
   ]
 }

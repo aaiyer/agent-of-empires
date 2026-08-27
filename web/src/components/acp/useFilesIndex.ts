@@ -33,10 +33,7 @@ export function fuzzyFilter<T extends { label: string; description?: string }>(
  * `GET /api/sessions/:id/acp/files` which walks the session's
  * project_path tree (capped at 5k entries).
  */
-export function useFilesIndex(
-  sessionId: string,
-  enabled = true,
-): {
+export function useFilesIndex(sessionId: string): {
   files: string[];
   loading: boolean;
   /** True when the last fetch failed. Lets a caller distinguish "this session
@@ -57,12 +54,6 @@ export function useFilesIndex(
     setLoading(true);
   }
   useEffect(() => {
-    if (!enabled) {
-      setFiles([]);
-      setLoading(false);
-      setError(false);
-      return;
-    }
     let cancelled = false;
     // loading is set to true in render-time above when sessionId changes
     fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/files`)
@@ -86,6 +77,6 @@ export function useFilesIndex(
     return () => {
       cancelled = true;
     };
-  }, [sessionId, attempt, enabled]);
+  }, [sessionId, attempt]);
   return useMemo(() => ({ files, loading, error, reload }), [files, loading, error, reload]);
 }

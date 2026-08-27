@@ -3,13 +3,6 @@ use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-#[cfg(unix)]
-use std::io::Read;
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::Path;
 use std::sync::Arc;
 
 use super::AppState;
@@ -24,10 +17,6 @@ pub const MAGIC_DNS_HOST: &str = "maya-devbox.tail564f89.ts.net";
 pub const MAGIC_DNS_ORIGIN: &str = "https://maya-devbox.tail564f89.ts.net";
 pub const HOST: &str = "127.0.0.1";
 pub const PORT: u16 = 3773;
-pub const IMPORT_BINDINGS_PATH: &str = "/run/maya-aoe-import-bindings.json";
-const IMPORT_BINDINGS_SCHEMA: &str = "maya.aoe.import-bindings.v1";
-const IMPORT_BINDINGS_TYPE: &str = "maya-aoe-import-bindings";
-const MAX_IMPORT_BINDINGS_BYTES: u64 = 1024 * 1024;
 pub const CODEX_COMMAND: &str = "/usr/bin/sudo";
 pub const CODEX_ARGS: &[&str] = &[
     "-n",
@@ -115,42 +104,11 @@ pub fn first_turn_title(prompt: &str) -> String {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ImportBindings {
-    schema: String,
-    #[serde(rename = "type")]
-    kind: String,
-    profile: String,
-    project_path: String,
-    source_catalog_sha256: String,
-    entries: Vec<ImportBinding>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImportBinding {
-    pub source_t3_thread_id: String,
-    pub title: String,
-    pub managed_codex_session_id: String,
-}
-
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
 fn is_aoe_session_id(value: &str) -> bool {
     value.len() == 16
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
-fn is_source_thread_id(value: &str) -> bool {
-    canonical_codex_session_id(value.strip_prefix("maya-import-").unwrap_or(value))
 }
 
 pub(crate) fn is_managed_model(value: &str) -> bool {
@@ -177,133 +135,6 @@ pub(crate) fn is_managed_effort(value: &str) -> bool {
 
 fn canonical_codex_session_id(value: &str) -> bool {
     uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.to_string() == value)
-}
-
-fn parse_import_bindings(bytes: &[u8]) -> anyhow::Result<ImportBindings> {
-    anyhow::ensure!(bytes.ends_with(b"\n"), "import bindings must end in one LF");
-    let catalog: ImportBindings = serde_json::from_slice(bytes)?;
-    let mut canonical = serde_json::to_vec(&catalog)?;
-    canonical.push(b'\n');
-    anyhow::ensure!(canonical == bytes, "import bindings JSON is not canonical");
-    anyhow::ensure!(
-        catalog.schema == IMPORT_BINDINGS_SCHEMA,
-        "wrong import bindings schema"
-    );
-    anyhow::ensure!(
-        catalog.kind == IMPORT_BINDINGS_TYPE,
-        "wrong import bindings type"
-    );
-    anyhow::ensure!(
-        catalog.profile == PROFILE_NAME,
-        "wrong import bindings profile"
-    );
-    anyhow::ensure!(
-        catalog.project_path == PROJECT_PATH,
-        "wrong import bindings project"
-    );
-    anyhow::ensure!(
-        is_sha256(&catalog.source_catalog_sha256),
-        "invalid source catalog digest"
-    );
-    anyhow::ensure!(
-        !catalog.entries.is_empty(),
-        "import bindings has no entries"
-    );
-
-    let mut sources = HashSet::new();
-    let mut codex_ids = HashSet::new();
-    for entry in &catalog.entries {
-        anyhow::ensure!(
-            is_source_thread_id(&entry.source_t3_thread_id),
-            "invalid source T3 thread id"
-        );
-        anyhow::ensure!(!entry.title.trim().is_empty(), "empty import title");
-        anyhow::ensure!(
-            entry.title.trim() == entry.title,
-            "non-canonical import title"
-        );
-        anyhow::ensure!(
-            canonical_codex_session_id(&entry.managed_codex_session_id),
-            "invalid managed Codex session id"
-        );
-        anyhow::ensure!(
-            sources.insert(entry.source_t3_thread_id.as_str()),
-            "duplicate source T3 thread id"
-        );
-        anyhow::ensure!(
-            codex_ids.insert(entry.managed_codex_session_id.as_str()),
-            "duplicate managed Codex session id"
-        );
-    }
-    Ok(catalog)
-}
-
-#[cfg(unix)]
-fn read_import_bindings(path: &Path) -> anyhow::Result<Vec<u8>> {
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
-    let metadata = file.metadata()?;
-    anyhow::ensure!(
-        metadata.file_type().is_file(),
-        "import bindings is not a regular file"
-    );
-    anyhow::ensure!(metadata.nlink() == 1, "import bindings must have one link");
-    anyhow::ensure!(metadata.uid() == 0, "import bindings must be root-owned");
-    // SAFETY: getegid has no preconditions and only reads process identity.
-    let service_gid = unsafe { libc::getegid() };
-    anyhow::ensure!(
-        metadata.gid() == service_gid,
-        "import bindings has the wrong group"
-    );
-    anyhow::ensure!(
-        metadata.mode() & 0o7777 == 0o440,
-        "import bindings mode must be 0440"
-    );
-    anyhow::ensure!(
-        (1..=MAX_IMPORT_BINDINGS_BYTES).contains(&metadata.len()),
-        "import bindings has invalid size"
-    );
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.by_ref()
-        .take(MAX_IMPORT_BINDINGS_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    anyhow::ensure!(
-        bytes.len() as u64 == metadata.len(),
-        "import bindings changed while reading"
-    );
-    Ok(bytes)
-}
-
-#[cfg(not(unix))]
-fn read_import_bindings(_path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
-    anyhow::bail!("Maya import bindings require Unix file authentication")
-}
-
-pub fn load_import_binding(
-    source_t3_thread_id: &str,
-    expected_catalog_sha256: &str,
-) -> anyhow::Result<ImportBinding> {
-    anyhow::ensure!(
-        is_source_thread_id(source_t3_thread_id),
-        "invalid source T3 thread id"
-    );
-    anyhow::ensure!(
-        is_sha256(expected_catalog_sha256),
-        "invalid source catalog digest"
-    );
-    let bytes = read_import_bindings(Path::new(IMPORT_BINDINGS_PATH))?;
-    let catalog = parse_import_bindings(&bytes)?;
-    anyhow::ensure!(
-        catalog.source_catalog_sha256 == expected_catalog_sha256,
-        "source catalog digest mismatch"
-    );
-    catalog
-        .entries
-        .into_iter()
-        .find(|entry| entry.source_t3_thread_id == source_t3_thread_id)
-        .ok_or_else(|| anyhow::anyhow!("source T3 thread is not bound for import"))
 }
 
 pub async fn apply_first_turn_name(
@@ -392,9 +223,6 @@ pub fn route_allowed(method: &Method, path: &str) -> bool {
     }
     if path == "/api/sessions" {
         return matches!(*method, Method::GET | Method::POST);
-    }
-    if path == "/api/maya/import-session" && *method == Method::POST {
-        return true;
     }
     if path == "/api/workspace-ordering" && *method == Method::PUT {
         return true;
@@ -709,37 +537,6 @@ mod tests {
             bind_codex_agent_spec(&mut crafted, "0123456789abcdef", None).is_err(),
             "caller-crafted argv must fail before the persisted assignment is appended"
         );
-    }
-
-    #[test]
-    fn import_catalog_is_canonical_and_unique() {
-        let bytes = b"{\"schema\":\"maya.aoe.import-bindings.v1\",\"type\":\"maya-aoe-import-bindings\",\"profile\":\"maya\",\"project_path\":\"/home/aaiyer/maya/maya-main\",\"source_catalog_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"entries\":[{\"source_t3_thread_id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"title\":\"Imported thread\",\"managed_codex_session_id\":\"11111111-1111-4111-8111-111111111111\"},{\"source_t3_thread_id\":\"maya-import-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\",\"title\":\"Imported prefixed thread\",\"managed_codex_session_id\":\"22222222-2222-4222-8222-222222222222\"}]}\n";
-        let parsed = parse_import_bindings(bytes).expect("canonical catalog");
-        assert_eq!(parsed.entries.len(), 2);
-
-        let mut noncanonical = bytes.to_vec();
-        noncanonical.insert(1, b' ');
-        assert!(parse_import_bindings(&noncanonical).is_err());
-
-        let duplicate = bytes
-            .strip_suffix(b"]}\n")
-            .expect("catalog suffix")
-            .iter()
-            .copied()
-            .chain(b",{\"source_t3_thread_id\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"title\":\"Other\",\"managed_codex_session_id\":\"33333333-3333-4333-8333-333333333333\"}]}\n".iter().copied())
-            .collect::<Vec<_>>();
-        assert!(parse_import_bindings(&duplicate).is_err());
-
-        for invalid in [
-            "0123456789abcdef",
-            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
-            "maya-import-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa-extra",
-        ] {
-            assert!(
-                !is_source_thread_id(invalid),
-                "accepted source id {invalid}"
-            );
-        }
     }
 
     #[test]
