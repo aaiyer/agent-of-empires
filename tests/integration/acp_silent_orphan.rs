@@ -158,6 +158,7 @@ async fn silent_orphan_fires_on_cost_then_silence() {
         AcpSessionId("silent-orphan-positive".into()),
         None,
         "claude".into(),
+        false,
         None,
     )
     .await
@@ -220,6 +221,7 @@ async fn silent_orphan_suppressed_during_normal_turn() {
         AcpSessionId("silent-orphan-negative".into()),
         None,
         "claude".into(),
+        false,
         None,
     )
     .await
@@ -283,6 +285,7 @@ async fn silent_orphan_disabled_by_zero_grace() {
         AcpSessionId("silent-orphan-disabled".into()),
         None,
         "claude".into(),
+        false,
         None,
     )
     .await
@@ -342,6 +345,7 @@ async fn silent_orphan_suppressed_during_async_agent_wait() {
         AcpSessionId("silent-orphan-async-agent".into()),
         None,
         "claude".into(),
+        false,
         None,
     )
     .await
@@ -402,6 +406,7 @@ async fn silent_orphan_suppressed_during_background_bash() {
         AcpSessionId("silent-orphan-background-bash".into()),
         None,
         "claude".into(),
+        false,
         None,
     )
     .await
@@ -456,6 +461,7 @@ async fn silent_orphan_suppressed_during_scheduled_wakeup() {
         AcpSessionId("silent-orphan-wakeup".into()),
         None,
         "claude".into(),
+        false,
         None,
     )
     .await

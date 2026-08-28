@@ -169,6 +169,7 @@ async fn attach_in_flight_synthesizes_reattach_idle_stopped() {
         AcpSessionId("midturn-true".into()),
         None,
         "claude".into(),
+        false,
         None,
     )
     .await
@@ -207,6 +208,7 @@ async fn attach_idle_session_does_not_synthesize_stopped() {
         AcpSessionId("midturn-false".into()),
         None,
         "claude".into(),
+        false,
         None,
     )
     .await
@@ -255,6 +257,7 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
         AcpSessionId("midturn-disarm".into()),
         None,
         "claude".into(),
+        false,
         None,
     )
     .await
@@ -300,6 +303,7 @@ async fn socket_transport_round_trips_prompt_via_attach() {
         AcpSessionId("roundtrip".into()),
         None,
         "claude".into(),
+        false,
         None,
     )
     .await

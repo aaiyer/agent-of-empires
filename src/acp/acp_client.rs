@@ -12,6 +12,7 @@
 //! mpsc channel into ACP requests until shutdown.
 
 use std::collections::{HashMap, VecDeque};
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -834,6 +835,7 @@ enum ConnectMode {
         acp_session_id: String,
         in_flight_turn: bool,
         seed_history_replay: bool,
+        maya_restricted: bool,
     },
 }
 
@@ -2100,7 +2102,10 @@ fn take_injected_fresh_handshake_failure() -> bool {
 /// floor was raised from 10s to 120s in #1360 alongside the default
 /// bump from 60 to 120; users who explicitly want a shorter grace
 /// must set `0` to disable instead.
-fn silent_orphan_grace(profile: Option<&str>) -> std::time::Duration {
+fn silent_orphan_grace(profile: Option<&str>, maya_restricted: bool) -> std::time::Duration {
+    if maya_restricted {
+        return std::time::Duration::ZERO;
+    }
     #[cfg(debug_assertions)]
     if let Ok(raw) = std::env::var("AOE_SILENT_ORPHAN_GRACE_MS") {
         if let Ok(ms) = raw.parse::<u64>() {
@@ -2966,6 +2971,7 @@ impl AcpClient {
         };
         let external_terminal_guard = control_client.as_ref().map(|_| guard);
         let external_prompt_in_flight = control_client.as_ref().map(|_| prompt_in_flight);
+        let mut handshake_control = ShutdownControlOnDrop(control_client.clone());
 
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
 
@@ -2999,8 +3005,8 @@ impl AcpClient {
             )
             .instrument(conn_span),
         );
-
         wait_for_handshake(&session_label, ready_rx, None, &install_binary).await?;
+        handshake_control.0.take();
 
         Ok(Self {
             session_id,
@@ -3044,6 +3050,7 @@ impl AcpClient {
         session_id: AcpSessionId,
         sandbox: Option<(SessionSandbox, SandboxPathMap)>,
         agent_key: String,
+        maya_restricted: bool,
         source_profile: Option<String>,
     ) -> Result<Self, AcpError> {
         let expected_acp_session_id = stored_acp_session_id.clone();
@@ -3054,6 +3061,7 @@ impl AcpClient {
             acp_session_id: stored_acp_session_id,
             in_flight_turn,
             seed_history_replay,
+            maya_restricted,
         };
         let profile = agent_profiles::resolve(&agent_key);
         // Resolve the binary name from the registry so the resume path
@@ -3433,6 +3441,19 @@ impl AcpClient {
     /// mutex (which would deadlock send_prompt).
     pub fn take_inbound(&mut self) -> Option<mpsc::Receiver<Event>> {
         self.inbound.take()
+    }
+}
+
+/// Cancel a socket handshake if its constructor is dropped before completion.
+/// Closing the exact runner control channel cancels only that runner.
+struct ShutdownControlOnDrop(Option<Arc<DaemonControlClient>>);
+
+impl Drop for ShutdownControlOnDrop {
+    fn drop(&mut self) {
+        if let Some(control) = self.0.take() {
+            // SAFETY: `control` keeps this exact socket alive for the call.
+            unsafe { libc::shutdown(control.raw_fd, libc::SHUT_RDWR) };
+        }
     }
 }
 
@@ -4277,6 +4298,7 @@ struct DaemonControlClient {
     handshake_rx: Mutex<mpsc::Receiver<ControlBody>>,
     completion: Arc<std::sync::Mutex<Option<oneshot::Sender<control_protocol::PromptOutcome>>>>,
     pending_history_replay: Mutex<Option<control_protocol::PendingHistoryReplay>>,
+    raw_fd: RawFd,
 }
 
 impl DaemonControlClient {
@@ -4549,11 +4571,13 @@ async fn connect_runner_control_v2(
         }
     });
 
+    let raw_fd = write_half.as_ref().as_raw_fd();
     Some(Arc::new(DaemonControlClient {
         write: Mutex::new(write_half),
         handshake_rx: Mutex::new(hs_rx),
         completion,
         pending_history_replay: Mutex::new(pending_history_replay),
+        raw_fd,
     }))
 }
 
@@ -7472,6 +7496,14 @@ async fn run_connection_task<W, R>(
                     ..
                 }
             );
+            let restricted_runtime = match &mode {
+                ConnectMode::Fresh {
+                    maya_restricted, ..
+                }
+                | ConnectMode::Resume {
+                    maya_restricted, ..
+                } => *maya_restricted,
+            };
             // Mark the adopted turn so the notification handler applies the
             // cost-marker barrier and the between-prompt watchdog emits
             // `prompt_complete` for it. Set before any turn events arrive. See #2899.
@@ -7535,6 +7567,7 @@ async fn run_connection_task<W, R>(
                     acp_session_id: stored,
                     in_flight_turn: _,
                     seed_history_replay,
+                    ..
                 } => {
                     // INVARIANT: Resume mode MUST NOT send `session/new`
                     // or `session/load`. This is the load-bearing trick
@@ -8578,7 +8611,7 @@ async fn run_connection_task<W, R>(
                         let mut prompt_orphaned = false;
 
                         let silent_orphan_grace_default =
-                            silent_orphan_grace(source_profile.as_deref());
+                            silent_orphan_grace(source_profile.as_deref(), restricted_runtime);
                         let silent_orphan_grace_fast = silent_orphan_fast_grace();
                         let silent_orphan_enabled =
                             silent_orphan_grace_default > std::time::Duration::ZERO;
@@ -10838,6 +10871,11 @@ mod tests {
     // before it ever reached the shim.
     // -------------------------------------------------------------------
 
+    #[test]
+    fn maya_restricted_disables_silent_orphan_watchdog() {
+        assert_eq!(silent_orphan_grace(None, true), std::time::Duration::ZERO);
+    }
+
     fn watchdog_test_cfg() -> SilentOrphanWatchdogConfig {
         SilentOrphanWatchdogConfig {
             base_grace: std::time::Duration::from_secs(120),
@@ -12933,6 +12971,7 @@ done
         const TOKEN: &str = "55555555-5555-4555-8555-555555555555";
         let (daemon, runner) = tokio::net::UnixStream::pair().expect("control socket pair");
         let (_daemon_read, daemon_write) = daemon.into_split();
+        let raw_fd = daemon_write.as_ref().as_raw_fd();
         let (mut runner_read, _runner_write) = runner.into_split();
         let (_handshake_tx, handshake_rx) = mpsc::channel(1);
         let control = Arc::new(DaemonControlClient {
@@ -12943,6 +12982,7 @@ done
             // subsequent session/load must arm the daemon-side token rather
             // than leaving that initial snapshot stale.
             pending_history_replay: Mutex::new(None),
+            raw_fd,
         });
         let (mut client, _events) = AcpClient::fake_for_test(AcpSessionId("fresh-replay".into()));
         client.control_client = Some(control.clone());
@@ -12977,6 +13017,7 @@ done
         const TOKEN: &str = "66666666-6666-4666-8666-666666666666";
         let (daemon, runner) = tokio::net::UnixStream::pair().expect("control socket pair");
         let (_daemon_read, daemon_write) = daemon.into_split();
+        let raw_fd = daemon_write.as_ref().as_raw_fd();
         drop(runner);
         let (_handshake_tx, handshake_rx) = mpsc::channel(1);
         let control = Arc::new(DaemonControlClient {
@@ -12987,6 +13028,7 @@ done
                 acp_session_id: "stored-history".into(),
                 replay_token: TOKEN.into(),
             })),
+            raw_fd,
         });
         let (mut client, _events) =
             AcpClient::fake_for_test(AcpSessionId("reattached-replay".into()));
