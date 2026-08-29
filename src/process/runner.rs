@@ -768,6 +768,8 @@ struct RunnerShared {
     /// Unsettled imported replay retained across daemon detach/reattach. The
     /// runner forgets it only after the daemon acknowledges the exact barrier.
     history_replay: Mutex<Option<PendingHistoryReplayState>>,
+    #[cfg(test)]
+    history_replay_pause: Mutex<Option<HistoryReplayPause>>,
     /// Monotonic JSON-RPC id allocator for the requests the runner issues
     /// to the agent on its own (`initialize`, `session/*`, `session/prompt`)
     /// now that it owns the client side of the protocol. On the v2 path the
@@ -858,6 +860,13 @@ struct PendingHistoryReplayState {
     running: bool,
     barrier_delivered: bool,
     failed: bool,
+}
+
+#[cfg(test)]
+struct HistoryReplayPause {
+    captured: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+    completed: tokio::sync::oneshot::Sender<()>,
 }
 
 impl ReplayCapture {
@@ -1000,6 +1009,8 @@ impl RunnerShared {
             handshake: Mutex::new(RunnerHandshake::default()),
             load_replay_capture: Mutex::new(None),
             history_replay: Mutex::new(None),
+            #[cfg(test)]
+            history_replay_pause: Mutex::new(None),
             next_req_id: AtomicI64::new(RUNNER_REQUEST_ID_BASE),
             pending_client_responses: Mutex::new(HashMap::new()),
             relay_session_news: Mutex::new(HashSet::new()),
@@ -1715,14 +1726,16 @@ impl RunnerShared {
         };
         let shared = Arc::clone(self);
         tokio::spawn(async move {
+            #[cfg(test)]
+            let mut replay_completed = None;
             loop {
                 let next = {
                     let pending = shared.history_replay.lock().await;
                     let Some(replay) = pending.as_ref() else {
-                        return;
+                        break;
                     };
                     if replay.generation != generation {
-                        return;
+                        break;
                     }
                     if replay.next_line < replay.replay.len() {
                         Some((
@@ -1735,13 +1748,22 @@ impl RunnerShared {
                             .map(|line| (replay.replay_token.clone(), line, true))
                     }
                 };
+                #[cfg(test)]
+                {
+                    let pause = shared.history_replay_pause.lock().await.take();
+                    if let Some(pause) = pause {
+                        replay_completed = Some(pause.completed);
+                        let _ = pause.captured.send(());
+                        let _ = pause.release.await;
+                    }
+                }
                 let Some((token, line, barrier)) = next else {
                     if let Some(replay) = shared.history_replay.lock().await.as_mut() {
                         if replay.generation == generation {
                             replay.running = false;
                         }
                     }
-                    return;
+                    break;
                 };
                 if !shared
                     .deliver_replay_step(&token, generation, &line, barrier)
@@ -1752,11 +1774,15 @@ impl RunnerShared {
                             replay.running = false;
                         }
                     }
-                    return;
+                    break;
                 }
                 if barrier {
-                    return;
+                    break;
                 }
+            }
+            #[cfg(test)]
+            if let Some(completed) = replay_completed {
+                let _ = completed.send(());
             }
         });
     }
@@ -3233,65 +3259,85 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$AOE_TEST_RESPONSE_ID"
     }
 
     #[tokio::test]
-    async fn cleared_history_replay_fences_stale_delivery_after_reattach() {
+    async fn cleared_history_replay_fences_spawned_delivery_after_reattach() {
         const TOKEN: &str = "88888888-8888-4888-8888-888888888888";
         let shared = Arc::new(RunnerShared::new());
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        *shared.history_replay_pause.lock().await = Some(HistoryReplayPause {
+            captured: captured_tx,
+            release: release_rx,
+            completed: completed_tx,
+        });
         shared
             .schedule_history_replay(
-                vec![b"current\n".to_vec()].into(),
+                vec![b"first\n".to_vec(), b"second\n".to_vec()].into(),
                 "stored-history".into(),
                 TOKEN.into(),
             )
             .await
             .expect("retain replay");
-        let stale_generation = shared
-            .history_replay
-            .lock()
+        tokio::time::timeout(Duration::from_secs(1), captured_rx)
             .await
-            .as_ref()
-            .expect("unsettled replay")
-            .generation;
+            .expect("spawned replay capture timeout")
+            .expect("spawned replay captures its generation and line");
 
         let relay_generation = *shared.relay_failures.borrow();
         shared.clear_outbound(false, relay_generation).await;
-        let current_generation = {
-            let mut pending = shared.history_replay.lock().await;
-            let replay = pending.as_mut().expect("replay survives detach");
-            assert_ne!(replay.generation, stale_generation);
-            replay.running = true;
-            replay.generation
-        };
-
         let (daemon, runner) = UnixStream::pair().expect("replacement relay");
         let (daemon_read, _daemon_write) = daemon.into_split();
         let (_runner_read, runner_write) = runner.into_split();
         assert!(shared.install_outbound(runner_write).await.is_none());
 
-        assert!(
-            !shared
-                .deliver_replay_step(TOKEN, stale_generation, b"stale\n", false)
-                .await,
-            "detached replay work must not write through the replacement relay"
-        );
-        {
-            let replay = shared.history_replay.lock().await;
-            let replay = replay.as_ref().expect("current replay remains owned");
-            assert_eq!(replay.next_line, 0);
-            assert!(replay.running);
-        }
-
-        assert!(
-            shared
-                .deliver_replay_step(TOKEN, current_generation, b"current\n", false)
-                .await
-        );
-        let mut reader = BufReader::new(daemon_read);
-        let mut received = String::new();
-        reader
-            .read_line(&mut received)
+        release_tx.send(()).expect("release stale replay task");
+        tokio::time::timeout(Duration::from_secs(1), completed_rx)
             .await
-            .expect("read current replay line");
-        assert_eq!(received, "current\n");
+            .expect("stale replay completion timeout")
+            .expect("stale replay task completes");
+        let mut unexpected = [0_u8; 1];
+        assert_eq!(
+            daemon_read
+                .try_read(&mut unexpected)
+                .expect_err("stale replay must not reach replacement relay")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        shared.resume_history_replay().await;
+        let mut reader = BufReader::new(daemon_read);
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+                .await
+                .expect("current replay frame timeout")
+                .expect("read current replay frame");
+            received.push(line);
+        }
+        assert_eq!(&received[..2], &["first\n", "second\n"]);
+        let barrier: serde_json::Value =
+            serde_json::from_str(&received[2]).expect("typed replay barrier");
+        assert_eq!(barrier["params"]["sessionId"], "stored-history");
+        assert_eq!(
+            barrier["params"]["update"]["_meta"][HISTORY_REPLAY_META_KEY],
+            TOKEN
+        );
+
+        shared.settle_history_replay(TOKEN).await;
+        assert!(shared.history_replay.lock().await.is_none());
+        assert!(
+            reader.buffer().is_empty(),
+            "replay reader must not contain an extra buffered frame"
+        );
+        assert_eq!(
+            reader
+                .get_ref()
+                .try_read(&mut unexpected)
+                .expect_err("replay and barrier must be delivered exactly once")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[tokio::test]
