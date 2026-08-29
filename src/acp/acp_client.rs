@@ -3229,8 +3229,7 @@ struct ShutdownControlOnDrop(Option<Arc<DaemonControlClient>>);
 impl Drop for ShutdownControlOnDrop {
     fn drop(&mut self) {
         if let Some(control) = self.0.take() {
-            // SAFETY: `control` keeps this exact socket alive for the call.
-            unsafe { libc::shutdown(control.raw_fd, libc::SHUT_RDWR) };
+            control.shutdown();
         }
     }
 }
@@ -4080,6 +4079,11 @@ struct DaemonControlClient {
 }
 
 impl DaemonControlClient {
+    fn shutdown(&self) {
+        // SAFETY: `self` keeps this exact socket alive for the call.
+        unsafe { libc::shutdown(self.raw_fd, libc::SHUT_RDWR) };
+    }
+
     async fn send(&self, body: ControlBody) -> Result<(), AcpError> {
         let mut w = self.write.lock().await;
         control_protocol::write_frame(&mut *w, &body)
@@ -6727,10 +6731,17 @@ async fn run_connection_task<W, R>(
     // new turn that legitimately reuses the prior turn's trailing text under a
     // fresh message_id would be misclassified as a restatement. See #2281.
     let agent_msg_dedup_for_block = agent_msg_dedup.clone();
+    let control_on_close = control_client.clone();
 
     let result = Client
         .builder()
         .name("aoe-acp")
+        .on_close(move |_connection| async move {
+            if let Some(control) = control_on_close {
+                control.shutdown();
+            }
+            Err(acp_internal_error("agent transport closed".into()))
+        })
         .on_receive_notification(
             move |notification: SessionNotification, _cx| {
                 let event_tx = event_tx_for_notif.clone();
