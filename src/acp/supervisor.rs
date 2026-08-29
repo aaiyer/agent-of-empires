@@ -3269,6 +3269,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             acp_session_id,
             sandbox_resources,
             attach_agent_key,
+            self.maya_restricted
+                .load(std::sync::atomic::Ordering::Acquire),
             record.source_profile.clone(),
         )
         .await?;

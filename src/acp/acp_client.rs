@@ -12,6 +12,7 @@
 //! mpsc channel into ACP requests until shutdown.
 
 use std::collections::{HashMap, VecDeque};
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -326,23 +327,9 @@ impl AcpError {
     }
 }
 
-/// Inspect an ACP-level error response from a `session/prompt` request
-/// and return a `RateLimitInfo` if the adapter reported a quota/usage
-/// limit hit. claude-agent-acp signals this via `data.errorKind ==
-/// "rate_limit"` on the JSON-RPC error object. Other adapters may
-/// surface the same signal differently; the catch-all message regex in
-/// `classify_rate_limit_from_message` is the defensive fallback.
-///
-/// `captured_resets_at` is the only source of a reset time: the epoch
-/// the adapter forwarded out-of-band for a window it reported as
-/// `rejected` (see `rate_limit_rejection_from_meta`). The error payload
-/// itself carries only `errorKind`, and its message text holds nothing
-/// machine-readable, just a locale rendering ("resets 12:10pm
-/// (Europe/Paris)"). When no rejected epoch was ever observed the reset
-/// is genuinely unknown and stays `None`; an earlier `now + 1h` guess
-/// presented a fabricated time as fact (#3152). The message is preserved
-/// verbatim in `RateLimitInfo.status` so the UI can surface the text
-/// instead.
+/// Classify a structured prompt error as a rate limit. Reset time comes only
+/// from a separately captured rejected-window epoch; localized message text is
+/// displayed verbatim but never parsed or guessed.
 pub(crate) fn classify_rate_limit_error(
     err: &agent_client_protocol::Error,
     captured_resets_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -359,13 +346,8 @@ pub(crate) fn classify_rate_limit_error(
     })
 }
 
-/// Defensive fallback for the connection-task end path. The outer
-/// error type carries no structured `data`, only a Display string, so
-/// match on the fingerprint claude-agent-acp embeds in its error
-/// payload. Hit rate is intentionally narrow: a substring match on
-/// `errorKind":"rate_limit"` only matches the JSON the adapter pastes
-/// into its error message; unrelated logs that mention "rate_limit"
-/// won't trigger.
+/// Fallback for an outer error that preserved only the adapter's serialized
+/// `errorKind` fingerprint.
 pub(crate) fn classify_rate_limit_from_message(
     message: &str,
     captured_resets_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -395,19 +377,8 @@ struct RateLimitRejection {
     resets_at_secs: i64,
 }
 
-/// Extract a rate-limit *rejection* from a `usage_update`'s `_meta`.
-///
-/// Only `status == "rejected"` observations are returned. A warning
-/// (`allowed_warning`) carries a real epoch too, but nothing ties it to
-/// whichever window later rejects the prompt: the adapter reduces the
-/// prompt error to `{ errorKind: "rate_limit" }`, so a retained warning
-/// epoch can only be guessed at. Guessing is what produced "come back
-/// Thursday" for a five-hour limit, so warnings are logged at the call
-/// site and dropped here (#3152).
-///
-/// Guards against a millisecond-scale value (the JS SDK ecosystem
-/// conflates seconds and ms) so a stray ms epoch cannot resolve to the
-/// year 5138+. See #3028.
+/// Extract only rejected rate-limit windows. Warning epochs cannot be matched
+/// reliably to a later rejected window. Millisecond epochs are normalized.
 fn rate_limit_rejection_from_meta(
     meta: &Option<agent_client_protocol::schema::v1::Meta>,
 ) -> Option<RateLimitRejection> {
@@ -437,15 +408,8 @@ fn rate_limit_rejection_from_meta(
     })
 }
 
-/// Pick the reset time to report from the per-window rejection captures.
-///
-/// The latest reset still ahead of `now` wins: every window that rejected
-/// has to clear before the session can run again, so the last one to
-/// reset is when the user can actually resume. In practice exactly one
-/// window is present and the choice is moot. Entries whose reset has
-/// already passed belong to a window that has since rolled over and are
-/// ignored. `None` means no rejection epoch was ever observed, which the
-/// callers surface as an unknown reset rather than a guess (#3152).
+/// Return the latest future reset because every rejected window must clear.
+/// Expired observations are ignored and missing data remains unknown.
 fn captured_rate_limit_resets_at(
     captures: &std::sync::Mutex<HashMap<String, i64>>,
     now: chrono::DateTime<chrono::Utc>,
@@ -459,15 +423,8 @@ fn captured_rate_limit_resets_at(
         .max()
 }
 
-/// Experimental `session/delete` ACP request. Adapters advertising
-/// `sessionCapabilities.delete: {}` (claude-agent-acp >= 0.36) handle
-/// this by releasing adapter-side state for the session (e.g. clearing
-/// the persisted Claude session record on disk). Other adapters reply
-/// with `-32601 method_not_found` and the supervisor falls through to
-/// the existing SIGTERM path. The Rust ACP schema crate (0.12) does
-/// not yet expose `SessionCapabilities.delete`, so the request type is
-/// defined here against the wire format from the TypeScript SDK. See
-/// #1404.
+/// Wire request not yet exposed by the Rust ACP schema. Unsupported adapters
+/// return `method_not_found`, after which normal process cleanup continues.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
 #[request(method = "session/delete", response = DeleteSessionResponse)]
 #[serde(rename_all = "camelCase")]
@@ -796,26 +753,9 @@ pub enum ResetSessionOutcome {
     Failed { message: String },
 }
 
-/// How the connection task should handle the ACP handshake against the
-/// agent.
-///
-/// `Fresh` is the standard path: send `initialize`, then either
-/// `session/load` (if the agent advertises support AND we have a stored
-/// id) or `session/new`.
-///
-/// `Resume` is used by `AcpClient::attach` on `aoe serve` restart, when
-/// the per-session `aoe __acp-runner` shim kept the agent process
-/// alive across the daemon's death. The agent is already initialized
-/// and the session is already in its in-memory map; re-sending
-/// `session/new` would split context onto a new session id (which the
-/// in-flight turn does not address), and re-sending `session/load`
-/// against an agent that advertises `loadSession: false` (e.g. the
-/// bundled `aoe-agent`) would fall through to `session/new` with the
-/// same split-context bug. In `Resume` mode the daemon still sends
-/// `initialize` (idempotent for capabilities, cheap, lets us learn the
-/// agent's caps) but skips both `session/new` and `session/load` and
-/// uses the supplied `acp_session_id` as-is. `in_flight_turn` arms the
-/// resume-idle watchdog described in `run_connection_task`.
+/// Handshake mode. `Fresh` loads or creates a session. `Resume` attaches to a
+/// runner that survived the daemon, reusing its session id so an in-flight turn
+/// and its context are not split onto a new session.
 #[derive(Debug, Clone)]
 enum ConnectMode {
     Fresh {
@@ -834,117 +774,40 @@ enum ConnectMode {
         acp_session_id: String,
         in_flight_turn: bool,
         seed_history_replay: bool,
+        maya_restricted: bool,
     },
 }
 
-/// Time after a `Resume`-mode attach with `in_flight_turn = true`,
-/// during which the runner forwards NO inbound notification, before the
-/// watchdog synthesizes a `Stopped { reason: "reattach_idle" }` event.
-/// The watchdog disarms permanently on the first inbound notification
-/// (see `first_event_after_attach`): once the runner forwards anything,
-/// the turn is observable and later silence is normal mid-turn
-/// reasoning, not an orphan. So this grace only bounds the fully-silent
-/// reattach case (the orphaned `session/prompt` response was lost and
-/// no notification ever arrives). 30s leaves headroom for a slow first
-/// post-attach event (model reasoning before its first chunk) while
-/// still clearing a truly-dead reattach quickly. See #1216.
+/// Fully silent grace after reattaching to an in-flight turn. Any inbound
+/// notification disarms this watchdog because later silence may be reasoning.
 const RESUME_IDLE_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Grace window between the first `session/cancel` notification (sent
-/// during an in-flight `session/prompt`) and the daemon declaring the
-/// agent unresponsive. When this fires, the connection task ends with
-/// `Stopped { reason: "agent_unresponsive" }` and the supervisor
-/// SIGTERMs the runner before respawning via `session/load`. 10s is
-/// long enough for claude-agent-acp to resolve a real cancel through
-/// the SDK message boundary but short enough that a user who clicked
-/// "Force end turn" isn't watching a frozen UI for 30s while the
-/// daemon waits.
-///
-/// claude-agent-acp >=0.37.0 (upstream #694) now resolves cancel by
-/// returning `PromptResponse { stop_reason: StopReason::Cancelled }`
-/// promptly; in that path the watchdog never fires and the terminal
-/// Stopped reason is `cancelled` (set by `prompt_cancelled` in the
-/// prompt loop) instead of `agent_unresponsive`. The 10s watchdog
-/// stays as a transport-wedge defense: native cancel only protects
-/// against the adapter ignoring the signal, not against socket /
-/// stdout / process-level wedges that prevent the PromptResponse from
-/// reaching the daemon at all. See #1196.
-///
-/// claude-agent-acp >=0.41.0 (upstream #680) also force-resolves a
-/// prompt loop wedged in a `TaskOutput { block: true }` poll against a
-/// hung background task: ~30s after the first cancel it returns
-/// `cancelled` instead of hanging forever. The floor (see
-/// `agent_compat`) guarantees that path, so a cancel during off-protocol
-/// background work no longer rides the 30-minute
-/// `OFF_PROTOCOL_WORK_GRACE_FLOOR` below before recovering.
+/// After a cancel, declare the adapter unresponsive if no prompt response
+/// arrives. This remains a transport-wedge defense even for adapters that
+/// normally resolve cancellation promptly.
 pub(crate) const CANCEL_ESCALATION_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Vendor-agnostic silent-orphan grace fallback used when no config
-/// value is available. Mirrors `AcpConfig::silent_orphan_grace_secs`
-/// default. Bumped from 60s to 120s in #1360 so async-agent flows
-/// (Claude SDK `Agent` tool with `isAsync: true`) survive normal sub-
-/// agent wait windows. See `silent_orphan_grace()`.
+/// Default silent-orphan grace, mirrored by `AcpConfig`.
 const SILENT_ORPHAN_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Minimum effective grace applied when the prompt loop has observed
-/// off-protocol work in the current turn: an async-agent launch
-/// (`OffProtocolWorkKind::AsyncAgent`, see #1360) or a backgrounded
-/// Bash launch (`OffProtocolWorkKind::BackgroundCommand`, see #1401).
-/// The watchdog stays armed but uses this as a floor against the
-/// configured base grace, so an operator who deliberately set a higher
-/// `silent_orphan_grace_secs` still wins. Finite by design: if claude-
-/// agent-acp hangs DURING the off-protocol wait with no cancel sent, the
-/// watchdog still recovers after 30 minutes rather than holding the turn
-/// open forever. When a cancel IS sent, claude-agent-acp >=0.41.0
-/// (upstream #680) force-resolves the wedge in ~30s, so this 30-minute
-/// floor only governs the un-cancelled quiet-wait case.
-/// See #1360, #1401, and upstream `agentclientprotocol/claude-agent-acp#336`.
+/// Grace floor for work that continues without ACP progress, such as an async
+/// agent or background command. It is finite so a real wedge still recovers.
 const OFF_PROTOCOL_WORK_GRACE_FLOOR: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-/// Accelerated silent-orphan grace used when a cost-populated
-/// `UsageUpdate` notification has arrived for the current prompt. The
-/// daemon treats that frame as claude-agent-acp's "wrap up accounting"
-/// terminal-candidate marker emitted just before `PromptResponse`;
-/// when the prompt response then fails to arrive, recovery doesn't
-/// need the full vendor-agnostic grace. See
-/// `silent_orphan_fast_grace()`.
+/// Short grace after end-of-turn accounting arrives without PromptResponse.
 const SILENT_ORPHAN_FAST_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Cadence at which the silent-orphan select arm wakes up to evaluate
-/// whether the watchdog should fire. Polling cadence rather than reset-
-/// on-signal so the prompt loop owns the timer without needing the
-/// notification handler to reach back into a pinned `tokio::time::sleep`.
+/// Polling keeps timer ownership in the prompt loop.
 const SILENT_ORPHAN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Idle grace for the between-prompt watchdog once the cost-bearing
-/// end-of-turn `UsageUpdate` has arrived. Much shorter than the per-prompt
-/// `SILENT_ORPHAN_FAST_GRACE_DEFAULT`: that one also waits out a
-/// possibly-late `PromptResponse` over the wire, but a between-prompt
-/// agent-initiated turn has no RPC to wait for, so once it emits its
-/// end-of-turn marker and goes quiet a few seconds is enough. Kept low so
-/// the "monitoring" badge and running status clear promptly after a monitor
-/// turn finishes. A turn that actually continues emits fresh progress,
-/// which resets the idle timer and clears `cost_seen`, so this cannot cut a
-/// live turn short. See #2325.
+/// Grace for an agent-initiated turn after its end-of-turn accounting marker.
 const BETWEEN_PROMPT_IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Idle grace for a between-prompt agent-initiated turn that streamed
-/// output but never reported a cost-bearing end-of-turn marker and never
-/// scheduled a wake, i.e. a turn that stalled mid-stream (the model
-/// connection dropped, the process parked) rather than finishing cleanly or
-/// parking a monitor. A legitimately parked monitor / `/loop` sets a
-/// `wake_at` and so never lands here; genuinely off-protocol work
-/// (backgrounded Bash) latches the 30-minute floor. So this bucket is the
-/// stall, and it should self-heal in a couple of minutes, not 30. Set to
-/// the vendor-agnostic base grace so a live turn's normal inter-chunk /
-/// inter-tool gaps (which refresh the idle timer) cannot trip it. See
-/// #2573.
+/// Grace for an agent-initiated turn that stalled without accounting or a
+/// scheduled wake. Progress continually resets the timer.
 const BETWEEN_PROMPT_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Tick cadence for the between-prompt idle check. Faster than
-/// `SILENT_ORPHAN_CHECK_INTERVAL` so the badge and status clear within a few
-/// seconds of the turn ending. Only polled while the command loop is parked
-/// between prompts, so the extra wakeups are cheap. See #2325.
+/// Faster cadence used only while the command loop is between prompts.
 const BETWEEN_PROMPT_IDLE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn opencode_data_dir() -> Option<PathBuf> {
@@ -1271,32 +1134,18 @@ struct SilentOrphanWatchdogConfig {
     off_protocol_grace_floor: std::time::Duration,
 }
 
-/// Pure state machine for the silent-orphan watchdog. The prompt loop
-/// owns one instance per prompt; the `apply_signal` method consumes
-/// `LifecycleSignal`s from the notification handler and `should_fire`
-/// returns the firing predicate on each polling tick.
-///
-/// All wall-clock and monotonic time inputs are injected by the caller
-/// (`now: Instant`, `wall_now: DateTime<Utc>`) so the unit tests can
-/// step the clock forward synthetically. The struct never reaches into
-/// `Instant::now()` or `chrono::Utc::now()` directly.
+/// Per-prompt silent-orphan state machine. Time is injected for deterministic
+/// tests.
 ///
 /// Invariants:
 ///
 /// - `tool_calls_in_flight` non-empty → watchdog is always suppressed.
-/// - `off_protocol_work_seen.is_some()` → effective grace lifts to at
-///   least `off_protocol_grace_floor` for the rest of this prompt, EXCEPT
-///   the backgrounded-Bash mid-stream-stall case: `BackgroundCommand` with
-///   `last_refresh_was_progress` bypasses the floor and recovers on the
-///   normal per-prompt grace (#2645).
-/// - `wakeup_suppress_until.is_some()` and `now < deadline` →
-///   suppressed regardless of grace.
+/// - off-protocol work uses its grace floor, except a background-command stream
+///   that visibly stalled;
+/// - a future wake suppresses the watchdog;
 /// - `cost_seen` switches the no-off-protocol case to fast grace; any
 ///   subsequent `Progress` / `ToolStarted` / `ToolCompleted` /
 ///   `WakeupPending` clears it.
-///
-/// See #1240 (original wedge), #1360 (async-agent floor), #1401
-/// (backgrounded Bash + ScheduleWakeup), and #2645 (mid-stream stall).
 #[derive(Debug, Default)]
 struct SilentOrphanWatchdog {
     saw_first_progress: bool,
@@ -1305,15 +1154,8 @@ struct SilentOrphanWatchdog {
     tool_calls_in_flight: std::collections::HashMap<String, ToolMetadata>,
     off_protocol_work_seen: Option<OffProtocolWorkKind>,
     wakeup_suppress_until: Option<tokio::time::Instant>,
-    /// True when the last signal that refreshed the progress timer was a
-    /// `Progress` (`AgentMessageChunk` / `AgentThoughtChunk` / `Plan` /
-    /// non-terminal `ToolCallUpdate`) rather than a tool boundary
-    /// (`ToolStarted` / `ToolCompleted`) or a `WakeupPending`. Lets
-    /// `effective_grace` tell a model stream that died mid-message apart
-    /// from a backgrounded Bash that is still being polled: a live bash
-    /// surfaces as `BashOutput` tool activity (flag `false`, keeps the
-    /// 30-min floor), while a mid-stream stall leaves the flag `true`
-    /// (recover on the normal per-prompt grace). See #2645.
+    /// Distinguishes a stream that died mid-message from background work still
+    /// producing tool activity.
     last_refresh_was_progress: bool,
 }
 
@@ -1791,23 +1633,8 @@ fn between_prompt_stop_reason(adopted: bool, cost_seen: bool) -> &'static str {
     }
 }
 
-/// Per-turn claim on "who publishes this turn's terminal `Stopped`", shared by
-/// every path that can end one: the runner control reader's waiterless
-/// completion, the resume-idle watchdog, the between-prompt watchdog, and the
-/// cancel / force-stop desync recovery.
-///
-/// It replaces a single one-shot `AtomicBool`. That bool was claimed at most
-/// once per CONNECTION, so once any path had used it, a later turn on the same
-/// connection could not claim it: the between-prompt watchdog would reset its
-/// state, compute `claimed == false`, and skip the emit, leaving the session
-/// rendering Running with no terminal event. Reachable today by reattaching to
-/// an in-flight turn (the reader claims the guard for the adopted turn) and
-/// then letting the agent resume itself once more.
-///
-/// Keyed by turn instead: `begin_turn` marks the start of a turn, and a claim
-/// succeeds once per turn. An epoch rather than a reset so a claim can never
-/// clear the state of a NEWER turn, which is the race a plain "release the
-/// guard when done" would reintroduce. See #3190 and PR #3192 review.
+/// Ensures exactly one path publishes each turn's terminal event. Epochs allow
+/// a later turn to be claimed without letting an older path clear its state.
 pub(crate) struct TerminalClaim {
     /// Incremented for each turn that begins on this connection.
     epoch: AtomicU64,
@@ -1874,20 +1701,8 @@ pub(crate) struct LifecycleEnvelope {
     pub signal: LifecycleSignal,
 }
 
-/// Deliver a lifecycle envelope from the notification handler to the
-/// prompt loop with the right backpressure policy.
-///
-/// `Progress` uses `try_send` first to avoid blocking the notification
-/// handler under streaming-chunk bursts; if the channel is full it
-/// falls back to an awaited `send`. The fallback preserves correctness
-/// (a dropped `Progress` after a `TerminalUsage` would leave
-/// `cost_seen = true` with a stale `last_progress_at`, false-firing
-/// the fast-grace path on a healthy turn).
-///
-/// All other lifecycle variants use an awaited `send` directly because
-/// their loss can flip the watchdog into a false-positive state that
-/// only the next equivalent signal would clear. See #1401 design
-/// rationale.
+/// Deliver without dropping signals that affect watchdog correctness. Progress
+/// tries the nonblocking path first because it arrives in bursts.
 async fn send_lifecycle_signal(
     tx: &mpsc::Sender<LifecycleEnvelope>,
     env: LifecycleEnvelope,
@@ -1920,20 +1735,9 @@ async fn send_lifecycle_signal(
     }
 }
 
-/// Forward a notification's watchdog signals to the per-prompt lifecycle
-/// channel, but only while a prompt is in flight.
-///
-/// The channel's sole consumer is the prompt loop: it drains during a
-/// `session/prompt` and flushes leftovers (discarding them by epoch) at
-/// the start of the next one. Between prompts nothing reads it, so a busy
-/// agent (a background Task subagent streaming child tool calls, or an
-/// agent-initiated turn) fills all slots and the next awaited send parks
-/// the notification handler until the next prompt; with dispatch
-/// serialized per connection, that freezes every subsequent notification
-/// and the session appears dead while the agent keeps working. Skipping
-/// the send loses nothing: a between-prompt envelope could only ever be
-/// flushed unread. The between-prompt watchdog is fed by atomics in the
-/// notification handler, not this channel. See #2888.
+/// Forward signals only while their prompt-loop consumer is active. Between
+/// prompts they would fill the channel and block all later notifications; the
+/// separate idle watchdog reads atomics instead.
 async fn forward_lifecycle_signals(
     prompt_active: bool,
     tx: &mpsc::Sender<LifecycleEnvelope>,
@@ -1950,33 +1754,9 @@ async fn forward_lifecycle_signals(
     }
 }
 
-/// Detect whether a `ToolCallUpdate` completion content array carries a
-/// Claude SDK marker that the underlying work continues off-protocol after
-/// the visible tool call completes. Two markers today:
-///
-/// - `"Async agent launched successfully"`: the `Agent` tool with
-///   `isAsync: true` spawned a sub-agent polled via an internal SDK
-///   channel (#1360).
-/// - `"Command running in background with ID: "`: the `Bash` tool with
-///   `run_in_background: true` left a subprocess running; the agent will
-///   poll later via `BashOutput` / `KillShell` (#1401).
-///
-/// Text detection is intentionally narrow. Both prefixes are hardcoded in
-/// the Anthropic Claude SDK and are the most stable identifiers available
-/// short of upstream `agentclientprotocol/claude-agent-acp#336` forwarding
-/// the off-protocol notifications natively. If a prefix ever changes,
-/// this detector returns `None` and the watchdog falls back to the base
-/// grace. For backgrounded Bash, the daemon also tracks
-/// `raw_input.run_in_background == true` at `ToolStarted` time as a
-/// defense in depth, so a single broken signal cannot reintroduce the
-/// false-positive class this fix targets.
-///
-/// Match anchors at the start of a text block (or any line within it)
-/// rather than substring `contains`. The SDK emits these markers as the
-/// FIRST line of the completion content; user output from a regular
-/// `Bash` that happens to print `Command running in background with
-/// ID: ...` would otherwise trip the watchdog to its 30-minute floor.
-/// See CodeRabbit review on PR #1406.
+/// Detect SDK markers for async agents and background commands whose work
+/// continues after the visible tool call. Match only line prefixes so ordinary
+/// command output containing the marker does not extend watchdog grace.
 fn detect_off_protocol_work_completed(
     content: &Option<Vec<agent_client_protocol::schema::v1::ToolCallContent>>,
 ) -> Option<OffProtocolWorkKind> {
@@ -2100,7 +1880,10 @@ fn take_injected_fresh_handshake_failure() -> bool {
 /// floor was raised from 10s to 120s in #1360 alongside the default
 /// bump from 60 to 120; users who explicitly want a shorter grace
 /// must set `0` to disable instead.
-fn silent_orphan_grace(profile: Option<&str>) -> std::time::Duration {
+fn silent_orphan_grace(profile: Option<&str>, maya_restricted: bool) -> std::time::Duration {
+    if maya_restricted {
+        return std::time::Duration::ZERO;
+    }
     #[cfg(debug_assertions)]
     if let Ok(raw) = std::env::var("AOE_SILENT_ORPHAN_GRACE_MS") {
         if let Ok(ms) = raw.parse::<u64>() {
@@ -2966,6 +2749,7 @@ impl AcpClient {
         };
         let external_terminal_guard = control_client.as_ref().map(|_| guard);
         let external_prompt_in_flight = control_client.as_ref().map(|_| prompt_in_flight);
+        let mut handshake_control = ShutdownControlOnDrop(control_client.clone());
 
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
 
@@ -2999,8 +2783,8 @@ impl AcpClient {
             )
             .instrument(conn_span),
         );
-
         wait_for_handshake(&session_label, ready_rx, None, &install_binary).await?;
+        handshake_control.0.take();
 
         Ok(Self {
             session_id,
@@ -3044,6 +2828,7 @@ impl AcpClient {
         session_id: AcpSessionId,
         sandbox: Option<(SessionSandbox, SandboxPathMap)>,
         agent_key: String,
+        maya_restricted: bool,
         source_profile: Option<String>,
     ) -> Result<Self, AcpError> {
         let expected_acp_session_id = stored_acp_session_id.clone();
@@ -3054,6 +2839,7 @@ impl AcpClient {
             acp_session_id: stored_acp_session_id,
             in_flight_turn,
             seed_history_replay,
+            maya_restricted,
         };
         let profile = agent_profiles::resolve(&agent_key);
         // Resolve the binary name from the registry so the resume path
@@ -3433,6 +3219,19 @@ impl AcpClient {
     /// mutex (which would deadlock send_prompt).
     pub fn take_inbound(&mut self) -> Option<mpsc::Receiver<Event>> {
         self.inbound.take()
+    }
+}
+
+/// Cancel a socket handshake if its constructor is dropped before completion.
+/// Closing the exact runner control channel cancels only that runner.
+struct ShutdownControlOnDrop(Option<Arc<DaemonControlClient>>);
+
+impl Drop for ShutdownControlOnDrop {
+    fn drop(&mut self) {
+        if let Some(control) = self.0.take() {
+            // SAFETY: `control` keeps this exact socket alive for the call.
+            unsafe { libc::shutdown(control.raw_fd, libc::SHUT_RDWR) };
+        }
     }
 }
 
@@ -4277,6 +4076,7 @@ struct DaemonControlClient {
     handshake_rx: Mutex<mpsc::Receiver<ControlBody>>,
     completion: Arc<std::sync::Mutex<Option<oneshot::Sender<control_protocol::PromptOutcome>>>>,
     pending_history_replay: Mutex<Option<control_protocol::PendingHistoryReplay>>,
+    raw_fd: RawFd,
 }
 
 impl DaemonControlClient {
@@ -4549,11 +4349,13 @@ async fn connect_runner_control_v2(
         }
     });
 
+    let raw_fd = write_half.as_ref().as_raw_fd();
     Some(Arc::new(DaemonControlClient {
         write: Mutex::new(write_half),
         handshake_rx: Mutex::new(hs_rx),
         completion,
         pending_history_replay: Mutex::new(pending_history_replay),
+        raw_fd,
     }))
 }
 
@@ -7472,6 +7274,14 @@ async fn run_connection_task<W, R>(
                     ..
                 }
             );
+            let restricted_runtime = match &mode {
+                ConnectMode::Fresh {
+                    maya_restricted, ..
+                }
+                | ConnectMode::Resume {
+                    maya_restricted, ..
+                } => *maya_restricted,
+            };
             // Mark the adopted turn so the notification handler applies the
             // cost-marker barrier and the between-prompt watchdog emits
             // `prompt_complete` for it. Set before any turn events arrive. See #2899.
@@ -7535,6 +7345,7 @@ async fn run_connection_task<W, R>(
                     acp_session_id: stored,
                     in_flight_turn: _,
                     seed_history_replay,
+                    ..
                 } => {
                     // INVARIANT: Resume mode MUST NOT send `session/new`
                     // or `session/load`. This is the load-bearing trick
@@ -8578,7 +8389,7 @@ async fn run_connection_task<W, R>(
                         let mut prompt_orphaned = false;
 
                         let silent_orphan_grace_default =
-                            silent_orphan_grace(source_profile.as_deref());
+                            silent_orphan_grace(source_profile.as_deref(), restricted_runtime);
                         let silent_orphan_grace_fast = silent_orphan_fast_grace();
                         let silent_orphan_enabled =
                             silent_orphan_grace_default > std::time::Duration::ZERO;
@@ -10838,6 +10649,11 @@ mod tests {
     // before it ever reached the shim.
     // -------------------------------------------------------------------
 
+    #[test]
+    fn maya_restricted_disables_silent_orphan_watchdog() {
+        assert_eq!(silent_orphan_grace(None, true), std::time::Duration::ZERO);
+    }
+
     fn watchdog_test_cfg() -> SilentOrphanWatchdogConfig {
         SilentOrphanWatchdogConfig {
             base_grace: std::time::Duration::from_secs(120),
@@ -12933,6 +12749,7 @@ done
         const TOKEN: &str = "55555555-5555-4555-8555-555555555555";
         let (daemon, runner) = tokio::net::UnixStream::pair().expect("control socket pair");
         let (_daemon_read, daemon_write) = daemon.into_split();
+        let raw_fd = daemon_write.as_ref().as_raw_fd();
         let (mut runner_read, _runner_write) = runner.into_split();
         let (_handshake_tx, handshake_rx) = mpsc::channel(1);
         let control = Arc::new(DaemonControlClient {
@@ -12943,6 +12760,7 @@ done
             // subsequent session/load must arm the daemon-side token rather
             // than leaving that initial snapshot stale.
             pending_history_replay: Mutex::new(None),
+            raw_fd,
         });
         let (mut client, _events) = AcpClient::fake_for_test(AcpSessionId("fresh-replay".into()));
         client.control_client = Some(control.clone());
@@ -12977,6 +12795,7 @@ done
         const TOKEN: &str = "66666666-6666-4666-8666-666666666666";
         let (daemon, runner) = tokio::net::UnixStream::pair().expect("control socket pair");
         let (_daemon_read, daemon_write) = daemon.into_split();
+        let raw_fd = daemon_write.as_ref().as_raw_fd();
         drop(runner);
         let (_handshake_tx, handshake_rx) = mpsc::channel(1);
         let control = Arc::new(DaemonControlClient {
@@ -12987,6 +12806,7 @@ done
                 acp_session_id: "stored-history".into(),
                 replay_token: TOKEN.into(),
             })),
+            raw_fd,
         });
         let (mut client, _events) =
             AcpClient::fake_for_test(AcpSessionId("reattached-replay".into()));
