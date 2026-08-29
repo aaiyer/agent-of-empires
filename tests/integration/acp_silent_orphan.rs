@@ -10,7 +10,7 @@
 //!   1. positive: cost-populated usage_update + silence → orphan fires.
 //!   2. negative (tool open): a long-running tool keeps
 //!      `tool_calls_in_flight` non-empty → orphan must NOT fire.
-//!   3. disabled (grace = 0): watchdog skipped entirely → no orphan.
+//!   3. Maya-restricted: watchdog skipped entirely → no orphan.
 //!
 //! Skipped automatically if `node` is missing.
 //!
@@ -250,16 +250,16 @@ async fn silent_orphan_suppressed_during_normal_turn() {
 
 #[tokio::test]
 #[serial]
-async fn silent_orphan_disabled_by_zero_grace() {
+async fn silent_orphan_disabled_for_maya_restricted_resume() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
     }
 
-    // `0` disables the watchdog entirely. With the shim parked on
-    // SILENT_ORPHAN we'd otherwise see prompt_orphaned within a few
-    // hundred milliseconds; instead we should see no Stopped frame at
-    // all within the deadline, because nothing else fires.
+    // Maya-restricted connections disable the watchdog. Keep both grace
+    // values non-zero so a dropped `ConnectMode::Resume` restriction would
+    // emit prompt_orphaned within this deadline, as the non-restricted
+    // control above proves.
     //
     // Override the polling cadence too: the default 5s tick would let
     // a regressed "disabled" knob slip past a 2s deadline simply
@@ -267,7 +267,7 @@ async fn silent_orphan_disabled_by_zero_grace() {
     // means a wrongly-armed watchdog WOULD fire within the deadline,
     // turning a silent assertion into a real one.
     let _env = EnvGuard::set(&[
-        ("AOE_SILENT_ORPHAN_GRACE_MS", "0"),
+        ("AOE_SILENT_ORPHAN_GRACE_MS", "300"),
         ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "200"),
         ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
     ]);
@@ -285,7 +285,7 @@ async fn silent_orphan_disabled_by_zero_grace() {
         AcpSessionId("silent-orphan-disabled".into()),
         None,
         "claude".into(),
-        false,
+        true,
         None,
     )
     .await
@@ -303,7 +303,7 @@ async fn silent_orphan_disabled_by_zero_grace() {
 
     assert!(
         stopped.is_none(),
-        "silent-orphan watchdog must stay fully disarmed when grace = 0; saw Stopped reason={stopped:?}"
+        "Maya-restricted resume must keep the silent-orphan watchdog disarmed; saw Stopped reason={stopped:?}"
     );
 }
 
