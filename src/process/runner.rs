@@ -854,6 +854,7 @@ struct PendingHistoryReplayState {
     next_line: usize,
     acp_session_id: String,
     replay_token: String,
+    generation: u64,
     running: bool,
     barrier_delivered: bool,
     failed: bool,
@@ -1294,6 +1295,7 @@ impl RunnerShared {
             self.control.lock().await.pending = None;
         }
         if let Some(replay) = self.history_replay.lock().await.as_mut() {
+            replay.generation = replay.generation.wrapping_add(1);
             replay.next_line = 0;
             replay.running = false;
             replay.barrier_delivered = false;
@@ -1609,6 +1611,7 @@ impl RunnerShared {
                 next_line: 0,
                 acp_session_id,
                 replay_token,
+                generation: 0,
                 running: false,
                 barrier_delivered: false,
                 failed: false,
@@ -1640,14 +1643,22 @@ impl RunnerShared {
         Some(line)
     }
 
-    async fn deliver_replay_step(&self, token: &str, line: &[u8], barrier: bool) -> bool {
+    async fn deliver_replay_step(
+        &self,
+        token: &str,
+        generation: u64,
+        line: &[u8],
+        barrier: bool,
+    ) -> bool {
         let _delivery = self.relay_delivery.lock().await;
         if self
             .history_replay
             .lock()
             .await
             .as_ref()
-            .is_none_or(|replay| replay.replay_token != token || replay.failed)
+            .is_none_or(|replay| {
+                replay.replay_token != token || replay.generation != generation || replay.failed
+            })
         {
             return false;
         }
@@ -1664,7 +1675,7 @@ impl RunnerShared {
             let Some(replay) = pending.as_mut() else {
                 return false;
             };
-            if replay.replay_token != token {
+            if replay.replay_token != token || replay.generation != generation {
                 return false;
             }
             if barrier {
@@ -1691,7 +1702,7 @@ impl RunnerShared {
     }
 
     async fn resume_history_replay(self: &Arc<Self>) {
-        {
+        let generation = {
             let mut pending = self.history_replay.lock().await;
             let Some(replay) = pending.as_mut() else {
                 return;
@@ -1700,7 +1711,8 @@ impl RunnerShared {
                 return;
             }
             replay.running = true;
-        }
+            replay.generation
+        };
         let shared = Arc::clone(self);
         tokio::spawn(async move {
             loop {
@@ -1709,6 +1721,9 @@ impl RunnerShared {
                     let Some(replay) = pending.as_ref() else {
                         return;
                     };
+                    if replay.generation != generation {
+                        return;
+                    }
                     if replay.next_line < replay.replay.len() {
                         Some((
                             replay.replay_token.clone(),
@@ -1722,13 +1737,18 @@ impl RunnerShared {
                 };
                 let Some((token, line, barrier)) = next else {
                     if let Some(replay) = shared.history_replay.lock().await.as_mut() {
-                        replay.running = false;
+                        if replay.generation == generation {
+                            replay.running = false;
+                        }
                     }
                     return;
                 };
-                if !shared.deliver_replay_step(&token, &line, barrier).await {
+                if !shared
+                    .deliver_replay_step(&token, generation, &line, barrier)
+                    .await
+                {
                     if let Some(replay) = shared.history_replay.lock().await.as_mut() {
-                        if replay.replay_token == token {
+                        if replay.replay_token == token && replay.generation == generation {
                             replay.running = false;
                         }
                     }
@@ -2961,6 +2981,7 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$AOE_TEST_RESPONSE_ID"
             next_line: 1,
             acp_session_id: "stored-history".into(),
             replay_token: TOKEN.into(),
+            generation: 0,
             running: true,
             barrier_delivered: false,
             failed: false,
@@ -3001,6 +3022,7 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$AOE_TEST_RESPONSE_ID"
             next_line: 0,
             acp_session_id: "stored-history".into(),
             replay_token: TOKEN.into(),
+            generation: 0,
             running: false,
             barrier_delivered: false,
             failed: false,
@@ -3208,6 +3230,68 @@ printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$AOE_TEST_RESPONSE_ID"
 
         shared.settle_history_replay(TOKEN).await;
         assert!(shared.history_replay.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cleared_history_replay_fences_stale_delivery_after_reattach() {
+        const TOKEN: &str = "88888888-8888-4888-8888-888888888888";
+        let shared = Arc::new(RunnerShared::new());
+        shared
+            .schedule_history_replay(
+                vec![b"current\n".to_vec()].into(),
+                "stored-history".into(),
+                TOKEN.into(),
+            )
+            .await
+            .expect("retain replay");
+        let stale_generation = shared
+            .history_replay
+            .lock()
+            .await
+            .as_ref()
+            .expect("unsettled replay")
+            .generation;
+
+        let relay_generation = *shared.relay_failures.borrow();
+        shared.clear_outbound(false, relay_generation).await;
+        let current_generation = {
+            let mut pending = shared.history_replay.lock().await;
+            let replay = pending.as_mut().expect("replay survives detach");
+            assert_ne!(replay.generation, stale_generation);
+            replay.running = true;
+            replay.generation
+        };
+
+        let (daemon, runner) = UnixStream::pair().expect("replacement relay");
+        let (daemon_read, _daemon_write) = daemon.into_split();
+        let (_runner_read, runner_write) = runner.into_split();
+        assert!(shared.install_outbound(runner_write).await.is_none());
+
+        assert!(
+            !shared
+                .deliver_replay_step(TOKEN, stale_generation, b"stale\n", false)
+                .await,
+            "detached replay work must not write through the replacement relay"
+        );
+        {
+            let replay = shared.history_replay.lock().await;
+            let replay = replay.as_ref().expect("current replay remains owned");
+            assert_eq!(replay.next_line, 0);
+            assert!(replay.running);
+        }
+
+        assert!(
+            shared
+                .deliver_replay_step(TOKEN, current_generation, b"current\n", false)
+                .await
+        );
+        let mut reader = BufReader::new(daemon_read);
+        let mut received = String::new();
+        reader
+            .read_line(&mut received)
+            .await
+            .expect("read current replay line");
+        assert_eq!(received, "current\n");
     }
 
     #[tokio::test]
