@@ -303,6 +303,23 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         preserve_files: &[],
         clean_files: &[],
     },
+    AgentConfigMount {
+        tool_name: "prime-agent",
+        host_rel: ".prime/agent",
+        container_suffix: ".prime/agent",
+        // Skip AoE's sandbox staging dir, the per-instance session
+        // transcripts, and the bootstrapped IPython kernel venv
+        // (machine-specific, and the container rebuilds it on first run).
+        // skills/ stays un-skipped and is copied below so user-authored
+        // host skills reach the container, like Kimi's mount.
+        skip_entries: &["sandbox", "sessions", "kernel-venv"],
+        seed_files: &[],
+        copy_dirs: &["skills"],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
+        clean_files: &[],
+    },
 ];
 
 /// Sync host agent config into the shared sandbox directory. Copies top-level files
@@ -935,6 +952,42 @@ fn sync_managed_skills_into_sandbox(
 /// default case where no worktree is detected).
 ///
 /// Returns (host_mount_path, container_mount_path, working_dir)
+/// Where a sandboxed Pi publishes its conversation, inside the container.
+///
+/// Under the pi config mount rather than the hook base: that bind already
+/// exists for every Pi container, so no new mount is needed and an image
+/// created by an older AoE keeps working. Docker cannot add a mount to a
+/// container that already exists, and reusing one is the normal path.
+pub(crate) const PI_SIDECAR_DIR_IN_CONTAINER: &str = "/root/.pi/aoe-session";
+
+/// Host directory backing [`PI_SIDECAR_DIR_IN_CONTAINER`], and the root the
+/// extension is written under.
+pub(crate) fn pi_sandbox_dir() -> Option<std::path::PathBuf> {
+    let mount = AGENT_CONFIG_MOUNTS.iter().find(|m| m.tool_name == "pi")?;
+    let home = dirs::home_dir()?;
+    sandbox_dir_for(mount, &home, None).ok()
+}
+
+/// Write the session-id extension where a sandboxed Pi discovers it
+/// (`~/.pi/agent/extensions/` in the container). Discovery rather than `-e`:
+/// pi refuses to start when an `-e` path is missing, and the file has to
+/// survive an upgrade of AoE under a container that already exists.
+pub(crate) fn install_pi_sandbox_extension() -> Result<()> {
+    let dir = pi_sandbox_dir()
+        .ok_or_else(|| anyhow::anyhow!("no Pi sandbox dir"))?
+        .join("agent")
+        .join("extensions");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("aoe-session-id.js");
+    let source = crate::session::instance::PI_SESSION_EXTENSION;
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(source) {
+        let tmp = dir.join("aoe-session-id.js.tmp");
+        std::fs::write(&tmp, source)?;
+        std::fs::rename(&tmp, &path)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn compute_volume_paths(
     project_path: &Path,
     project_path_str: &str,
@@ -1257,29 +1310,44 @@ fn refresh_codex_sandbox_hooks(
     }
 }
 
-fn apply_yolo_trust_config(
+/// Pre-trust the container workspace in the staged config of `mount`'s agent.
+///
+/// Codex and Gemini stay gated on YOLO mode: their prompts guard approvals the
+/// user has already opted out of there, and outside YOLO the prompt is the
+/// approval. Claude Code's dialog is not an approval gate but a startup gate,
+/// so it blocks a non-YOLO session just as hard and is applied unconditionally.
+fn apply_folder_trust_config(
     mount: &AgentConfigMount,
     sandbox_dir: &Path,
     container_workspace_path: &str,
+    is_yolo_mode: bool,
 ) -> Result<()> {
     match (mount.tool_name, mount.host_rel) {
-        ("codex", ".codex") => crate::hooks::trust_codex_project(
+        ("codex", ".codex") if is_yolo_mode => crate::hooks::trust_codex_project(
             &sandbox_dir.join("config.toml"),
             container_workspace_path,
         ),
-        ("gemini", ".gemini") => {
+        ("gemini", ".gemini") if is_yolo_mode => {
             crate::hooks::disable_gemini_folder_trust(&sandbox_dir.join("settings.json"))
         }
+        // The same host file is bind-mounted at both `$CLAUDE_CONFIG_DIR/.claude.json`
+        // (via the config dir) and `~/.claude.json` (via `home_seed_files`), so one
+        // write covers whichever path this Claude Code build reads.
+        ("claude", ".claude") => crate::hooks::trust_claude_project(
+            &sandbox_dir.join(".claude.json"),
+            container_workspace_path,
+        ),
         _ => Ok(()),
     }
 }
 
-pub(crate) fn ensure_yolo_trust_config_for_active_agent(
+pub(crate) fn ensure_folder_trust_config_for_active_agent(
     tool: &str,
     detect_as: Option<&str>,
     profile: &str,
     instance_id: &str,
     container_workspace_path: &str,
+    is_yolo_mode: bool,
 ) {
     let Some(home) = dirs::home_dir() else {
         return;
@@ -1298,17 +1366,24 @@ pub(crate) fn ensure_yolo_trust_config_for_active_agent(
             Ok(dir) => dir,
             Err(e) => {
                 tracing::warn!(target: "session.profile",
-                    "Failed to resolve sandbox YOLO trust config for {}: {}", mount.tool_name, e
+                    "Failed to resolve sandbox folder trust config for {}: {}", mount.tool_name, e
                 );
                 continue;
             }
         };
         if let Err(e) = std::fs::create_dir_all(&sandbox_dir)
             .with_context(|| format!("creating sandbox config dir {}", sandbox_dir.display()))
-            .and_then(|_| apply_yolo_trust_config(mount, &sandbox_dir, container_workspace_path))
+            .and_then(|_| {
+                apply_folder_trust_config(
+                    mount,
+                    &sandbox_dir,
+                    container_workspace_path,
+                    is_yolo_mode,
+                )
+            })
         {
             tracing::warn!(target: "session.profile",
-                "Failed to apply sandbox YOLO trust config for {} at {}: {}",
+                "Failed to apply sandbox folder trust config for {} at {}: {}",
                 mount.tool_name,
                 sandbox_dir.display(),
                 e
@@ -1926,54 +2001,21 @@ pub(crate) fn build_container_config(
                     value: value.to_string(),
                 });
             }
-
-            // Codex and Gemini re-prompt for folder trust on every launch, and
-            // in a sandbox the config dir is ephemeral so the prompt never
-            // "sticks". In YOLO mode the user has already opted out of
-            // approvals, so disable the trust confirmation in the staged
-            // sandbox config to match that intent (issue #472). The `.codex`
-            // /`.gemini` sandbox dirs were staged by the AGENT_CONFIG_MOUNTS
-            // loop above, so these merges land in files that get bind-mounted
-            // into the container.
-            match agent.name {
-                "codex" => {
-                    if let Some(mount) = AGENT_CONFIG_MOUNTS
-                        .iter()
-                        .find(|mount| mount.tool_name == "codex" && mount.host_rel == ".codex")
-                    {
-                        match sandbox_dir_for(mount, &home, Some(instance_id)) {
-                            Ok(sandbox_dir) => {
-                                if let Err(e) = crate::hooks::trust_codex_project(
-                                    &sandbox_dir.join("config.toml"),
-                                    &workspace_path,
-                                ) {
-                                    tracing::warn!(target: "session.profile",
-                                        "Failed to mark project trusted in sandbox Codex config: {}", e);
-                                }
-                            }
-                            Err(e) => tracing::warn!(target: "session.profile",
-                                "Failed to resolve sandbox Codex config for YOLO trust: {}", e
-                            ),
-                        }
-                    } else {
-                        tracing::warn!(target: "session.profile",
-                            "Codex config mount is unavailable for sandbox YOLO trust");
-                    }
-                }
-                "gemini" => {
-                    let settings_file = home
-                        .join(".gemini")
-                        .join(SANDBOX_SUBDIR)
-                        .join("settings.json");
-                    if let Err(e) = crate::hooks::disable_gemini_folder_trust(&settings_file) {
-                        tracing::warn!(target: "session.profile",
-                            "Failed to disable folder trust in sandbox Gemini settings: {}", e);
-                    }
-                }
-                _ => {}
-            }
         }
     }
+
+    // Folder trust goes through the shared registry so the create path and the
+    // attach/restart path in `instance/container.rs` cannot drift (issue #472).
+    // Called outside the YOLO gate because the registry decides per agent which
+    // prompts are approval gates and which merely block startup.
+    ensure_folder_trust_config_for_active_agent(
+        agent_selection.tool,
+        agent_selection.detect_as,
+        profile,
+        instance_id,
+        &workspace_path,
+        is_yolo_mode,
+    );
 
     // Add extra_volumes from config (host:container format)
     // Also collect container paths to filter conflicting volume_ignores later
@@ -2124,6 +2166,81 @@ fn common_ancestor(a: &Path, b: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    // The sandbox design rests on a bind that already exists: the Pi config
+    // dir at `/root/.pi`. Everything else follows from it, so assert the mount
+    // the builder actually produces rather than the one this branch intended.
+    // No container runs in CI, which is exactly why this has to be pinned here.
+    #[test]
+    #[serial_test::serial]
+    fn sandboxed_pi_config_mount_backs_the_sidecar_and_extension() {
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        let instance_id = "pisandboxbind001";
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("pi", None),
+            false,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
+
+        let sandbox_dir = pi_sandbox_dir().expect("a Pi sandbox dir");
+        let bind = config
+            .volumes
+            .iter()
+            .find(|v| v.container_path == "/root/.pi")
+            .expect("the Pi config dir must be bound at /root/.pi");
+        assert_eq!(bind.host_path, sandbox_dir.to_string_lossy());
+        assert!(!bind.read_only, "the pane publishes into this bind");
+
+        // Both container paths therefore resolve under that host directory.
+        assert!(PI_SIDECAR_DIR_IN_CONTAINER.starts_with("/root/.pi/"));
+        let host_sidecar = sandbox_dir.join(
+            PI_SIDECAR_DIR_IN_CONTAINER
+                .strip_prefix("/root/.pi/")
+                .unwrap(),
+        );
+        assert!(host_sidecar.starts_with(&sandbox_dir));
+
+        install_pi_sandbox_extension().expect("install the extension");
+        assert!(
+            sandbox_dir
+                .join("agent/extensions/aoe-session-id.js")
+                .is_file(),
+            "the extension must land where the container discovers it"
+        );
+
+        // Nothing this branch adds may introduce a mount: a container that
+        // already exists cannot gain one.
+        assert!(
+            !config
+                .volumes
+                .iter()
+                .any(|v| v.container_path.contains("aoe-pi-session-id")),
+            "no per-extension mount may be required"
+        );
+    }
+
     use super::*;
     use crate::hooks::test_support::BaseGuard;
     use std::fs;
@@ -3076,6 +3193,27 @@ mod tests {
         assert!(!sandbox.join("subdir").exists());
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn test_prime_agent_mount_copies_user_skills() {
+        let home = TempDir::new().unwrap();
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(home.path());
+        let skill_dir = home.path().join(".prime/agent/skills/reviewing");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("SKILL.md"), "review instructions").unwrap();
+
+        let prime_mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|m| m.tool_name == "prime-agent")
+            .expect("prime-agent mount must exist");
+        let sandbox = prepare_sandbox_dir(prime_mount, home.path(), None).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(sandbox.join("skills/reviewing/SKILL.md")).unwrap(),
+            "review instructions"
+        );
+    }
+
     // Regression for #3014: settings.json (a top-level file) referenced a hook
     // script under ~/.claude/hooks/, but `hooks` was absent from Claude's
     // copy_dirs, so the config was carried into the sandbox without the script
@@ -3445,6 +3583,9 @@ mod tests {
             ("gemini", Some("skills")),
             ("opencode", Some("skills")),
             ("kimi", Some("skills")),
+            // Prime Agent reads ~/.prime/agent/skills, under its .prime/agent
+            // mount.
+            ("prime-agent", Some("skills")),
             // Codex reads ~/.agents/skills, which is not under its .codex mount.
             ("codex", None),
         ];
@@ -4063,7 +4204,7 @@ volume_ignores = ["node_modules"]
     // every launch.
     #[test]
     #[serial_test::serial]
-    fn test_build_container_config_yolo_trusts_codex_project() {
+    fn test_build_container_config_yolo_trusts_codex_project_only_in_yolo() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
@@ -4115,6 +4256,70 @@ volume_ignores = ["node_modules"]
         );
 
         crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    // Claude Code's folder-trust dialog is keyed on the git root, so every
+    // container workspace is a fresh key and the dialog blocks startup. Unlike
+    // Codex and Gemini this is not an approval gate, so it is seeded in both
+    // YOLO and non-YOLO sessions, and it must merge into the onboarding state
+    // the same file already carries (issue #472).
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_seeds_claude_folder_trust() {
+        for is_yolo in [false, true] {
+            let (_hg, _, _tmp_base) = BaseGuard::ready();
+            let temp_home = TempDir::new().unwrap();
+            std::env::set_var("HOME", temp_home.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+            let project_dir = TempDir::new().unwrap();
+            git2::Repository::init(project_dir.path()).unwrap();
+
+            let sandbox_info = super::super::instance::SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "test-container".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            };
+            let instance_id = format!("claude-trust-test-{is_yolo}");
+            let config = build_container_config(
+                project_dir.path().to_str().unwrap(),
+                &sandbox_info,
+                ContainerAgentSelection::new("claude", None),
+                is_yolo,
+                &instance_id,
+                None,
+                "",
+            )
+            .unwrap();
+
+            let seeded = temp_home
+                .path()
+                .join(".claude")
+                .join(SANDBOX_SUBDIR)
+                .join(".claude.json");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&seeded).unwrap()).unwrap();
+            // The trust key is the in-container working dir, not the host path.
+            assert_eq!(
+                parsed["projects"][&config.working_dir]["hasTrustDialogAccepted"].as_bool(),
+                Some(true),
+                "yolo={is_yolo}: container workspace must be pre-trusted"
+            );
+            // The same file carries onboarding state seeded by the mount.
+            assert_eq!(
+                parsed["hasCompletedOnboarding"].as_bool(),
+                Some(true),
+                "yolo={is_yolo}: trust seed must merge, not replace"
+            );
+
+            crate::hooks::cleanup_hook_status_dir(&instance_id);
+        }
     }
 
     #[test]
@@ -4171,7 +4376,7 @@ volume_ignores = ["node_modules"]
 
     #[test]
     #[serial_test::serial]
-    fn test_ensure_yolo_trust_config_restores_codex_after_refresh() {
+    fn test_ensure_folder_trust_config_restores_codex_after_refresh() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
@@ -4203,12 +4408,13 @@ trust_level = "trusted"
         assert_eq!(refreshed["model"].as_str(), Some("host"));
         assert!(refreshed.get("projects").is_none());
 
-        ensure_yolo_trust_config_for_active_agent(
+        ensure_folder_trust_config_for_active_agent(
             "codex",
             None,
             "",
             instance_id,
             "/workspace/project",
+            true,
         );
         let restored: toml::Value =
             toml::from_str(&fs::read_to_string(codex_sandbox.join("config.toml")).unwrap())
@@ -4222,7 +4428,7 @@ trust_level = "trusted"
 
     #[test]
     #[serial_test::serial]
-    fn test_ensure_yolo_trust_config_restores_gemini_after_refresh() {
+    fn test_ensure_folder_trust_config_restores_gemini_after_refresh() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
@@ -4252,12 +4458,13 @@ trust_level = "trusted"
         assert_eq!(refreshed["theme"].as_str(), Some("host"));
         assert!(refreshed["security"]["folderTrust"]["enabled"].is_null());
 
-        ensure_yolo_trust_config_for_active_agent(
+        ensure_folder_trust_config_for_active_agent(
             "gemini",
             None,
             "",
             "gemini-yolo-refresh-test",
             "/workspace/project",
+            true,
         );
         let restored: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(gemini_sandbox.join("settings.json")).unwrap(),

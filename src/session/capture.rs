@@ -1,7 +1,7 @@
 //! Session ID capture logic for all supported agent types.
 
 use std::collections::HashSet;
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -97,8 +97,10 @@ pub(crate) fn validated_session_id(id: String) -> Option<String> {
     }
 }
 
-/// Generate a new UUID v4 for a Claude Code session.
-pub(crate) fn generate_claude_session_id() -> String {
+/// Generate a new UUID v4 to pin an agent session id at launch. Claude
+/// (`--session-id`), its fork children, and Pi (`--session-id`) all accept
+/// this spelling.
+pub(crate) fn generate_session_uuid() -> String {
     Uuid::new_v4().to_string()
 }
 
@@ -549,23 +551,6 @@ pub(crate) fn claude_poll_fn_sandboxed(
     }
 }
 
-pub(crate) fn encode_pi_project_path(cwd: &str) -> String {
-    let stripped = cwd
-        .strip_prefix('/')
-        .or_else(|| cwd.strip_prefix('\\'))
-        .unwrap_or(cwd);
-
-    let encoded: String = stripped
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' => '-',
-            _ => c,
-        })
-        .collect();
-
-    format!("--{encoded}--")
-}
-
 /// Number of leading lines and bytes scanned when locating a pi-family
 /// session header. The byte cap matters because `BufRead::lines` otherwise
 /// allocates without bound for one hostile or corrupt line.
@@ -633,15 +618,6 @@ fn parse_pi_header_json(line: &str) -> Option<(Option<String>, Option<String>)> 
     Some((session_id, cwd))
 }
 
-pub(crate) fn extract_pi_session_id_from_header(path: &Path) -> Option<String> {
-    extract_pi_header_fields(path).and_then(|(id, _)| id)
-}
-
-#[cfg(test)]
-pub(crate) fn extract_pi_cwd_from_header(path: &Path) -> Option<String> {
-    extract_pi_header_fields(path).and_then(|(_, cwd)| cwd)
-}
-
 pub(crate) fn extract_pi_uuid_from_filename(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
     let uuid_part = stem.rsplit('_').next()?;
@@ -649,310 +625,34 @@ pub(crate) fn extract_pi_uuid_from_filename(path: &Path) -> Option<String> {
     Some(uuid_part.to_string())
 }
 
-/// Capture Pi session ID by scanning the Pi agent sessions directory.
-///
-/// Looks for `.jsonl` session files under `~/.pi/agent/sessions/` (or
-/// `$PI_CODING_AGENT_DIR/sessions/`). The primary lookup uses the encoded
-/// project path as a directory name. Falls back to scanning all session
-/// directories and matching via the `cwd` header field.
-pub(crate) fn capture_pi_session_id(
-    project_path: &str,
-    exclusion: &HashSet<String>,
-) -> Result<String> {
-    capture_pi_family_session_id(project_path, exclusion, ".pi/agent")
+#[cfg(test)]
+pub(crate) fn extract_pi_cwd_from_header(path: &Path) -> Option<String> {
+    extract_pi_header_fields(path).and_then(|(_, cwd)| cwd)
 }
 
-/// Scan Pi's on-disk session store.
+/// Polling closure over the sidecar Pi's AoE extension writes: the pane's own
+/// conversation, `/new` included, with no store scan involved.
+/// Polling closure over the sidecar Pi's AoE extension writes.
 ///
-/// This retains Pi's encoded-path fast path, cwd fallback, and historical
-/// newest-directory fallback. OMP deliberately does not use this heuristic:
-/// its dedicated capture module requires an exact terminal breadcrumb.
-fn capture_pi_family_session_id(
-    project_path: &str,
-    exclusion: &HashSet<String>,
-    default_subdir: &str,
-) -> Result<String> {
-    let pi_home = resolve_agent_home(Some("PI_CODING_AGENT_DIR"), default_subdir)?;
-    let sessions_dir = pi_home.join("sessions");
-
-    if !sessions_dir.exists() {
-        anyhow::bail!(
-            "Pi sessions directory not found: {}",
-            sessions_dir.display()
-        );
-    }
-
-    let encoded_name = encode_pi_project_path(project_path);
-    let project_dir = sessions_dir.join(&encoded_name);
-
-    if project_dir.is_dir() {
-        let mut candidates: Vec<(String, std::time::SystemTime)> = Vec::new();
-
-        for entry in resilient_read_dir(&project_dir)? {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let session_id = match extract_pi_session_id_from_header(&path) {
-                Some(id) if !id.is_empty() && !exclusion.contains(&id) => id,
-                _ => continue,
-            };
-            let modified = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            candidates.push((session_id, modified));
-        }
-
-        candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
-
-        if let Some((id, _)) = candidates.first() {
-            return Ok(id.clone());
-        }
-    }
-
-    // Fallback: scan all subdirectories and match via CWD header
-    let canonical_project = canonicalize_or_raw(project_path);
-    let mut fallback_candidates: Vec<(String, std::time::SystemTime)> = Vec::new();
-    // Whether any file recorded a cwd equal to the project, tracked before the
-    // exclusion filter. If a project session exists but every cwd match is
-    // excluded, we must not fall through to the project-agnostic newest-dir
-    // heuristic, which would resume a different project's session.
-    let mut saw_cwd_match = false;
-
-    for subdir_entry in resilient_read_dir(&sessions_dir)? {
-        let subdir_path = subdir_entry.path();
-        if !subdir_path.is_dir() {
-            continue;
-        }
-        for file_entry in resilient_read_dir(&subdir_path)? {
-            let file_path = file_entry.path();
-            if file_path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let fields = match extract_pi_header_fields(&file_path) {
-                Some(f) => f,
-                None => continue,
-            };
-            let cwd = match fields.1 {
-                Some(c) if !c.is_empty() => c,
-                _ => continue,
-            };
-            let canonical_cwd = canonicalize_or_raw(&cwd);
-            if canonical_cwd != canonical_project {
-                continue;
-            }
-            saw_cwd_match = true;
-            let session_id = match fields.0 {
-                Some(id) if !id.is_empty() && !exclusion.contains(&id) => id,
-                _ => continue,
-            };
-            let modified = file_entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            fallback_candidates.push((session_id, modified));
-        }
-    }
-
-    fallback_candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
-
-    if let Some((id, _)) = fallback_candidates.first() {
-        return Ok(id.clone());
-    }
-
-    // A session for this project exists on disk but every cwd match was
-    // excluded (e.g. the just-crashed sid the resume cascade cleared). Return
-    // an error rather than the project-scoped newest-dir fallback below, which
-    // would otherwise resume a different project's session.
-    if saw_cwd_match {
-        anyhow::bail!("All Pi sessions matching project path are excluded");
-    }
-
-    // Third fallback: when JSONL headers fail to parse (no `id` field),
-    // extract a UUID from the filename. Only consider directories whose
-    // encoded name matches the target project path, so we never grab a
-    // session from the wrong project.
-    let mut project_dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(entries) = resilient_read_dir(&sessions_dir) {
-        for entry in entries {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            if path.file_name().and_then(|n| n.to_str()) == Some(&encoded_name) {
-                project_dirs.push(path);
-            }
-        }
-    }
-    // Sort by mtime descending so we pick the newest project directory
-    // (handles the case where the directory itself was recently recreated).
-    project_dirs.sort_by_key(|d| {
-        d.metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-    });
-    project_dirs.reverse();
-
-    for dir in &project_dirs {
-        if let Ok(entries) = resilient_read_dir(dir) {
-            let mut file_candidates: Vec<(String, std::time::SystemTime)> = Vec::new();
-            for entry in entries {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                    continue;
-                }
-                if let Some(uuid) = extract_pi_uuid_from_filename(&path) {
-                    if !exclusion.contains(&uuid) {
-                        let mtime = entry
-                            .metadata()
-                            .and_then(|m| m.modified())
-                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                        file_candidates.push((uuid, mtime));
-                    }
-                }
-            }
-            file_candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
-            if let Some((id, _)) = file_candidates.first() {
-                return Ok(id.clone());
-            }
-        }
-    }
-
-    anyhow::bail!("No Pi session found matching project path")
-}
-
-pub(crate) fn pi_poll_fn(
-    project_path: String,
+/// The source says where the pane publishes: a container's bind-backed
+/// directory or the per-instance hook dir. Getting it wrong is silent, the
+/// poller simply never observing anything, so it is passed in rather than
+/// re-derived here.
+pub(crate) fn pi_sidecar_poll_fn(
     instance_id: String,
-    extra_excludes: HashSet<String>,
-) -> impl Fn() -> Option<String> + Send + 'static {
+    source: crate::session::instance::PiSidecarSource,
+) -> impl Fn() -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        capture_pi_session_id(&project_path, &exclusion)
-            .map_err(
-                |e| tracing::debug!(target: "session.capture", "Pi poll capture failed: {}", e),
-            )
-            .ok()
-            .and_then(validated_session_id)
-    }
-}
-
-const PI_COMMAND_TIMEOUT_SECS: u64 = 5;
-
-/// Shell snippet executed via `docker exec` to enumerate pi-family `.jsonl`
-/// session files inside the container. Each file is emitted as a
-/// `===PI:<unix-mtime>===` header followed by the file's `{"type":"session",...}`
-/// record and a `===END===` trailer; the host parses this stream rather than
-/// spawning one `docker exec head` per file.
-///
-/// `pi` writes that record on line 0, but `omp` (a pi fork) prefixes a
-/// `{"type":"title",...}` record, so the session record can be on line 1. The
-/// script scans the first 8 lines (mirroring `PI_HEADER_SCAN_LINES`) and emits
-/// only the session line, matched via `grep -m1 '^{"type":"session"'`. The
-/// anchor ties the match to a session record at the start of a line, so that
-/// `title` line 0 is skipped and a `"type":"session"` substring nested inside
-/// an earlier record is not picked in its place. Emitting one line per
-/// file keeps a conversation line (arbitrary text on later lines) from ever
-/// colliding with the `===PI:`/`===END===` delimiters.
-///
-/// `grep -m1` is a GNU and BusyBox extension rather than strict POSIX; both the
-/// Debian and Alpine container bases support it, so it is safe for the images
-/// pi-family agents run in.
-const PI_CONTAINER_LIST_SCRIPT: &str = r#"SESS_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/sessions"
-[ -d "$SESS_DIR" ] || exit 0
-for d in "$SESS_DIR"/*/; do
-  for f in "$d"*.jsonl; do
-    [ -f "$f" ] || continue
-    ts=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
-    printf '===PI:%s===\n' "$ts"
-    head -n 8 "$f" | grep -m1 '^{"type":"session"'
-    printf '\n===END===\n'
-  done
-done
-"#;
-
-/// Capture a Pi session ID from inside a Docker container.
-///
-/// Mirrors `capture_pi_session_id` but reads `.jsonl` headers via
-/// `docker exec sh` since pi-in-container writes to the container's
-/// `~/.pi/agent/sessions/`. Matches against `container_cwd` (the path
-/// pi-in-container records), not the host project path.
-pub(crate) fn try_capture_pi_session_id_in_container(
-    container_name: &str,
-    container_cwd: &str,
-    exclusion: &HashSet<String>,
-) -> Result<String> {
-    let mut cmd = std::process::Command::new("docker");
-    cmd.args(["exec", container_name, "sh", "-c", PI_CONTAINER_LIST_SCRIPT]);
-
-    let stdout_bytes = run_with_timeout(
-        cmd,
-        Duration::from_secs(PI_COMMAND_TIMEOUT_SECS),
-        "docker exec sh (pi session scan)",
-    )?;
-    select_pi_session_in_container(&stdout_bytes, container_cwd, exclusion)
-}
-
-/// Parse the delimited stream emitted by `PI_CONTAINER_LIST_SCRIPT` and pick
-/// the most recent session whose recorded CWD matches `container_cwd`.
-fn select_pi_session_in_container(
-    stdout_bytes: &[u8],
-    container_cwd: &str,
-    exclusion: &HashSet<String>,
-) -> Result<String> {
-    let text = String::from_utf8_lossy(stdout_bytes);
-    let mut candidates: Vec<(String, Option<String>, u64)> = Vec::new();
-
-    for chunk in text.split("===PI:").skip(1) {
-        let (ts_str, rest) = match chunk.split_once("===\n") {
-            Some(p) => p,
-            None => continue,
+        use crate::session::instance::PiSidecarSource;
+        let id = match source {
+            PiSidecarSource::SandboxDir(ref dir) => std::fs::read_to_string(dir.join("session_id"))
+                .ok()
+                .map(|raw| raw.trim().to_string())
+                .filter(|id| Uuid::parse_str(id).is_ok()),
+            PiSidecarSource::HostHooks => crate::hooks::read_hook_session_id(&instance_id),
         };
-        let ts: u64 = ts_str.trim().parse().unwrap_or(0);
-        let json_part = match rest.split_once("\n===END===") {
-            Some((j, _)) => j,
-            None => rest,
-        };
-        let (id_opt, cwd) = match parse_pi_header_json(json_part.trim()) {
-            Some(p) => p,
-            None => continue,
-        };
-        let session_id = match id_opt {
-            Some(id) if !id.is_empty() && !exclusion.contains(&id) => id,
-            _ => continue,
-        };
-        candidates.push((session_id, cwd, ts));
-    }
-
-    if candidates.is_empty() {
-        anyhow::bail!("No Pi sessions found in container");
-    }
-
-    candidates.sort_by_key(|c| std::cmp::Reverse(c.2));
-
-    let project_match = candidates
-        .iter()
-        .find(|(_, cwd, _)| cwd.as_deref() == Some(container_cwd));
-
-    project_match
-        .map(|(id, _, _)| id.clone())
-        .ok_or_else(|| anyhow::anyhow!("No Pi session matching container CWD"))
-}
-
-/// Polling closure for sandboxed (Docker) Pi session tracking.
-pub(crate) fn pi_poll_fn_sandboxed(
-    container_name: String,
-    container_cwd: String,
-    instance_id: String,
-    extra_excludes: HashSet<String>,
-) -> impl Fn() -> Option<String> + Send + 'static {
-    move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        try_capture_pi_session_id_in_container(&container_name, &container_cwd, &exclusion)
-            .map_err(|e| tracing::debug!(target: "session.capture", "Pi container poll capture failed: {}", e))
-            .ok()
-            .and_then(validated_session_id)
+        id.and_then(validated_session_id)
+            .map(crate::session::poller::SessionIdObservation::instance_sidecar)
     }
 }
 
@@ -1008,8 +708,11 @@ fn compose_exclusion_in(
 /// another session can capture the parked conversation before its owner swaps
 /// back. Claude, host Codex, and host Kimi additionally need inactive
 /// same-tool protection because their shared-store MRU scans can select a
-/// conversation after the owning pane disappears. Sandboxed Codex and Kimi
-/// omit that protection because their stores are instance-private or are not
+/// conversation after the owning pane disappears. Host Pi is included for its
+/// poller alone: acquisition no longer scans its store at all (#3576), but a
+/// peer that goes inactive after this pane launched can still leave the
+/// freshest file inside the poller's floor. Sandboxed Codex, Kimi, and Pi omit
+/// the protection because their stores are instance-private or are not
 /// captured from the host (#3317).
 ///
 /// Scope: host stores are keyed by each agent's effective home, not by AoE
@@ -2784,6 +2487,184 @@ pub(crate) fn kimi_poll_fn(
     }
 }
 
+/// Slack (ms) applied to the launch-time floor, mirroring
+/// [`KIMI_MTIME_FLOOR_SLACK_MS`]: session files can carry second-granularity
+/// mtimes that land below the millisecond launch timestamp and must still
+/// count as "touched after launch".
+const PRIME_AGENT_MTIME_FLOOR_SLACK_MS: f64 = 2000.0;
+
+/// Byte cap on the first-line header read, mirroring
+/// [`PI_HEADER_SCAN_BYTES`]: `BufRead::read_line` otherwise allocates
+/// without bound for one hostile or corrupt line. A header longer than this
+/// fails to parse and the file is skipped until the next poll.
+const PRIME_AGENT_HEADER_SCAN_BYTES: u64 = 64 * 1024;
+
+/// One Prime Agent session, parsed from the first line of a
+/// `~/.prime/agent/sessions/<uuid>.jsonl` file. The header carries both the
+/// resume id and the working directory; the file name is a different uuid,
+/// so the id must come from the header, never from the path.
+struct PrimeAgentSession {
+    id: String,
+    cwd: String,
+    mtime_ms: u64,
+}
+
+/// Scan `<prime-agent home>/sessions/*.jsonl` and parse each file's first
+/// line as a session header. Unreadable files, non-JSON first lines, headers
+/// whose `type` is not `session`, and headers missing `id`/`cwd` are skipped:
+/// a read-only poll races writers and must tolerate partial files.
+fn scan_prime_agent_sessions(sessions_dir: &Path) -> Vec<PrimeAgentSession> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let Ok(entries) = resilient_read_dir(sessions_dir) else {
+        return Vec::new();
+    };
+    let mut sessions = Vec::new();
+    for entry in entries.filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl")) {
+        // Guarded open, mirroring extract_pi_header_fields: O_NONBLOCK keeps
+        // a misnamed FIFO from blocking the poll on open, O_NOFOLLOW refuses
+        // symlinked entries, and only regular files are scanned.
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        #[cfg(not(unix))]
+        if std::fs::symlink_metadata(entry.path())
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let Ok(file) = options.open(entry.path()) else {
+            continue;
+        };
+        if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let mut first_line = String::new();
+        let mut reader = std::io::BufReader::new(file);
+        if (&mut reader)
+            .take(PRIME_AGENT_HEADER_SCAN_BYTES)
+            .read_line(&mut first_line)
+            .is_err()
+        {
+            continue;
+        }
+        let Ok(header) = serde_json::from_str::<serde_json::Value>(&first_line) else {
+            continue;
+        };
+        if header.get("type").and_then(|v| v.as_str()) != Some("session") {
+            continue;
+        }
+        let (Some(id), Some(cwd)) = (
+            header.get("id").and_then(|v| v.as_str()),
+            header.get("cwd").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let mtime_ms = std::fs::metadata(entry.path())
+            .and_then(|m| m.modified())
+            .map(crate::util::system_time_to_ms)
+            .unwrap_or(0);
+        sessions.push(PrimeAgentSession {
+            id: id.to_string(),
+            cwd: cwd.to_string(),
+            mtime_ms,
+        });
+    }
+    sessions
+}
+
+/// Pick the newest unexcluded Prime Agent session whose header `cwd` matches
+/// `project_path`. Paths are canonicalized so a symlinked cwd still matches.
+/// When `launch_time_ms` is `Some`, only sessions whose file was modified at
+/// or after that floor are eligible, so a fresh live poll cannot latch onto a
+/// pre-existing conversation before the agent writes the new one. Retroactive
+/// recovery passes `None` to allow resuming an older session.
+fn select_prime_agent_session(
+    sessions: Vec<PrimeAgentSession>,
+    project_path: &str,
+    exclusion: &HashSet<String>,
+    launch_time_ms: Option<f64>,
+) -> Result<String> {
+    let canonical_match = canonicalize_or_raw(project_path);
+    let mut candidates: Vec<(String, u64)> = sessions
+        .into_iter()
+        .filter(|s| !exclusion.contains(&s.id))
+        .filter(|s| canonicalize_or_raw(&s.cwd) == canonical_match)
+        .map(|s| (s.id, s.mtime_ms))
+        .collect();
+    if let Some(threshold) = launch_time_ms {
+        candidates.retain(|(_, mtime_ms)| {
+            (*mtime_ms as f64) + PRIME_AGENT_MTIME_FLOOR_SLACK_MS >= threshold
+        });
+    }
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
+    candidates
+        .into_iter()
+        .next()
+        .map(|(id, _)| id)
+        .ok_or_else(|| anyhow::anyhow!("No Prime Agent session found matching project path"))
+}
+
+/// Resolve Prime Agent's session directory with the CLI's own env
+/// precedence: `PRIME_AGENT_SESSION_DIR`, then its legacy alias
+/// `PRIME_AGENT_CODING_AGENT_SESSION_DIR`, then `<coding agent
+/// home>/sessions`. The `--session-dir` flag and `settings.json.sessionDir`
+/// are invisible to this host-side scan (they are tracked separately).
+fn prime_agent_sessions_dir(coding_agent_home: &Path) -> PathBuf {
+    for var in [
+        "PRIME_AGENT_SESSION_DIR",
+        "PRIME_AGENT_CODING_AGENT_SESSION_DIR",
+    ] {
+        if let Ok(dir) = std::env::var(var) {
+            return PathBuf::from(dir);
+        }
+    }
+    coding_agent_home.join("sessions")
+}
+
+/// Capture a Prime Agent session ID for `project_path`.
+///
+/// Reads the first line of every JSONL file in Prime Agent's resolved
+/// session directory (`PRIME_AGENT_SESSION_DIR`, then the legacy alias,
+/// else `<home>/sessions` where the home resolves from
+/// `PRIME_AGENT_CODING_AGENT_DIR`, default `~/.prime/agent`) and returns
+/// the id of the newest session whose header `cwd` matches `project_path`,
+/// skipping any ids in `exclusion`. `launch_time_ms` gates live polling to
+/// sessions touched after this run started (`None` for retroactive recovery).
+/// Prime Agent resumes the returned id with `prime-agent --resume <id>`.
+pub(crate) fn capture_prime_agent_session_id(
+    project_path: &str,
+    exclusion: &HashSet<String>,
+    launch_time_ms: Option<f64>,
+) -> Result<String> {
+    let home = resolve_agent_home(Some("PRIME_AGENT_CODING_AGENT_DIR"), ".prime/agent")?;
+    let sessions = scan_prime_agent_sessions(&prime_agent_sessions_dir(&home));
+    select_prime_agent_session(sessions, project_path, exclusion, launch_time_ms)
+}
+
+/// Polling closure for Prime Agent session tracking, mirroring
+/// [`kimi_poll_fn`]. Host-only: the sessions directory is read from the host,
+/// so sandboxed sessions have no poller and start fresh on restart.
+pub(crate) fn prime_agent_poll_fn(
+    project_path: String,
+    instance_id: String,
+    launch_time_ms: f64,
+    extra_excludes: HashSet<String>,
+) -> impl Fn() -> Option<String> + Send + 'static {
+    move || {
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        capture_prime_agent_session_id(&project_path, &exclusion, Some(launch_time_ms))
+            .map_err(|e| {
+                tracing::debug!(target: "session.capture", "Prime Agent poll capture failed: {}", e)
+            })
+            .ok()
+            .and_then(validated_session_id)
+    }
+}
+
 /// Effective Kimi home for one environment list: `KIMI_CODE_HOME` resolved
 /// through the same `$VAR` / bare-key grammar launch applies
 /// ([`crate::session::environment::resolve_host_environment_value`]), else the
@@ -3395,16 +3276,16 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_claude_session_id() {
-        let id = generate_claude_session_id();
+    fn test_generate_session_uuid() {
+        let id = generate_session_uuid();
 
         // Should be a valid UUID format
         assert!(uuid::Uuid::parse_str(&id).is_ok());
     }
 
     #[test]
-    fn test_generate_claude_session_id_uniqueness() {
-        let ids: Vec<String> = (0..100).map(|_| generate_claude_session_id()).collect();
+    fn test_generate_session_uuid_uniqueness() {
+        let ids: Vec<String> = (0..100).map(|_| generate_session_uuid()).collect();
         let unique_ids: std::collections::HashSet<_> = ids.iter().collect();
 
         assert_eq!(ids.len(), unique_ids.len());
@@ -3901,65 +3782,6 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_pi_project_path() {
-        // Every path separator (both flavors) and `:` collapses to `-`, and the
-        // result is wrapped in `--`. Runs of separators are not coalesced, so a
-        // trailing or doubled slash shows up as an extra dash.
-        let cases = [
-            ("/home/user/project", "--home-user-project--"),
-            ("/home/user/my-project", "--home-user-my-project--"),
-            ("/home/user/project/", "--home-user-project---"),
-            ("/a//double/slash", "--a--double-slash--"),
-            ("/path/with spaces", "--path-with spaces--"),
-            ("C:\\Users\\bob\\proj", "--C--Users-bob-proj--"),
-            ("C:/Users/bob", "--C--Users-bob--"),
-            ("/", "----"),
-        ];
-        for (input, expected) in cases {
-            assert_eq!(encode_pi_project_path(input), expected, "{input:?}");
-        }
-    }
-
-    #[test]
-    fn test_extract_pi_session_id_from_header_valid() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("session.jsonl");
-        std::fs::write(
-            &path,
-            r#"{"type":"session","id":"019342ab-1234-7def-8901-abcdef012345","cwd":"/tmp"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            extract_pi_session_id_from_header(&path),
-            Some("019342ab-1234-7def-8901-abcdef012345".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_pi_session_id_from_header_missing_id() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("session.jsonl");
-        std::fs::write(&path, r#"{"type":"session","cwd":"/tmp"}"#).unwrap();
-        assert_eq!(extract_pi_session_id_from_header(&path), None);
-    }
-
-    #[test]
-    fn test_extract_pi_session_id_from_header_invalid_json() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("session.jsonl");
-        std::fs::write(&path, "not valid json at all").unwrap();
-        assert_eq!(extract_pi_session_id_from_header(&path), None);
-    }
-
-    #[test]
-    fn test_extract_pi_session_id_from_header_empty_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("session.jsonl");
-        std::fs::write(&path, "").unwrap();
-        assert_eq!(extract_pi_session_id_from_header(&path), None);
-    }
-
-    #[test]
     fn test_extract_pi_cwd_from_header() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("session.jsonl");
@@ -3981,444 +3803,6 @@ mod tests {
         assert_eq!(
             extract_pi_uuid_from_filename(&path),
             Some("019342ab-1234-7def-8901-abcdef012345".to_string())
-        );
-    }
-
-    /// Regression (#3078 family): omp writes a `{"type":"title"}` record on line
-    /// 0 and the `{"type":"session"}` header on line 1, so a line-0-only read
-    /// returned no id and no cwd. The bounded multi-line scan recovers both from
-    /// the title-first layout while leaving pi (session on line 0) unchanged.
-    #[test]
-    fn test_extract_pi_header_fields_title_first() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("session.jsonl");
-        let mut contents =
-            "{\"type\":\"title\",\"v\":1,\"title\":\"t\"}\n\
-             {\"type\":\"session\",\"version\":3,\"id\":\"019fc9a0-f688-7000-ae45-d9e51e5e1b8a\",\"cwd\":\"/Users/dev/proj\"}\n"
-                .to_string();
-        contents.push_str(&"x".repeat(PI_HEADER_SCAN_BYTES * 2));
-        std::fs::write(&path, contents).unwrap();
-        assert_eq!(
-            extract_pi_session_id_from_header(&path),
-            Some("019fc9a0-f688-7000-ae45-d9e51e5e1b8a".to_string())
-        );
-        assert_eq!(
-            extract_pi_cwd_from_header(&path),
-            Some("/Users/dev/proj".to_string())
-        );
-
-        let oversized_prefix = format!(
-            "{}\n{{\"type\":\"session\",\"id\":\"019fc9a0-f688-7000-ae45-d9e51e5e1b8a\",\"cwd\":\"/Users/dev/proj\"}}\n",
-            "x".repeat(PI_HEADER_SCAN_BYTES)
-        );
-        std::fs::write(&path, oversized_prefix).unwrap();
-        assert!(
-            extract_pi_session_id_from_header(&path).is_none(),
-            "a single oversized leading line must fail closed without scanning past the byte cap"
-        );
-    }
-
-    /// The header scan is bounded by `PI_HEADER_SCAN_LINES`: a `session` record
-    /// within the window is found, one past it is not (so a large `.jsonl` body
-    /// is never walked).
-    #[test]
-    fn test_extract_pi_header_fields_scan_bound() {
-        let session = r#"{"type":"session","id":"aaa","cwd":"/p"}"#;
-        let cases = [
-            (0usize, true),
-            (PI_HEADER_SCAN_LINES - 1, true),
-            (PI_HEADER_SCAN_LINES, false),
-        ];
-        for (index, expected_found) in cases {
-            let tmp = tempfile::tempdir().unwrap();
-            let path = tmp.path().join("session.jsonl");
-            let mut contents = String::new();
-            for _ in 0..index {
-                contents.push_str("{\"type\":\"title\",\"v\":1}\n");
-            }
-            contents.push_str(session);
-            contents.push('\n');
-            std::fs::write(&path, &contents).unwrap();
-            let found = extract_pi_session_id_from_header(&path).is_some();
-            assert_eq!(found, expected_found, "session at line index {index}");
-        }
-    }
-
-    /// Real e2e: run the same shell script we ship to `docker exec` against a
-    /// Pi session dir on disk, and feed the stdout into the parser to confirm
-    /// it picks up the live UUID. Set `AOE_PI_E2E_DIR=/path/to/.pi/agent` and
-    /// `AOE_PI_E2E_PROJECT=/abs/project/path` to enable; otherwise skipped.
-    /// Validates the production `PI_CONTAINER_LIST_SCRIPT` against real Pi
-    /// output without needing Docker.
-    #[test]
-    #[serial]
-    fn test_select_pi_session_in_container_against_real_script_output() {
-        let agent_dir = match std::env::var("AOE_PI_E2E_DIR") {
-            Ok(v) => v,
-            Err(_) => return,
-        };
-        let project_path = match std::env::var("AOE_PI_E2E_PROJECT") {
-            Ok(v) => v,
-            Err(_) => return,
-        };
-
-        let output = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(PI_CONTAINER_LIST_SCRIPT)
-            .env("PI_CODING_AGENT_DIR", &agent_dir)
-            .output()
-            .expect("script invocation failed");
-        assert!(
-            output.status.success(),
-            "script exited non-zero: {:?}",
-            output.status
-        );
-
-        let id = select_pi_session_in_container(&output.stdout, &project_path, &HashSet::new())
-            .expect("parser failed on real Pi output");
-        assert!(
-            Uuid::parse_str(&id).is_ok(),
-            "captured id {id:?} is not a UUID"
-        );
-        eprintln!("captured pi session id via container script: {id}");
-    }
-
-    /// Real e2e: when run against a session dir produced by an actual `pi`
-    /// binary, capture must return an ID that `pi --session <id>` accepts.
-    /// Set `AOE_PI_E2E_DIR=/path/to/.pi/agent` and
-    /// `AOE_PI_E2E_PROJECT=/abs/project/path` to enable; otherwise skipped.
-    #[test]
-    #[serial]
-    fn test_capture_pi_session_id_against_real_pi_binary() {
-        let agent_dir = match std::env::var("AOE_PI_E2E_DIR") {
-            Ok(v) => v,
-            Err(_) => return,
-        };
-        let project_path = match std::env::var("AOE_PI_E2E_PROJECT") {
-            Ok(v) => v,
-            Err(_) => return,
-        };
-
-        let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
-        std::env::set_var("PI_CODING_AGENT_DIR", &agent_dir);
-
-        let result = capture_pi_session_id(&project_path, &HashSet::new());
-
-        match old_val {
-            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
-            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-        }
-
-        let id = result.expect("real Pi session capture failed");
-        assert!(
-            Uuid::parse_str(&id).is_ok(),
-            "captured id {id:?} is not a UUID"
-        );
-        eprintln!("captured pi session id: {id}");
-    }
-
-    #[test]
-    #[serial]
-    fn test_capture_pi_session_id_basic() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions_dir = tmp.path().join("sessions");
-        let project_encoded = encode_pi_project_path("/home/user/project");
-        let project_dir = sessions_dir.join(&project_encoded);
-        std::fs::create_dir_all(&project_dir).unwrap();
-
-        let uuid = "019342ab-1234-7def-8901-abcdef012345";
-        std::fs::write(
-            project_dir.join(format!("2024-12-03T14-00-00-000Z_{uuid}.jsonl")),
-            format!(r#"{{"type":"session","id":"{uuid}","cwd":"/home/user/project"}}"#),
-        )
-        .unwrap();
-
-        let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
-        std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
-
-        let result = capture_pi_session_id("/home/user/project", &HashSet::new());
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), uuid);
-
-        match old_val {
-            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
-            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn test_capture_pi_session_id_most_recent_wins() {
-        let tmp = tempfile::tempdir().unwrap();
-
-        let sessions_dir = tmp.path().join("sessions");
-        let project_encoded = encode_pi_project_path("/home/user/project");
-        let project_dir = sessions_dir.join(&project_encoded);
-        std::fs::create_dir_all(&project_dir).unwrap();
-
-        let uuid_old = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-        let uuid_new = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
-
-        let old_path = project_dir.join(format!("2024-12-01T10-00-00-000Z_{uuid_old}.jsonl"));
-        let new_path = project_dir.join(format!("2024-12-03T14-00-00-000Z_{uuid_new}.jsonl"));
-        std::fs::write(
-            &old_path,
-            format!(r#"{{"type":"session","id":"{uuid_old}","cwd":"/home/user/project"}}"#),
-        )
-        .unwrap();
-        std::fs::write(
-            &new_path,
-            format!(r#"{{"type":"session","id":"{uuid_new}","cwd":"/home/user/project"}}"#),
-        )
-        .unwrap();
-        set_mtime_secs(&old_path, 1_700_000_000);
-        set_mtime_secs(&new_path, 1_700_000_100);
-
-        let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
-        std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
-
-        let result = capture_pi_session_id("/home/user/project", &HashSet::new());
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), uuid_new);
-
-        match old_val {
-            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
-            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn test_capture_pi_session_id_exclusion() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions_dir = tmp.path().join("sessions");
-        let project_encoded = encode_pi_project_path("/home/user/project");
-        let project_dir = sessions_dir.join(&project_encoded);
-        std::fs::create_dir_all(&project_dir).unwrap();
-
-        let uuid_excluded = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-        let uuid_kept = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
-
-        std::fs::write(
-            project_dir.join(format!("2024-12-01T10-00-00-000Z_{uuid_excluded}.jsonl")),
-            format!(r#"{{"type":"session","id":"{uuid_excluded}","cwd":"/home/user/project"}}"#),
-        )
-        .unwrap();
-        std::fs::write(
-            project_dir.join(format!("2024-12-03T14-00-00-000Z_{uuid_kept}.jsonl")),
-            format!(r#"{{"type":"session","id":"{uuid_kept}","cwd":"/home/user/project"}}"#),
-        )
-        .unwrap();
-
-        let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
-        std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
-
-        let mut exclusion = HashSet::new();
-        exclusion.insert(uuid_excluded.to_string());
-
-        let result = capture_pi_session_id("/home/user/project", &exclusion);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), uuid_kept);
-
-        match old_val {
-            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
-            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn test_capture_pi_session_id_all_cwd_matches_excluded_errs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions_dir = tmp.path().join("sessions");
-
-        // Only session whose cwd matches the project, in a non-encoded dir so it
-        // is reached via the cwd-fallback scan; its id is excluded.
-        let target_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-        let target_dir = sessions_dir.join("--wrong-name--");
-        std::fs::create_dir_all(&target_dir).unwrap();
-        std::fs::write(
-            target_dir.join(format!("2024-12-01T10-00-00-000Z_{target_id}.jsonl")),
-            format!(r#"{{"type":"session","id":"{target_id}","cwd":"/home/user/project"}}"#),
-        )
-        .unwrap();
-
-        // A different project's session, newer: the newest-dir fallback would
-        // resume it if the cwd-match bail did not fire first.
-        let decoy_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
-        let decoy_dir = sessions_dir.join("--decoy--");
-        std::fs::create_dir_all(&decoy_dir).unwrap();
-        std::fs::write(
-            decoy_dir.join(format!("2024-12-09T10-00-00-000Z_{decoy_id}.jsonl")),
-            format!(r#"{{"type":"session","id":"{decoy_id}","cwd":"/home/user/other"}}"#),
-        )
-        .unwrap();
-
-        let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
-        std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
-
-        let mut exclusion = HashSet::new();
-        exclusion.insert(target_id.to_string());
-        let result = capture_pi_session_id("/home/user/project", &exclusion);
-
-        match old_val {
-            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
-            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-        }
-
-        let err =
-            result.expect_err("all cwd matches excluded must error, not cross-project resume");
-        assert!(err.to_string().contains("are excluded"), "{err:?}");
-    }
-
-    #[test]
-    #[serial]
-    fn test_capture_pi_session_id_cwd_fallback_most_recent_wins() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions_dir = tmp.path().join("sessions");
-
-        let uuid_old = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-        let uuid_new = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
-
-        let dir_a = sessions_dir.join("--wrong-name-a--");
-        std::fs::create_dir_all(&dir_a).unwrap();
-        let path_a = dir_a.join(format!("2024-12-01T10-00-00-000Z_{uuid_old}.jsonl"));
-        std::fs::write(
-            &path_a,
-            format!(r#"{{"type":"session","id":"{uuid_old}","cwd":"/home/user/project"}}"#),
-        )
-        .unwrap();
-
-        let dir_b = sessions_dir.join("--wrong-name-b--");
-        std::fs::create_dir_all(&dir_b).unwrap();
-        let path_b = dir_b.join(format!("2024-12-03T14-00-00-000Z_{uuid_new}.jsonl"));
-        std::fs::write(
-            &path_b,
-            format!(r#"{{"type":"session","id":"{uuid_new}","cwd":"/home/user/project"}}"#),
-        )
-        .unwrap();
-        set_mtime_secs(&path_a, 1_700_000_000);
-        set_mtime_secs(&path_b, 1_700_000_100);
-
-        let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
-        std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
-
-        let result = capture_pi_session_id("/home/user/project", &HashSet::new());
-        assert!(
-            result.is_ok(),
-            "Fallback should find sessions via CWD header"
-        );
-        assert_eq!(result.unwrap(), uuid_new);
-
-        match old_val {
-            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
-            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn test_capture_pi_session_id_cwd_fallback_succeeds() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions_dir = tmp.path().join("sessions");
-
-        let wrong_encoded = "--some-other-name--";
-        let wrong_dir = sessions_dir.join(wrong_encoded);
-        std::fs::create_dir_all(&wrong_dir).unwrap();
-
-        let uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-        std::fs::write(
-            wrong_dir.join(format!("2024-12-03T14-00-00-000Z_{uuid}.jsonl")),
-            format!(r#"{{"type":"session","id":"{uuid}","cwd":"/home/user/project"}}"#),
-        )
-        .unwrap();
-
-        let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
-        std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
-
-        let result = capture_pi_session_id("/home/user/project", &HashSet::new());
-        assert!(result.is_ok(), "Fallback CWD scan should find the session");
-        assert_eq!(result.unwrap(), uuid);
-
-        match old_val {
-            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
-            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-        }
-    }
-
-    /// Third fallback: when JSONL headers fail to parse, extract a UUID from
-    /// the filename. Only consider directories whose encoded name matches the
-    /// target project path, so we never grab a session from the wrong project.
-    #[test]
-    #[serial]
-    fn test_capture_pi_session_id_fallback_by_dir_mtime() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions_dir = tmp.path().join("sessions");
-
-        let uuid_match = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-        let uuid_other = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
-
-        // Create the matching directory first, with the older session.
-        let dir_match = sessions_dir.join("--nonexistent-path-for-test--");
-        std::fs::create_dir_all(&dir_match).unwrap();
-        std::fs::write(
-            dir_match.join(format!("2024-12-01T10-00-00-000Z_{uuid_match}.jsonl")),
-            "also not valid json\n",
-        )
-        .unwrap();
-
-        // Create a non-matching directory (different project) with a *newer*
-        // session — must still be ignored, so this pins the scoping filter
-        // rather than the mtime sort alone.
-        let dir_other = sessions_dir.join("--other-dir--");
-        std::fs::create_dir_all(&dir_other).unwrap();
-        std::fs::write(
-            dir_other.join(format!("2024-12-03T14-00-00-000Z_{uuid_other}.jsonl")),
-            "not valid json\n",
-        )
-        .unwrap();
-        set_mtime_secs(&dir_match, 1_700_000_000);
-        set_mtime_secs(&dir_other, 1_700_000_100);
-
-        let _env = EnvGuard::set(&[("PI_CODING_AGENT_DIR", tmp.path())]);
-
-        // Should find the session in the matching directory, not the newer
-        // (but unrelated) one.
-        let result = capture_pi_session_id("/nonexistent/path/for/test", &HashSet::new());
-        assert!(
-            result.is_ok(),
-            "Dir-mtime fallback should find session: {:?}",
-            result
-        );
-        assert_eq!(result.unwrap(), uuid_match);
-    }
-
-    /// Third fallback: when no matching project directory exists, should
-    /// return an error rather than picking from any directory.
-    #[test]
-    #[serial]
-    fn test_capture_pi_session_id_fallback_no_match_returns_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions_dir = tmp.path().join("sessions");
-
-        let uuid = "cccccccc-cccc-cccc-cccc-cccccccccccc";
-
-        // Only a non-matching directory exists.
-        let dir_other = sessions_dir.join("--other-dir--");
-        std::fs::create_dir_all(&dir_other).unwrap();
-        std::fs::write(
-            dir_other.join(format!("2024-12-03T14-00-00-000Z_{uuid}.jsonl")),
-            "not valid json\n",
-        )
-        .unwrap();
-
-        let _env = EnvGuard::set(&[("PI_CODING_AGENT_DIR", tmp.path())]);
-
-        let result = capture_pi_session_id("/nonexistent/path/for/test", &HashSet::new());
-        assert!(
-            result.is_err(),
-            "Should error when no matching project directory exists: {:?}",
-            result
         );
     }
 
@@ -4615,70 +3999,6 @@ mod tests {
     fn test_select_vibe_session_in_container_empty_input() {
         let result = select_vibe_session_in_container(b"", "/workspace", &HashSet::new());
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_select_pi_session_in_container_picks_most_recent_match() {
-        let stdout = b"\
-===PI:1700000000===
-{\"type\":\"session\",\"id\":\"older-match\",\"cwd\":\"/workspace\"}
-===END===
-===PI:1700001000===
-{\"type\":\"session\",\"id\":\"newer-match\",\"cwd\":\"/workspace\"}
-===END===
-===PI:1700002000===
-{\"type\":\"session\",\"id\":\"other-project\",\"cwd\":\"/elsewhere\"}
-===END===
-";
-        let result = select_pi_session_in_container(stdout, "/workspace", &HashSet::new()).unwrap();
-        assert_eq!(result, "newer-match");
-    }
-
-    #[test]
-    fn test_select_pi_session_in_container_respects_exclusion() {
-        let stdout = b"\
-===PI:1700001000===
-{\"type\":\"session\",\"id\":\"already-claimed\",\"cwd\":\"/workspace\"}
-===END===
-===PI:1700000500===
-{\"type\":\"session\",\"id\":\"available\",\"cwd\":\"/workspace\"}
-===END===
-";
-        let mut exclusion = HashSet::new();
-        exclusion.insert("already-claimed".to_string());
-        let result = select_pi_session_in_container(stdout, "/workspace", &exclusion).unwrap();
-        assert_eq!(result, "available");
-    }
-
-    #[test]
-    fn test_select_pi_session_in_container_no_match_returns_error() {
-        let stdout = b"\
-===PI:1700000000===
-{\"type\":\"session\",\"id\":\"foo\",\"cwd\":\"/somewhere/else\"}
-===END===
-";
-        let result = select_pi_session_in_container(stdout, "/workspace", &HashSet::new());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_select_pi_session_in_container_empty_input() {
-        let result = select_pi_session_in_container(b"", "/workspace", &HashSet::new());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_select_pi_session_in_container_skips_non_session_lines() {
-        let stdout = b"\
-===PI:1700000000===
-{\"type\":\"message\",\"id\":\"not-a-session\",\"cwd\":\"/workspace\"}
-===END===
-===PI:1700001000===
-{\"type\":\"session\",\"id\":\"valid\",\"cwd\":\"/workspace\"}
-===END===
-";
-        let result = select_pi_session_in_container(stdout, "/workspace", &HashSet::new()).unwrap();
-        assert_eq!(result, "valid");
     }
 
     #[test]
@@ -7052,5 +6372,194 @@ mod tests {
 
         let found = scan_claude_project_dir(home.path(), project, None, &HashSet::new()).unwrap();
         assert_eq!(found.map(|(id, _)| id), Some(sid.to_string()));
+    }
+
+    /// Write one Prime Agent session file into `dir` and return its path.
+    fn write_prime_session(dir: &Path, name: &str, id: &str, cwd: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\
+                 \"timestamp\":\"2026-08-23T00:00:00.000Z\",\"cwd\":\"{cwd}\",\"rlmDepth\":0}}\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn test_scan_prime_agent_sessions_parses_headers_and_skips_noise() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir(&sessions_dir).unwrap();
+        write_prime_session(&sessions_dir, "aaa.jsonl", "id-valid", "/tmp/proj");
+        // A non-session first line (a mid-file event) must be skipped.
+        std::fs::write(
+            sessions_dir.join("bbb.jsonl"),
+            "{\"type\":\"model_change\",\"id\":\"x\"}\n",
+        )
+        .unwrap();
+        // Malformed JSON, a header without cwd, and a non-jsonl extension are
+        // all ignored by the scan.
+        std::fs::write(sessions_dir.join("ccc.jsonl"), "not json at all\n").unwrap();
+        std::fs::write(
+            sessions_dir.join("ddd.jsonl"),
+            "{\"type\":\"session\",\"version\":3,\"id\":\"id-nocwd\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sessions_dir.join("eee.txt"),
+            "{\"type\":\"session\",\"id\":\"id-txt\",\"cwd\":\"/tmp/proj\"}\n",
+        )
+        .unwrap();
+        // A missing directory scans empty rather than erroring.
+        assert!(scan_prime_agent_sessions(&tmp.path().join("nope")).is_empty());
+
+        let scanned = scan_prime_agent_sessions(&sessions_dir);
+        let mut ids: Vec<&str> = scanned.iter().map(|s| s.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["id-valid"]);
+    }
+
+    #[test]
+    fn test_scan_prime_agent_sessions_skips_oversized_header() {
+        // A first line longer than PRIME_AGENT_HEADER_SCAN_BYTES is read
+        // truncated, fails JSON parsing, and the file is skipped instead of
+        // allocating without bound (mirror of the pi oversized-line pin).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir(&sessions_dir).unwrap();
+        let mut oversized = String::from(
+            "{\"type\":\"session\",\"id\":\"id-big\",\"cwd\":\"/tmp/proj\",\"pad\":\"",
+        );
+        oversized.push_str(&"x".repeat(96 * 1024));
+        oversized.push_str("\"}\n");
+        std::fs::write(sessions_dir.join("big.jsonl"), &oversized).unwrap();
+
+        assert!(scan_prime_agent_sessions(&sessions_dir).is_empty());
+    }
+
+    /// Unix-only: a FIFO named `*.jsonl` must be skipped without blocking
+    /// the scan, and a symlinked entry must not be followed. If this test
+    /// ever hangs, the guarded open regressed to plain `File::open`.
+    #[test]
+    #[cfg(unix)]
+    fn test_scan_prime_agent_sessions_skips_fifo_and_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir(&sessions_dir).unwrap();
+        let fifo = sessions_dir.join("fifo.jsonl");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        symlink(
+            tmp.path().join("elsewhere.jsonl"),
+            sessions_dir.join("link.jsonl"),
+        )
+        .unwrap();
+
+        assert!(scan_prime_agent_sessions(&sessions_dir).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_prime_agent_session_id_selects_newest_matching_cwd() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir(&sessions_dir).unwrap();
+        let proj_path = tmp.path().join("proj").to_str().unwrap().to_string();
+        write_prime_session(&sessions_dir, "old.jsonl", "id-old", &proj_path);
+        set_mtime_secs(&sessions_dir.join("old.jsonl"), 1_000);
+        write_prime_session(&sessions_dir, "new.jsonl", "id-new", &proj_path);
+        set_mtime_secs(&sessions_dir.join("new.jsonl"), 2_000);
+        write_prime_session(
+            &sessions_dir,
+            "other.jsonl",
+            "id-other",
+            "/some/other/project",
+        );
+        set_mtime_secs(&sessions_dir.join("other.jsonl"), 3_000);
+
+        let _guard = EnvGuard::set(&[("PRIME_AGENT_CODING_AGENT_DIR", tmp.path())]);
+        let got = capture_prime_agent_session_id(&proj_path, &HashSet::new(), None).unwrap();
+        assert_eq!(got, "id-new");
+        // The exclusion set drops the newest match so the older one wins.
+        let excluded: HashSet<String> = ["id-new".to_string()].into_iter().collect();
+        let got = capture_prime_agent_session_id(&proj_path, &excluded, None).unwrap();
+        assert_eq!(got, "id-old");
+        // No session matches a different project.
+        assert!(capture_prime_agent_session_id("/elsewhere", &HashSet::new(), None).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_prime_agent_session_id_launch_floor_excludes_stale_sessions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir(&sessions_dir).unwrap();
+        let proj_path = tmp.path().join("proj").to_str().unwrap().to_string();
+        write_prime_session(&sessions_dir, "stale.jsonl", "id-stale", &proj_path);
+        set_mtime_secs(&sessions_dir.join("stale.jsonl"), 1_000);
+
+        let _guard = EnvGuard::set(&[("PRIME_AGENT_CODING_AGENT_DIR", tmp.path())]);
+        // A floor far in the future rejects the stale file; retroactive
+        // recovery (None) still finds it.
+        assert!(
+            capture_prime_agent_session_id(&proj_path, &HashSet::new(), Some(f64::MAX / 2.0))
+                .is_err()
+        );
+        assert_eq!(
+            capture_prime_agent_session_id(&proj_path, &HashSet::new(), None).unwrap(),
+            "id-stale"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_prime_agent_session_id_honors_session_dir_overrides() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // The default location holds a decoy that must be ignored whenever an
+        // override points elsewhere.
+        let default_sessions = tmp.path().join("sessions");
+        std::fs::create_dir(&default_sessions).unwrap();
+        write_prime_session(
+            &default_sessions,
+            "default.jsonl",
+            "id-default",
+            "/tmp/test",
+        );
+
+        let proj_path = "/tmp/test".to_string();
+        // Primary override wins over the default location.
+        let redirected = tmp.path().join("redirected");
+        std::fs::create_dir(&redirected).unwrap();
+        write_prime_session(&redirected, "seed.jsonl", "id-override", &proj_path);
+        let _primary = EnvGuard::set(&[
+            ("PRIME_AGENT_CODING_AGENT_DIR", tmp.path()),
+            ("PRIME_AGENT_SESSION_DIR", redirected.as_path()),
+        ]);
+        assert_eq!(
+            capture_prime_agent_session_id(&proj_path, &HashSet::new(), None).unwrap(),
+            "id-override"
+        );
+        // An ambient PRIME_AGENT_SESSION_DIR from the developer's own shell
+        // must not shadow the legacy alias under test.
+        drop(_primary);
+        let _unset_primary = EnvGuard::unset(&["PRIME_AGENT_SESSION_DIR"]);
+
+        // Legacy alias applies when the primary override is unset.
+        let legacy = tmp.path().join("legacy");
+        std::fs::create_dir(&legacy).unwrap();
+        write_prime_session(&legacy, "seed.jsonl", "id-legacy", &proj_path);
+        let _legacy = EnvGuard::set(&[
+            ("PRIME_AGENT_CODING_AGENT_DIR", tmp.path()),
+            ("PRIME_AGENT_CODING_AGENT_SESSION_DIR", legacy.as_path()),
+        ]);
+        assert_eq!(
+            capture_prime_agent_session_id(&proj_path, &HashSet::new(), None).unwrap(),
+            "id-legacy"
+        );
     }
 }
