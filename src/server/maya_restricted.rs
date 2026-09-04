@@ -83,7 +83,6 @@ pub fn is_restricted_session(instance: &crate::session::Instance) -> bool {
         && instance.worktree_info.is_none()
         && instance.workspace_info.is_none()
         && instance.agent_name.is_none()
-        && instance.agent_model.as_deref().is_none_or(is_managed_model)
         && instance.acp_mode_id.as_deref().is_none_or(is_managed_mode)
         && instance.acp_effort.as_deref().is_none_or(is_managed_effort)
 }
@@ -109,20 +108,6 @@ fn is_aoe_session_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
-pub(crate) fn is_managed_model(value: &str) -> bool {
-    matches!(
-        value,
-        "gpt-5.6-sol"
-            | "gpt-5.6-terra"
-            | "gpt-5.6-luna"
-            | "gpt-5.5"
-            | "gpt-5.4"
-            | "gpt-5.4-mini"
-            | "gpt-5.2"
-            | "codex-auto-review"
-    )
 }
 
 pub(crate) fn is_managed_mode(value: &str) -> bool {
@@ -540,22 +525,20 @@ mod tests {
     }
 
     #[test]
-    fn managed_selectors_keep_restricted_sessions_visible() {
+    fn model_selection_does_not_change_restricted_session_identity() {
         let mut instance = crate::session::Instance::new("Maya", PROJECT_PATH);
         instance.tool = "codex".into();
         instance.view = crate::session::View::Structured;
         instance.source_profile = PROFILE_NAME.into();
-        instance.agent_model = Some("gpt-5.6-sol".into());
+        instance.agent_model = Some("future/provider-owned:model id".into());
         instance.acp_mode_id = Some("agent-full-access".into());
         instance.acp_effort = Some("max".into());
         assert!(is_restricted_session(&instance));
 
-        for (model, mode, effort) in [
-            (Some("other"), Some("agent"), Some("high")),
-            (Some("gpt-5.6-sol"), Some("other"), Some("high")),
-            (Some("gpt-5.6-sol"), Some("agent"), Some("other")),
+        for (mode, effort) in [
+            (Some("other"), Some("high")),
+            (Some("agent"), Some("other")),
         ] {
-            instance.agent_model = model.map(str::to_owned);
             instance.acp_mode_id = mode.map(str::to_owned);
             instance.acp_effort = effort.map(str::to_owned);
             assert!(!is_restricted_session(&instance));

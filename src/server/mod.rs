@@ -7928,7 +7928,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maya_managed_selectors_survive_list_and_session_routing() {
+    async fn maya_model_selection_survives_list_and_session_routing() {
         use tower::ServiceExt;
 
         let mut allowed = Instance::new("Maya", maya_restricted::PROJECT_PATH);
@@ -7936,12 +7936,12 @@ mod tests {
         allowed.tool = "codex".into();
         allowed.view = crate::session::View::Structured;
         allowed.source_profile = maya_restricted::PROFILE_NAME.into();
-        allowed.agent_model = Some("gpt-5.6-sol".into());
+        allowed.agent_model = Some("future/provider-owned:model id".into());
         allowed.acp_mode_id = Some("agent-full-access".into());
         allowed.acp_effort = Some("max".into());
         let mut hidden = allowed.clone();
         hidden.id = "fedcba9876543210".into();
-        hidden.agent_model = Some("caller-controlled-model".into());
+        hidden.acp_mode_id = Some("caller-controlled-mode".into());
 
         let mut state = test_support::build_test_app_state_with_policy(
             vec![allowed, hidden],

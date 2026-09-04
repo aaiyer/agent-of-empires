@@ -1712,11 +1712,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 || cwd != std::path::Path::new(crate::server::maya_restricted::PROJECT_PATH)
                 || !additional_dirs.is_empty()
                 || !provider_env.is_empty()
-                || !maya_restricted_selectors_allowed(
-                    model.as_deref(),
-                    effort.as_deref(),
-                    acp_mode_id.as_deref(),
-                )
+                || !maya_restricted_selectors_allowed(effort.as_deref(), acp_mode_id.as_deref())
                 || sandbox_info.is_some()
                 || fork_from.is_some()
                 || source_profile.as_deref() != Some(crate::server::maya_restricted::PROFILE_NAME)
@@ -3542,13 +3538,8 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 }
 
-fn maya_restricted_selectors_allowed(
-    model: Option<&str>,
-    effort: Option<&str>,
-    mode: Option<&str>,
-) -> bool {
-    model.is_none_or(crate::server::maya_restricted::is_managed_model)
-        && effort.is_none_or(crate::server::maya_restricted::is_managed_effort)
+fn maya_restricted_selectors_allowed(effort: Option<&str>, mode: Option<&str>) -> bool {
+    effort.is_none_or(crate::server::maya_restricted::is_managed_effort)
         && mode.is_none_or(crate::server::maya_restricted::is_managed_mode)
 }
 
@@ -6235,23 +6226,17 @@ cursor-acp-bridge = "agent acp"
     }
 
     #[test]
-    fn maya_restricted_respawn_accepts_only_managed_persisted_selectors() {
+    fn maya_restricted_respawn_delegates_model_selection_to_the_adapter() {
         assert!(maya_restricted_selectors_allowed(
-            Some("gpt-5.6-sol"),
             Some("max"),
             Some("agent-full-access"),
         ));
-        assert!(maya_restricted_selectors_allowed(None, None, None));
+        assert!(maya_restricted_selectors_allowed(None, None));
         for selectors in [
-            (Some("caller-model"), Some("max"), Some("agent")),
-            (Some("gpt-5.6-sol"), Some("caller-effort"), Some("agent")),
-            (Some("gpt-5.6-sol"), Some("max"), Some("caller-mode")),
+            (Some("caller-effort"), Some("agent")),
+            (Some("max"), Some("caller-mode")),
         ] {
-            assert!(!maya_restricted_selectors_allowed(
-                selectors.0,
-                selectors.1,
-                selectors.2,
-            ));
+            assert!(!maya_restricted_selectors_allowed(selectors.0, selectors.1));
         }
     }
 
